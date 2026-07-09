@@ -316,6 +316,12 @@ func sliceElems(arg any) ([]any, bool) {
 	if t.Kind() != reflect.Slice && t.Kind() != reflect.Array {
 		return nil, false
 	}
+	if t.Elem().Kind() == reflect.Uint8 {
+		// Byte payloads are one value, not a list — named byte slices
+		// (json.RawMessage) and [16]byte UUIDs alike. Expanding them would
+		// splice a byte-per-placeholder list into "= ?".
+		return nil, false
+	}
 	if t.Implements(valuerType) {
 		return nil, false
 	}

@@ -299,6 +299,9 @@ func naiveSliceElems(arg any) ([]any, bool) {
 	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
 		return nil, false
 	}
+	if rv.Type().Elem().Kind() == reflect.Uint8 {
+		return nil, false // byte payloads are scalars, mirroring sliceElems
+	}
 	if _, isValuer := arg.(driver.Valuer); isValuer {
 		return nil, false
 	}

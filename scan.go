@@ -15,8 +15,9 @@ import (
 // fieldCodec is the per-field scan/bind strategy, decided once at plan time
 // so row scanning does zero classification work.
 type fieldCodec struct {
-	kind scanKind
-	bits int // integer/float width for overflow checks
+	kind       scanKind
+	bits       int  // integer/float width for overflow checks
+	bindValuer bool // basic kind that also implements driver.Valuer: bind through Value()
 }
 
 type scanKind uint8
@@ -34,7 +35,11 @@ const (
 	scanPtr     // slow path: *T with allocation
 )
 
-var scannerType = reflect.TypeFor[sql.Scanner]()
+var (
+	scannerType         = reflect.TypeFor[sql.Scanner]()
+	nullTimeType        = reflect.TypeFor[sql.NullTime]()
+	nullTimeGenericType = reflect.TypeFor[sql.Null[time.Time]]()
+)
 
 // codecFor classifies a field. Order is the documented priority chain:
 // json tag > sql.Scanner > pointer > []byte > basics. Anything else is a
@@ -54,7 +59,19 @@ func codecFor(f *field) (fieldCodec, error) {
 		}
 		return fieldCodec{kind: scanPtr}, nil
 	}
-	return basicCodec(t, f)
+	c, err := basicCodec(t, f)
+	if err != nil {
+		return c, err
+	}
+	// A basic-kind type that customizes its stored form through driver.Valuer
+	// (value receiver, so a bound value triggers it) must bind through Value(),
+	// not the unsafe fast read that would hand the driver the raw underlying
+	// value. Scan stays on the fast path: the column already holds the encoded
+	// form. (Scanner types are handled above and bind correctly via reflect.)
+	if t.Implements(valuerType) {
+		c.bindValuer = true
+	}
+	return c, nil
 }
 
 func basicCodec(t reflect.Type, f *field) (fieldCodec, error) {
@@ -513,33 +530,30 @@ func scanAll[T any](rows *sql.Rows, p *plan, byName bool) ([]T, error) {
 	return out, nil
 }
 
-// scanScalars drains a single-column result into basic values.
+// scanScalars drains a single-column result into basic values. The codec is
+// classified once for the whole result, not per row.
 func scanScalars[T any](rows *sql.Rows) ([]T, error) {
 	defer rows.Close()
+	t := reflect.TypeFor[T]()
+	f := &field{name: t.String(), column: "<scalar>", typ: t}
+	codec, err := codecFor(f)
+	if err != nil {
+		return nil, err
+	}
+	f.code = codec
+	cs := colScanner{f: f}
 	out := []T{}
 	for rows.Next() {
-		var v T
-		if err := scanScalar(rows, &v); err != nil {
+		out = append(out, *new(T))
+		cs.base = unsafe.Pointer(&out[len(out)-1])
+		if err := rows.Scan(&cs); err != nil {
 			return nil, err
 		}
-		out = append(out, v)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	return out, nil
-}
-
-func scanScalar[T any](rows *sql.Rows, dst *T) error {
-	t := reflect.TypeFor[T]()
-	f := &field{name: t.String(), column: "<scalar>", typ: t}
-	codec, err := codecFor(f)
-	if err != nil {
-		return err
-	}
-	f.code = codec
-	cs := colScanner{f: f, base: unsafe.Pointer(dst)}
-	return rows.Scan(&cs)
 }
 
 // isScalarType reports whether T scans as a single column rather than a
@@ -562,7 +576,7 @@ func isScalarType(t reflect.Type) bool {
 // reflect.Value round-trip for fixed-layout kinds. ok=false falls back to
 // bindArg. The same discipline as the scan fast path applies: offsets only
 // cross value-embedded structs, never pointers.
-func bindArgFast(f *field, base unsafe.Pointer, d Dialect, now time.Time) (any, bool, error) {
+func bindArgFast(f *field, base unsafe.Pointer, d Dialect) (any, bool, error) {
 	p := unsafe.Add(base, f.offset)
 	switch f.code.kind {
 	case scanInt:
@@ -589,7 +603,8 @@ func bindArgFast(f *field, base unsafe.Pointer, d Dialect, now time.Time) (any, 
 			n = *(*uint64)(p)
 		}
 		if n > math.MaxInt64 {
-			return strconv.FormatUint(n, 10), true, nil
+			v, err := bindOverflowUint(d, n)
+			return v, true, err
 		}
 		return int64(n), true, nil
 	case scanFloat:
@@ -661,12 +676,16 @@ func zeroFast(f *field, base unsafe.Pointer) (isZero, ok bool) {
 	return false, false
 }
 
-// fieldValue binds one field, fast path first.
-func fieldValue(f *field, base unsafe.Pointer, rv reflect.Value, d Dialect, now time.Time) (any, error) {
-	if a, ok, err := bindArgFast(f, base, d, now); ok {
-		return a, err
+// fieldValue binds one field, fast path first. A driver.Valuer basic type
+// skips the fast path so bindArg hands the driver the value itself, letting
+// Value() run.
+func fieldValue(f *field, base unsafe.Pointer, rv reflect.Value, d Dialect) (any, error) {
+	if !f.code.bindValuer {
+		if a, ok, err := bindArgFast(f, base, d); ok {
+			return a, err
+		}
 	}
-	return bindArg(f, rv.FieldByIndex(f.index), d, now)
+	return bindArg(f, rv.FieldByIndex(f.index), d)
 }
 
 // fieldIsZero checks one field, fast path first.
@@ -699,7 +718,7 @@ func scanOne[T any](rows *sql.Rows, p *plan) (*T, error) {
 }
 
 // bindArg converts a field value into a driver-facing argument.
-func bindArg(f *field, v reflect.Value, d Dialect, now time.Time) (any, error) {
+func bindArg(f *field, v reflect.Value, d Dialect) (any, error) {
 	if f.jsonCol {
 		if v.Kind() == reflect.Pointer && v.IsNil() {
 			return nil, nil // a nil *T stores SQL NULL, not the string "null"
@@ -710,11 +729,31 @@ func bindArg(f *field, v reflect.Value, d Dialect, now time.Time) (any, error) {
 		}
 		return data, nil
 	}
+	if f.code.bindValuer {
+		// Hand the driver the value itself so its Value() runs; skip the
+		// numeric/time normalization below, which would strip the type.
+		return v.Interface(), nil
+	}
 	if v.Kind() == reflect.Pointer {
 		if v.IsNil() {
 			return nil, nil
 		}
 		v = v.Elem()
+	}
+	// Mirror normalizeArgs: left to the driver's Valuer path, the inner time
+	// would skip microsecond truncation and rio's SQLite text encoding —
+	// the same field would then store differently under Insert and Upsert.
+	if v.Type() == nullTimeType {
+		if nv := v.Interface().(sql.NullTime); nv.Valid {
+			return d.bindTime(normalizeTime(nv.Time)), nil
+		}
+		return nil, nil
+	}
+	if v.Type() == nullTimeGenericType {
+		if nv := v.Interface().(sql.Null[time.Time]); nv.Valid {
+			return d.bindTime(normalizeTime(nv.V)), nil
+		}
+		return nil, nil
 	}
 	if v.Type() == timeType {
 		t := v.Interface().(time.Time)
@@ -728,13 +767,22 @@ func bindArg(f *field, v reflect.Value, d Dialect, now time.Time) (any, error) {
 	}
 	if isUintKind(v.Kind()) {
 		if n := v.Uint(); n > math.MaxInt64 {
-			// database/sql refuses uint64 with the high bit set; every
-			// dialect accepts the decimal literal as a string bind.
-			return strconv.FormatUint(n, 10), nil
+			return bindOverflowUint(d, n)
 		}
 	}
-	_ = now
 	return v.Interface(), nil
+}
+
+// bindOverflowUint binds a uint64 whose high bit is set. database/sql refuses
+// it, so MySQL (BIGINT UNSIGNED) and PostgreSQL (numeric) take the decimal
+// literal as a string. SQLite has no unsigned 64-bit integer: an INTEGER
+// column silently coerces the oversized literal to REAL and loses precision,
+// so rio fails loudly there instead of corrupting the row.
+func bindOverflowUint(d Dialect, n uint64) (any, error) {
+	if d.name() == "sqlite" {
+		return nil, fmt.Errorf("rio: value %d exceeds SQLite's signed 64-bit integer range and cannot be stored losslessly; use a TEXT column or a signed type", n)
+	}
+	return strconv.FormatUint(n, 10), nil
 }
 
 // normalizeTime is the single write-side time rule: UTC, no monotonic

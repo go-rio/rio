@@ -51,6 +51,18 @@ func KeepTrashed() UpsertOption {
 // whitelist, RETURNING backfill (PG/SQLite; MySQL fills the auto-increment
 // ID only on the insert path), and timestamp maintenance.
 //
+// Version backfill on the update path is RETURNING-only. Timestamps and every
+// bound column already match the database on all three dialects — rio wrote
+// the in-memory values into the statement — but a version column is
+// incremented server-side (version = version + 1) from the row's *current*
+// database value, which rio cannot know without RETURNING. On PostgreSQL and
+// SQLite it is read back; on MySQL (no RETURNING) the in-memory version stays
+// at what you set while the database moved on, and rio will not issue a hidden
+// second SELECT to reconcile it. A later optimistic-locked Update would then
+// see ErrStaleObject: reload the row after a MySQL upsert when you keep
+// updating through the same struct, or run version-tracking upserts on
+// PostgreSQL/SQLite.
+//
 // Soft-delete invariant: a successful DoUpdate upsert leaves the row visible
 // — deleted_at is cleared unless KeepTrashed is given. The explicit
 // softdelete tag opted the model into deletion semantics; resurrect-on-upsert
@@ -82,6 +94,11 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 	cols, back, args, _, _, err := insertColumns(p, rv, d, now)
 	if err != nil {
 		return err
+	}
+	if len(cols) == 0 {
+		// SQLite cannot attach a conflict clause to DEFAULT VALUES, so the
+		// all-defaults upsert is not portable; the same row inserts fine.
+		return fmt.Errorf("rio: Upsert on %s with every column defaulted (all omitzero columns zero); set a column or use Insert", p.structName)
 	}
 
 	update, err := upsertUpdateSet(p, &spec)
@@ -180,6 +197,13 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 	// MySQL reports 1 row affected for a fresh insert, 2 for an update.
 	if n, aerr := res.RowsAffected(); aerr == nil && n == 1 {
 		return fillLastInsertID(p, rv, res.LastInsertId)
+	} else if aerr == nil && n != 1 && !spec.doNothing && p.softDel != nil && !spec.keepTrashed {
+		// The conflict path ran ON DUPLICATE KEY UPDATE ... deleted_at = NULL,
+		// so the row is visible now; reconcile the in-memory value rio knows
+		// it wrote (the version, incremented server-side, it cannot know —
+		// see the doc). Keeps the restore-on-upsert invariant true in memory
+		// on MySQL, matching the RETURNING dialects.
+		clearTime(p.softDel, rv)
 	}
 	return nil
 }

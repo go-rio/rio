@@ -10,16 +10,17 @@ import (
 // idempotently: existing links are left alone (bare ON CONFLICT DO NOTHING;
 // a no-op assignment on MySQL), assuming the join table's standard composite
 // unique key. Nothing here is implicit: this is the explicit inverse of
-// hand-writing the join-table INSERT. Attaching zero ids is a no-op.
-func Attach[T any](ctx context.Context, db Queryer, row *T, relation string, ids ...any) error {
+// hand-writing the join-table INSERT. Typed id slices spread directly:
+// Attach(ctx, db, &u, "Tags", tagIDs...). Attaching zero ids is a no-op
+// (spell the id type as Attach[User, int64] when nothing infers it).
+func Attach[T any, K any](ctx context.Context, db Queryer, row *T, relation string, ids ...K) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	p, rel, res, ownerKey, err := joinWriteTarget(db, row, relation)
+	p, _, res, ownerKey, err := joinWriteTarget(db, row, relation)
 	if err != nil {
 		return err
 	}
-	_ = rel
 	g := db.gram()
 	d := g.d
 
@@ -58,8 +59,8 @@ func Attach[T any](ctx context.Context, db Queryer, row *T, relation string, ids
 // Detach unlinks rows from a ManyToMany relation by deleting join-table
 // rows. The ids are required — detaching "everything" must be written as an
 // explicit set-based delete on the join table, never implied by an empty
-// call.
-func Detach[T any](ctx context.Context, db Queryer, row *T, relation string, ids ...any) error {
+// call. Typed id slices spread directly: Detach(ctx, db, &u, "Tags", ids...).
+func Detach[T any, K any](ctx context.Context, db Queryer, row *T, relation string, ids ...K) error {
 	if len(ids) == 0 {
 		return fmt.Errorf("rio: Detach needs the ids to unlink; clearing a whole relation is an explicit join-table delete")
 	}
@@ -77,7 +78,10 @@ func Detach[T any](ctx context.Context, db Queryer, row *T, relation string, ids
 	b = append(b, " = ? AND "...)
 	b = d.quote(b, res.joinRef)
 	b = append(b, " IN (?)"...)
-	args := []any{ownerKey, ids}
+	// Pass the ids as []any, not []K: a byte-kind id type would make []K a
+	// []byte that IN (?) expansion treats as one BLOB (rebind.sliceElems),
+	// silently matching nothing.
+	args := []any{ownerKey, anySlice(ids)}
 
 	sqlText, outArgs, err := finishSQL(d, b, args)
 	if err != nil {
@@ -85,6 +89,16 @@ func Detach[T any](ctx context.Context, db Queryer, row *T, relation string, ids
 	}
 	_, err = run(ctx, db, "delete", p.structName, sqlText, outArgs)
 	return err
+}
+
+// anySlice widens a typed id slice to []any so IN (?) expansion never depends
+// on the element kind (a []byte-kind slice would otherwise bind as one BLOB).
+func anySlice[K any](ids []K) []any {
+	out := make([]any, len(ids))
+	for i, id := range ids {
+		out[i] = id
+	}
+	return out
 }
 
 // SyncRelation makes the ManyToMany relation match ids exactly, inside one
@@ -140,7 +154,7 @@ func SyncRelation[T any, K any](ctx context.Context, db Queryer, row *T, relatio
 			b = append(b, " AND "...)
 			b = d.quote(b, res.joinRef)
 			b = append(b, " NOT IN (?)"...)
-			args = append(args, ids)
+			args = append(args, anySlice(ids)) // []any: never bind byte-kind ids as one BLOB
 		}
 		sqlText, outArgs, err := finishSQL(d, b, args)
 		if err != nil {
@@ -152,11 +166,7 @@ func SyncRelation[T any, K any](ctx context.Context, db Queryer, row *T, relatio
 		if len(ids) == 0 {
 			return nil
 		}
-		anyIDs := make([]any, len(ids))
-		for i, id := range ids {
-			anyIDs[i] = id
-		}
-		return Attach(ctx, tx, row, relation, anyIDs...)
+		return Attach(ctx, tx, row, relation, ids...)
 	})
 }
 

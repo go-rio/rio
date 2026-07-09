@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"time"
 	"unsafe"
 )
@@ -34,14 +35,7 @@ func Insert[T any](ctx context.Context, db Queryer, row *T) error {
 	returning := d.caps().returning && len(back) > 0
 	build := func() []byte {
 		b := renderInsertHead(g, p, cols)
-		b = append(b, " VALUES ("...)
-		for i := range cols {
-			if i > 0 {
-				b = append(b, ", "...)
-			}
-			b = append(b, '?')
-		}
-		b = append(b, ')')
+		b = appendInsertValues(b, d, len(cols))
 		if returning {
 			b = append(b, " RETURNING "...)
 			for i, f := range back {
@@ -124,7 +118,7 @@ func Update[T any](ctx context.Context, db Queryer, row *T, cols ...string) erro
 	if err != nil {
 		return err
 	}
-	args, err := bindFields(p, rv, d, now, set)
+	args, err := bindFields(p, rv, d, set)
 	if err != nil {
 		return err
 	}
@@ -140,7 +134,14 @@ func Update[T any](ctx context.Context, db Queryer, row *T, cols ...string) erro
 		if p.version != nil {
 			return ErrStaleObject
 		}
-		return ErrNotFound
+		missing, perr := zeroAffectedMeansMissing(ctx, db, p, rv)
+		if perr != nil {
+			return perr
+		}
+		if missing {
+			return ErrNotFound
+		}
+		return nil // matched, values already identical
 	}
 	if p.version != nil {
 		bumpVersion(p.version, rv)
@@ -209,7 +210,7 @@ func softDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 	if p.updated != nil {
 		args = append(args, d.bindTime(now))
 	}
-	if args, err = appendKeyArgs(args, p, rv, d, now); err != nil {
+	if args, err = appendKeyArgs(args, p, rv, d); err != nil {
 		return err
 	}
 	res, err := run(ctx, db, "delete", p.structName, sqlText, args)
@@ -224,7 +225,15 @@ func softDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 		if p.version != nil {
 			return ErrStaleObject
 		}
-		return ErrNotFound
+		missing, perr := zeroAffectedMeansMissing(ctx, db, p, rv)
+		if perr != nil {
+			return perr
+		}
+		if missing {
+			return ErrNotFound
+		}
+		// Matched but unchanged (a same-instant double delete): the stamps
+		// below still describe the row.
 	}
 	setTime(p.softDel, rv, now)
 	if p.updated != nil {
@@ -243,7 +252,6 @@ func hardDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 	}
 	g := db.gram()
 	d := g.d
-	now := normalizeTime(db.conf().clock())
 
 	sqlText, err := crudSQL(g, p, "delete", 0, true, func() []byte {
 		b := make([]byte, 0, 96)
@@ -254,7 +262,7 @@ func hardDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 	if err != nil {
 		return err
 	}
-	args, err := appendKeyArgs(nil, p, rv, d, now)
+	args, err := appendKeyArgs(nil, p, rv, d)
 	if err != nil {
 		return err
 	}
@@ -283,17 +291,10 @@ func hardDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 // database name, plus UpdatedAt.
 func updateSet(p *plan, cols []string) ([]*field, error) {
 	if len(cols) == 0 {
-		out := make([]*field, 0, len(p.fields))
-		for _, f := range p.fields {
-			if f.isPK || f.isCreated || f.isVersion {
-				continue
-			}
-			out = append(out, f)
-		}
-		if len(out) == 0 {
+		if len(p.updatable) == 0 {
 			return nil, fmt.Errorf("rio: %s has no updatable columns", p.structName)
 		}
-		return out, nil
+		return p.updatable, nil // precomputed at plan time; callers only read
 	}
 	seen := make(map[string]bool, len(cols)+1)
 	out := make([]*field, 0, len(cols)+1)
@@ -314,15 +315,21 @@ func updateSet(p *plan, cols []string) ([]*field, error) {
 	if p.updated != nil && !seen[p.updated.column] {
 		out = append(out, p.updated)
 	}
+	// Canonical order, always. The SQL cache keys on an order-free column
+	// bitmap: if rendering followed caller order, Update("a","b") and a later
+	// Update("b","a") would share one cached statement while each binds values
+	// in its own order — silently writing values into the wrong columns.
+	sort.Slice(out, func(i, j int) bool { return out[i].ordinal < out[j].ordinal })
 	return out, nil
 }
 
 // stampForInsert fills zero timestamps and a zero version before binding.
 func stampForInsert(p *plan, rv reflect.Value, now time.Time) {
-	if p.created != nil && rv.FieldByIndex(p.created.index).IsZero() {
+	base := rv.Addr().UnsafePointer()
+	if p.created != nil && fieldIsZero(p.created, base, rv) {
 		setTime(p.created, rv, now)
 	}
-	if p.updated != nil && rv.FieldByIndex(p.updated.index).IsZero() {
+	if p.updated != nil && fieldIsZero(p.updated, base, rv) {
 		setTime(p.updated, rv, now)
 	}
 	if p.version != nil {
@@ -338,12 +345,14 @@ func stampForInsert(p *plan, rv reflect.Value, now time.Time) {
 }
 
 func setTime(f *field, rv reflect.Value, now time.Time) {
-	fv := rv.FieldByIndex(f.index)
-	if f.typ == timePtrType {
-		fv.Set(reflect.ValueOf(&now))
+	if f.typ == timeType {
+		// Same offset discipline as the scan fast path: mapped time fields
+		// are value-embedded, so a direct store skips reflect.ValueOf's
+		// interface boxing — the single largest allocation on Insert/Update.
+		*(*time.Time)(unsafe.Add(rv.Addr().UnsafePointer(), f.offset)) = now
 		return
 	}
-	fv.Set(reflect.ValueOf(now))
+	rv.FieldByIndex(f.index).Set(reflect.ValueOf(&now)) // *time.Time
 }
 
 func bumpVersion(f *field, rv reflect.Value) {
@@ -379,7 +388,7 @@ func insertColumns(p *plan, rv reflect.Value, d Dialect, now time.Time) (cols, b
 			back = append(back, f)
 			continue
 		}
-		a, err := fieldValue(f, base, rv, d, now)
+		a, err := fieldValue(f, base, rv, d)
 		if err != nil {
 			return nil, nil, nil, 0, false, err
 		}
@@ -415,6 +424,9 @@ func renderInsertHead(g *grammar, p *plan, cols []*field) []byte {
 	b := make([]byte, 0, 128)
 	b = append(b, "INSERT INTO "...)
 	b = d.quote(b, g.table(p))
+	if len(cols) == 0 {
+		return b // appendInsertValues renders the dialect's empty-row form
+	}
 	b = append(b, " ("...)
 	for i, f := range cols {
 		if i > 0 {
@@ -424,6 +436,27 @@ func renderInsertHead(g *grammar, p *plan, cols []*field) []byte {
 	}
 	b = append(b, ')')
 	return b
+}
+
+// appendInsertValues renders one row's VALUES tuple. When every column was
+// skipped (auto-increment PK plus omitzero columns, all zero) the row is
+// all-defaults: PostgreSQL/SQLite reject "() VALUES ()" and need
+// DEFAULT VALUES; MySQL only accepts the former.
+func appendInsertValues(b []byte, d Dialect, n int) []byte {
+	if n == 0 {
+		if d.name() == "mysql" {
+			return append(b, " () VALUES ()"...)
+		}
+		return append(b, " DEFAULT VALUES"...)
+	}
+	b = append(b, " VALUES ("...)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b = append(b, ", "...)
+		}
+		b = append(b, '?')
+	}
+	return append(b, ')')
 }
 
 // appendReturning renders an explicit column list — never * — so scans stay
@@ -526,18 +559,56 @@ func appendPKWhereSQL(b []byte, d Dialect, p *plan) []byte {
 	return b // still in unified ? form; crudSQL rebinds the whole statement
 }
 
+// zeroAffectedMeansMissing resolves the n==0 ambiguity for versionless
+// UPDATE-shaped writes. PostgreSQL and SQLite count matched rows, so zero
+// means the row is gone. MySQL counts changed rows (and rio must not flip
+// CLIENT_FOUND_ROWS: Upsert's insert/update discrimination depends on the
+// default ON DUPLICATE KEY counts), so an idempotent UPDATE also reports 0 —
+// one extra primary-key probe, only on this ambiguous path, keeps the
+// ErrNotFound contract identical on all three dialects.
+func zeroAffectedMeansMissing(ctx context.Context, db Queryer, p *plan, rv reflect.Value) (bool, error) {
+	g := db.gram()
+	if g.d.name() != "mysql" {
+		return true, nil
+	}
+	d := g.d
+	sqlText, err := crudSQL(g, p, "pkprobe", 0, true, func() []byte {
+		b := make([]byte, 0, 96)
+		b = append(b, "SELECT 1 FROM "...)
+		b = d.quote(b, g.table(p))
+		b = appendPKWhereSQL(b, d, p) // version is nil on this path: PKs only
+		return append(b, " LIMIT 1"...)
+	})
+	if err != nil {
+		return false, err
+	}
+	args, err := appendKeyArgs(nil, p, rv, d)
+	if err != nil {
+		return false, err
+	}
+	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
+	if err != nil {
+		return false, err
+	}
+	exists := rows.Next()
+	err = rows.Err()
+	rows.Close()
+	finishQuery(finish, err)
+	return !exists, err
+}
+
 // appendKeyArgs binds the PK (+version) values matching appendPKWhereSQL.
-func appendKeyArgs(args []any, p *plan, rv reflect.Value, d Dialect, now time.Time) ([]any, error) {
+func appendKeyArgs(args []any, p *plan, rv reflect.Value, d Dialect) ([]any, error) {
 	base := rv.Addr().UnsafePointer()
 	for _, pk := range p.pks {
-		a, err := fieldValue(pk, base, rv, d, now)
+		a, err := fieldValue(pk, base, rv, d)
 		if err != nil {
 			return nil, err
 		}
 		args = append(args, a)
 	}
 	if p.version != nil {
-		a, err := fieldValue(p.version, base, rv, d, now)
+		a, err := fieldValue(p.version, base, rv, d)
 		if err != nil {
 			return nil, err
 		}
@@ -548,17 +619,17 @@ func appendKeyArgs(args []any, p *plan, rv reflect.Value, d Dialect, now time.Ti
 
 // bindFields extracts the bind values for a rendered field list plus the
 // key/version tail.
-func bindFields(p *plan, rv reflect.Value, d Dialect, now time.Time, set []*field) ([]any, error) {
+func bindFields(p *plan, rv reflect.Value, d Dialect, set []*field) ([]any, error) {
 	base := rv.Addr().UnsafePointer()
 	args := make([]any, 0, len(set)+len(p.pks)+1)
 	for _, f := range set {
-		a, err := fieldValue(f, base, rv, d, now)
+		a, err := fieldValue(f, base, rv, d)
 		if err != nil {
 			return nil, err
 		}
 		args = append(args, a)
 	}
-	return appendKeyArgs(args, p, rv, d, now)
+	return appendKeyArgs(args, p, rv, d)
 }
 
 func fillLastInsertID(p *plan, rv reflect.Value, lastID func() (int64, error)) error {
@@ -625,7 +696,7 @@ func Restore[T any](ctx context.Context, db Queryer, row *T) error {
 	if p.updated != nil {
 		args = append(args, d.bindTime(now))
 	}
-	if args, err = appendKeyArgs(args, p, rv, d, now); err != nil {
+	if args, err = appendKeyArgs(args, p, rv, d); err != nil {
 		return err
 	}
 	res, err := run(ctx, db, "update", p.structName, sqlText, args)
@@ -640,7 +711,14 @@ func Restore[T any](ctx context.Context, db Queryer, row *T) error {
 		if p.version != nil {
 			return ErrStaleObject
 		}
-		return ErrNotFound
+		missing, perr := zeroAffectedMeansMissing(ctx, db, p, rv)
+		if perr != nil {
+			return perr
+		}
+		if missing {
+			return ErrNotFound
+		}
+		// Matched but unchanged: restoring a live row is idempotent.
 	}
 	clearTime(p.softDel, rv)
 	if p.updated != nil {
@@ -653,5 +731,9 @@ func Restore[T any](ctx context.Context, db Queryer, row *T) error {
 }
 
 func clearTime(f *field, rv reflect.Value) {
+	if f.typ == timeType {
+		*(*time.Time)(unsafe.Add(rv.Addr().UnsafePointer(), f.offset)) = time.Time{}
+		return
+	}
 	rv.FieldByIndex(f.index).SetZero()
 }

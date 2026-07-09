@@ -34,6 +34,7 @@ func TestSQLiteV02Suite(t *testing.T) {
 	db := sqliteDB(t)
 	runV02Suite(t, db, "sqlite")
 	runV03Sync(t, db, "sqlite")
+	runHardening(t, db, "sqlite")
 }
 
 func TestPostgresSuite(t *testing.T) {
@@ -50,6 +51,7 @@ func TestPostgresSuite(t *testing.T) {
 	runSuite(t, db, "postgres")
 	runV02Suite(t, db, "postgres")
 	runV03Sync(t, db, "postgres")
+	runHardening(t, db, "postgres")
 }
 
 func TestMySQLSuite(t *testing.T) {
@@ -81,6 +83,7 @@ func TestMySQLSuite(t *testing.T) {
 	runSuite(t, db, "mysql")
 	runV02Suite(t, db, "mysql")
 	runV03Sync(t, db, "mysql")
+	runHardening(t, db, "mysql")
 }
 
 // TestModerncTimeProbe pins how the modernc driver round-trips rio's own

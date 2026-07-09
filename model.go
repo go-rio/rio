@@ -23,14 +23,15 @@ type plan struct {
 	tableOverride string // from TableName(), "" otherwise
 	defaultTable  string // convention-derived, pre-computed
 
-	fields   []*field
-	byColumn map[string]*field
-	pks      []*field
-	autoIncr *field
-	version  *field
-	softDel  *field
-	created  *field
-	updated  *field
+	fields    []*field
+	byColumn  map[string]*field
+	pks       []*field
+	updatable []*field // full-column Update set, in field order
+	autoIncr  *field
+	version   *field
+	softDel   *field
+	created   *field
+	updated   *field
 
 	rels     map[string]*relField
 	relNames []string
@@ -133,7 +134,15 @@ func (p *plan) addFields(t reflect.Type, prefix []int, baseOffset uintptr) error
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
 		if !sf.IsExported() {
-			continue
+			// An embedded struct promotes its exported fields even when the
+			// embedded type's own name is unexported — encoding/json flattens
+			// these too, and silently dropping mapped columns is exactly the
+			// surprise rio refuses. Genuinely private fields stay skipped.
+			embeddedStruct := sf.Anonymous && (sf.Type.Kind() == reflect.Struct ||
+				(sf.Type.Kind() == reflect.Pointer && sf.Type.Elem().Kind() == reflect.Struct))
+			if !embeddedStruct {
+				continue
+			}
 		}
 		tag, opts, err := parseTag(sf)
 		if err != nil {
@@ -208,7 +217,13 @@ func (p *plan) addFields(t reflect.Type, prefix []int, baseOffset uintptr) error
 		if opts.softDelete {
 			f.isSoftDelete = true
 		}
-		if !opts.noStamp && sf.Type == timeType {
+		if !opts.noStamp && !opts.softDelete && !opts.version &&
+			(sf.Type == timeType || sf.Type == timePtrType) {
+			// The CreatedAt/UpdatedAt convention is name-based, so an explicit
+			// role tag wins: a field a user deliberately tagged softdelete is
+			// not also the updated_at stamp just because it is named UpdatedAt.
+			// *time.Time is accepted like softdelete — setTime/stampForInsert
+			// maintain the pointer form, so it must not silently go unstamped.
 			switch sf.Name {
 			case "CreatedAt":
 				f.isCreated = true
@@ -262,10 +277,10 @@ func (p *plan) classify() []error {
 			p.softDel = single("softdelete", p.softDel, f)
 		}
 		if f.isCreated {
-			p.created = f
+			p.created = single("CreatedAt", p.created, f)
 		}
 		if f.isUpdated {
-			p.updated = f
+			p.updated = single("UpdatedAt", p.updated, f)
 		}
 	}
 	if len(p.pks) == 1 {
@@ -277,6 +292,12 @@ func (p *plan) classify() []error {
 	}
 	if p.version != nil && p.version.isPK {
 		errs = append(errs, errors.New("the version column cannot be part of the primary key"))
+	}
+	for _, f := range p.fields {
+		if f.isPK || f.isCreated || f.isVersion {
+			continue
+		}
+		p.updatable = append(p.updatable, f)
 	}
 	return errs
 }

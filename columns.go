@@ -43,6 +43,7 @@ func WriteColumns(w io.Writer, pkgName string, models ...any) error {
 		plan  *plan
 	}
 	gens := make([]gen, 0, len(models))
+	byName := make(map[string]string, len(models)) // struct name → full type
 	for _, m := range models {
 		t := reflect.TypeOf(m)
 		if t.Kind() == reflect.Pointer {
@@ -52,6 +53,14 @@ func WriteColumns(w io.Writer, pkgName string, models ...any) error {
 		if err != nil {
 			return err
 		}
+		// Two models sharing a struct name (same type twice, or User from two
+		// packages) would emit colliding declarations — code that cannot
+		// compile. Refuse with the fix.
+		if prev, dup := byName[p.structName]; dup {
+			return fmt.Errorf("rio: WriteColumns: %s and %s both generate %sTable/%sCols; generate them into separate files",
+				prev, t.String(), p.structName, p.structName)
+		}
+		byName[p.structName] = t.String()
 		table := p.defaultTable
 		if p.tableOverride != "" {
 			table = p.tableOverride

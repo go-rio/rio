@@ -34,6 +34,11 @@ type compiledSQL struct {
 // already has its argument — a frozen constant query) or fully
 // exec-parameterized (no inline arguments; every ? binds at the call).
 // Slice expansion inside IN (?) needs value shapes and is inline-only.
+//
+// Rendered SQL is cached per DB handle for the Compiled value's lifetime.
+// Treat *DB as the long-lived object it is meant to be; churning through
+// short-lived handles against package-level Compiled queries accumulates one
+// cache entry per handle.
 func MustCompile[T any](q Query[T]) *Compiled[T] {
 	c, err := Compile(q)
 	if err != nil {
@@ -52,6 +57,9 @@ func Compile[T any](q Query[T]) (*Compiled[T], error) {
 		return nil, err
 	}
 
+	if err := checkHasCondArity(p, &q.s); err != nil {
+		return nil, err
+	}
 	inlineArgs := 0
 	for _, w := range q.s.wheres {
 		inlineArgs += len(w.args)
@@ -86,6 +94,41 @@ func Compile[T any](q Query[T]) (*Compiled[T], error) {
 			p.structName)
 	}
 	return c, nil
+}
+
+// checkHasCondArity requires every WhereHas condition to carry exactly its
+// own arguments at build time. WhereHas conditions live inside the EXISTS
+// subquery and always bind inline — a bare ? there cannot be an exec-time
+// parameter, and letting it slip through would surface later as a confusing
+// renumbering error (inline mode) or diverge between finishers (exec mode).
+func checkHasCondArity(p *plan, s *queryState) error {
+	holes, args := 0, 0
+	ambiguous := false
+	for _, hc := range s.hasConds {
+		var rq relQuery
+		for _, opt := range hc.opts {
+			opt(&rq)
+		}
+		for _, w := range rq.wheres {
+			args += len(w.args)
+			pg, my, lite := 0, 0, 0
+			_, _, _ = rebindCount(pgLex, w.expr, &pg)
+			_, _, _ = rebindCount(mysqlLex, w.expr, &my)
+			_, _, _ = rebindCount(sqliteLex, w.expr, &lite)
+			if pg != my || my != lite {
+				ambiguous = true
+			}
+			holes += pg
+		}
+	}
+	if ambiguous {
+		return fmt.Errorf("rio: Compile[%s]: cannot verify WhereHas placeholder count independent of dialect", p.structName)
+	}
+	if holes != args {
+		return fmt.Errorf("rio: Compile[%s]: WhereHas conditions bind inline; %d placeholder(s) need %d argument(s) at build time",
+			p.structName, holes, args)
+	}
+	return nil
 }
 
 // hasArgsInHasConds reports whether any WhereHas carries inline arguments.
@@ -223,6 +266,9 @@ func (c *Compiled[T]) All(ctx context.Context, db Queryer, args ...any) ([]T, er
 	if err := preloadInto(ctx, db, p, out, c.q.s.withs); err != nil {
 		return nil, err
 	}
+	if err := countInto(ctx, db, p, out, c.q.s.counts); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -240,6 +286,9 @@ func (c *Compiled[T]) First(ctx context.Context, db Queryer, args ...any) (*T, e
 }
 
 // Sole returns the single matching row, ErrNotFound, or ErrMultipleRows.
+// Like First it runs the compiled SQL as-is: to distinguish one row from many
+// it scans whatever the query returns, so compile with Limit(2) to keep it
+// from materializing a large result set just to detect duplicates.
 func (c *Compiled[T]) Sole(ctx context.Context, db Queryer, args ...any) (*T, error) {
 	rows, err := c.All(ctx, db, args...)
 	if err != nil {
@@ -312,8 +361,9 @@ func (c *Compiled[T]) Rows(ctx context.Context, db Queryer, args ...any) iter.Se
 	}
 }
 
-// Count runs the compiled conditions under SELECT count(*). The count SQL
-// renders per grammar on first use like everything else.
+// Count runs the compiled conditions under SELECT count(*). Its shape differs
+// from the cached row SELECT, so Count renders on every call — when a count
+// sits on a hot path, measure it, and reach for Raw if rendering shows up.
 func (c *Compiled[T]) Count(ctx context.Context, db Queryer, args ...any) (int64, error) {
 	q := c.q
 	if c.inline && len(args) > 0 {
@@ -329,7 +379,8 @@ func (c *Compiled[T]) Count(ctx context.Context, db Queryer, args ...any) (int64
 	return q.Count(ctx, db)
 }
 
-// Exists reports whether any row matches.
+// Exists reports whether any row matches. Like Count it renders per call —
+// its shape differs from the cached row SELECT.
 func (c *Compiled[T]) Exists(ctx context.Context, db Queryer, args ...any) (bool, error) {
 	q := c.q
 	if c.inline && len(args) > 0 {

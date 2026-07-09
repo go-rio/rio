@@ -4,8 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
+	"math"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -757,10 +760,10 @@ func TestAttachDetach(t *testing.T) {
 		t.Fatalf("detach sql:\n got: %s\nwant: %s", got, want)
 	}
 
-	if err := Detach(ctx, db, acc, "Tags"); err == nil {
+	if err := Detach[Account, int64](ctx, db, acc, "Tags"); err == nil {
 		t.Fatal("Detach without ids must refuse")
 	}
-	if err := Attach(ctx, db, acc, "Tags"); err != nil {
+	if err := Attach[Account, int64](ctx, db, acc, "Tags"); err != nil {
 		t.Fatalf("Attach with zero ids is a no-op: %v", err)
 	}
 	if err := Attach(ctx, db, &User{ID: 1}, "Posts", 1); err == nil || !strings.Contains(err.Error(), "ManyToMany") {
@@ -983,5 +986,797 @@ func TestWriteColumnsRefusesDuplicateFieldNames(t *testing.T) {
 	err := WriteColumns(&buf, "models", Doubled{})
 	if err == nil || !strings.Contains(err.Error(), "two fields named ID") {
 		t.Fatalf("duplicate field names must refuse: %v", err)
+	}
+}
+
+// --- post-v0.3.0 self-review hardening ---
+
+// Compiled.All ran preloads but silently dropped WithCount.
+func TestCompiledAllFillsWithCount(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
+	f.queueRows([]string{"board_id", "count"}, []driver.Value{int64(1), int64(4)})
+
+	counted := MustCompile(From[Board]().WithCount("Posts"))
+	boards, err := counted.All(ctx, db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if len(boards) != 1 || boards[0].PostsCount != 4 {
+		t.Fatalf("compiled WithCount must fill counts: %+v", boards)
+	}
+}
+
+// A silently ignored Limit would turn "delete ten rows" into "delete every
+// matching row"; set-based writes refuse shapes they cannot honor.
+func TestSetOpsRefuseLimitOffsetGroupBy(t *testing.T) {
+	ctx := context.Background()
+	db := newFakeDB().open()
+
+	if _, err := From[User]().Where("age > ?", 1).Limit(10).DeleteAll(ctx, db); err == nil || !strings.Contains(err.Error(), "DeleteAll cannot honor Limit/Offset") {
+		t.Fatalf("DeleteAll with Limit: %v", err)
+	}
+	if _, err := From[User]().Where("age > ?", 1).Offset(5).UpdateAll(ctx, db, Set{"age": 2}); err == nil || !strings.Contains(err.Error(), "UpdateAll cannot honor Limit/Offset") {
+		t.Fatalf("UpdateAll with Offset: %v", err)
+	}
+	if _, err := From[User]().Where("age > ?", 1).Limit(10).ForceDeleteAll(ctx, db); err == nil || !strings.Contains(err.Error(), "ForceDeleteAll cannot honor Limit/Offset") {
+		t.Fatalf("ForceDeleteAll with Limit: %v", err)
+	}
+	if _, err := From[User]().Where("age > ?", 1).GroupBy("age").UpdateAll(ctx, db, Set{"age": 2}); err == nil || !strings.Contains(err.Error(), "GroupBy") {
+		t.Fatalf("UpdateAll with GroupBy: %v", err)
+	}
+	if _, err := From[User]().Where("age > ?", 1).Limit(3).RestoreAll(ctx, db); err == nil || !strings.Contains(err.Error(), "RestoreAll cannot honor Limit/Offset") {
+		t.Fatalf("Restore with Limit: %v", err)
+	}
+}
+
+// Pluck refuses row-set-changing clauses it does not render, and honors
+// ForUpdate instead of silently skipping the lock.
+func TestPluckShapeGuards(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+
+	if _, err := Pluck[string](ctx, db, From[User]().GroupBy("age"), "email"); err == nil || !strings.Contains(err.Error(), "Raw") {
+		t.Fatalf("Pluck with GroupBy: %v", err)
+	}
+	f.queueRows([]string{"email"}, []driver.Value{"a@x"})
+	if _, err := Pluck[string](ctx, db, From[User]().Where("id = ?", 1).ForUpdate(), "email"); err != nil {
+		t.Fatalf("Pluck: %v", err)
+	}
+	if got := f.logged()[0]; !strings.HasSuffix(got, " FOR UPDATE") {
+		t.Fatalf("Pluck must render FOR UPDATE: %s", got)
+	}
+}
+
+// WhereHas conditions bind inside the EXISTS subquery; a bare ? there can
+// never be an exec-time parameter and must refuse at compile time.
+func TestCompileRejectsBareWhereHasPlaceholder(t *testing.T) {
+	_, err := Compile[User](From[User]().Where("age > ?").WhereHas("Posts", RelWhere("title = ?")))
+	if err == nil || !strings.Contains(err.Error(), "bind inline") {
+		t.Fatalf("bare ? in WhereHas must refuse at compile: %v", err)
+	}
+	_, err = Compile[User](From[User]().WhereHas("Posts", RelWhere("title = ?")))
+	if err == nil || !strings.Contains(err.Error(), "bind inline") {
+		t.Fatalf("bare ? in WhereHas (no other conds) must refuse: %v", err)
+	}
+}
+
+// Two models sharing a struct name would emit colliding declarations.
+func TestWriteColumnsRefusesDuplicateModelNames(t *testing.T) {
+	var buf strings.Builder
+	err := WriteColumns(&buf, "models", User{}, User{})
+	if err == nil || !strings.Contains(err.Error(), "separate files") {
+		t.Fatalf("duplicate model names must refuse: %v", err)
+	}
+}
+
+// A [16]byte UUID is one value; expanding it into sixteen placeholders would
+// splice a list into "= ?".
+func TestByteArrayArgStaysScalar(t *testing.T) {
+	sqlText, args, err := rebind(pgLex, bindDollar, "id = ?", []any{[16]byte{1}})
+	if err != nil {
+		t.Fatalf("rebind: %v", err)
+	}
+	if sqlText != "id = $1" || len(args) != 1 {
+		t.Fatalf("byte array must not expand: %s %v", sqlText, args)
+	}
+}
+
+// sql.NullTime as a query argument must bind rio's own time encoding — on
+// SQLite the driver's format would miss every stored value.
+func TestNormalizeArgsNullTime(t *testing.T) {
+	at := time.Date(2026, 7, 9, 3, 4, 5, 0, time.UTC)
+	out := normalizeArgs(SQLite, []any{sql.NullTime{Time: at, Valid: true}, sql.NullTime{}})
+	if s, ok := out[0].(string); !ok || !strings.HasPrefix(s, "2026-07-09 03:04:05") {
+		t.Fatalf("valid NullTime must bind rio's text form: %#v", out[0])
+	}
+	if out[1] != nil {
+		t.Fatalf("invalid NullTime must bind NULL: %#v", out[1])
+	}
+	out = normalizeArgs(SQLite, []any{sql.Null[time.Time]{V: at, Valid: true}})
+	if s, ok := out[0].(string); !ok || !strings.HasPrefix(s, "2026-07-09 03:04:05") {
+		t.Fatalf("sql.Null[time.Time] must bind rio's text form: %#v", out[0])
+	}
+}
+
+// --- opus multi-lens audit (post-v0.3.0) regressions ---
+
+// The SQL cache keys on an order-free column bitmap; whitelist rendering and
+// binding must therefore use one canonical order, or the second of two
+// same-columns-different-order Updates would bind values into the wrong
+// columns through the first call's cached statement.
+func TestUpdateWhitelistOrderInsensitive(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+
+	u1 := User{ID: 1, Email: "a@x", Age: 30}
+	if err := Update(ctx, db, &u1, "email", "age"); err != nil {
+		t.Fatalf("first update: %v", err)
+	}
+	u2 := User{ID: 2, Email: "b@x", Age: 40}
+	if err := Update(ctx, db, &u2, "age", "email"); err != nil {
+		t.Fatalf("second update: %v", err)
+	}
+	stmts := f.loggedContaining("UPDATE")
+	if len(stmts) != 2 || stmts[0].sql != stmts[1].sql {
+		t.Fatalf("both orders must share one canonical statement:\n%s\n%s", stmts[0].sql, stmts[1].sql)
+	}
+	// Canonical order is field order: email before age. The second call's
+	// args must match that layout, not its caller order.
+	if stmts[1].args[0] != "b@x" || stmts[1].args[1] != int64(40) {
+		t.Fatalf("second call bound values in caller order, not canonical: %v", stmts[1].args)
+	}
+}
+
+type AllDefaults struct {
+	ID   int64
+	Slot int `rio:",omitzero"`
+}
+
+// A row whose every column is skipped (auto-increment PK + zero omitzero
+// columns) must render the dialect's empty-row form, not "() VALUES ()"
+// which PostgreSQL and SQLite reject.
+func TestInsertAllDefaultsRendersDefaultValues(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueRows([]string{"id", "slot"}, []driver.Value{int64(7), int64(0)})
+	row := AllDefaults{}
+	if err := Insert(ctx, db, &row); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	want := `INSERT INTO "all_defaultses" DEFAULT VALUES RETURNING "id", "slot"`
+	if got := f.logged()[0]; got != want {
+		t.Fatalf("sqlite all-defaults insert:\n got: %s\nwant: %s", got, want)
+	}
+	if row.ID != 7 {
+		t.Fatalf("backfill: %+v", row)
+	}
+
+	fm := newFakeDB()
+	dbm := fm.open(MySQL)
+	fm.queueExec(9, 1)
+	rowm := AllDefaults{}
+	if err := Insert(ctx, dbm, &rowm); err != nil {
+		t.Fatalf("mysql Insert: %v", err)
+	}
+	if got := fm.logged()[0]; got != "INSERT INTO `all_defaultses` () VALUES ()" {
+		t.Fatalf("mysql all-defaults insert: %s", got)
+	}
+
+	// Upsert cannot express DEFAULT VALUES + conflict clause on SQLite;
+	// refuse uniformly instead of working on two dialects out of three.
+	if err := Upsert(ctx, db, &AllDefaults{}, OnConflict("id")); err == nil || !strings.Contains(err.Error(), "use Insert") {
+		t.Fatalf("all-defaults upsert must refuse: %v", err)
+	}
+}
+
+// json.RawMessage is one JSONB value, not a list of bytes.
+func TestNamedByteSliceStaysScalar(t *testing.T) {
+	raw := json.RawMessage(`{"k":1}`)
+	sqlText, args, err := rebind(pgLex, bindDollar, "data @> ?", []any{raw})
+	if err != nil {
+		t.Fatalf("rebind: %v", err)
+	}
+	if sqlText != "data @> $1" || len(args) != 1 {
+		t.Fatalf("named byte slice must not expand: %s %v", sqlText, args)
+	}
+}
+
+type Student struct {
+	ID      int64
+	Courses ManyToMany[CourseX] `rio:",join:enrollments,fk:learner_id,ref:course_ref"`
+}
+
+type CourseX struct {
+	ID int64
+}
+
+type Node struct {
+	ID      int64
+	Related ManyToMany[Node] `rio:",join:node_links"`
+}
+
+type NodeOK struct {
+	ID      int64
+	Related ManyToMany[NodeOK] `rio:",join:node_links,fk:src_id,ref:dst_id"`
+}
+
+// fk:/ref: on ManyToMany name the join table's columns; the convention would
+// otherwise hardcode struct names — and collide on self-referential m2m.
+func TestManyToManyJoinColumnOverrides(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
+	f.queueRows([]string{"id", "learner_id"})
+
+	_, err := From[Student]().With("Courses").All(ctx, db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	rel := f.logged()[1]
+	for _, frag := range []string{`"enrollments"."course_ref" = "course_xes"."id"`, `"enrollments"."learner_id" IN ($1)`} {
+		if !strings.Contains(rel, frag) {
+			t.Fatalf("fk:/ref: overrides missing, got:\n%s", rel)
+		}
+	}
+
+	// Self-referential m2m without explicit columns: both join columns would
+	// be "node_id" — refuse with the fix.
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
+	_, err = From[Node]().With("Related").All(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "fk: and ref:") {
+		t.Fatalf("self-referential m2m must demand explicit columns: %v", err)
+	}
+
+	// With explicit columns it renders both sides distinctly.
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
+	f.queueRows([]string{"id", "src_id"})
+	_, err = From[NodeOK]().With("Related").All(ctx, db)
+	if err != nil {
+		t.Fatalf("self-ref with tags: %v", err)
+	}
+	rel = f.logged()[len(f.logged())-1]
+	for _, frag := range []string{`"node_links"."dst_id" = "node_oks"."id"`, `"node_links"."src_id" IN ($1)`} {
+		if !strings.Contains(rel, frag) {
+			t.Fatalf("self-ref join columns wrong, got:\n%s", rel)
+		}
+	}
+}
+
+// MySQL counts changed rows, not matched rows: an idempotent Update must not
+// report ErrNotFound. One PK probe resolves the ambiguity; a truly missing
+// row still errors.
+func TestMySQLIdempotentUpdateProbes(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(MySQL)
+
+	f.queueExec(0, 0)                                    // UPDATE: matched but unchanged
+	f.queueRows([]string{"1"}, []driver.Value{int64(1)}) // probe finds the row
+	if err := Update(ctx, db, &Post{ID: 1, UserID: 5}); err != nil {
+		t.Fatalf("idempotent update must succeed: %v", err)
+	}
+	probe := f.logged()[1]
+	if !strings.Contains(probe, "SELECT 1 FROM `posts` WHERE `id` = ? LIMIT 1") {
+		t.Fatalf("probe sql: %s", probe)
+	}
+
+	f.queueExec(0, 0)          // UPDATE: no such row
+	f.queueRows([]string{"1"}) // probe finds nothing
+	err := Update(ctx, db, &Post{ID: 99, UserID: 5})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing row must stay ErrNotFound: %v", err)
+	}
+
+	// PostgreSQL counts matched rows; no probe happens.
+	fp := newFakeDB()
+	dbp := fp.open()
+	fp.queueExec(0, 0)
+	if err := Update(ctx, dbp, &Post{ID: 1, UserID: 5}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("pg zero-affected means missing: %v", err)
+	}
+	if len(fp.logged()) != 1 {
+		t.Fatalf("pg must not probe: %v", fp.logged())
+	}
+}
+
+// Attach/Detach accept typed id slices spread directly, like SyncRelation.
+func TestAttachDetachTypedIDs(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	ids := []int64{100, 101}
+
+	f.queueExec(0, 2)
+	if err := Attach(ctx, db, &Account{ID: 7}, "Tags", ids...); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	f.queueExec(0, 1)
+	if err := Detach(ctx, db, &Account{ID: 7}, "Tags", ids...); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+	if got := f.logged()[1]; !strings.Contains(got, `"tag_id" IN ($2, $3)`) {
+		t.Fatalf("detach expansion: %s", got)
+	}
+}
+
+// Row locks never reach the aggregate count shape (PostgreSQL rejects them);
+// Exists keeps the lock — its probe row is well-defined.
+func TestCountForUpdateOmitsLock(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+
+	f.queueRows([]string{"count"}, []driver.Value{int64(3)})
+	if _, err := From[Post]().Where("user_id = ?", 5).ForUpdate().Count(ctx, db); err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	if got := f.logged()[0]; strings.Contains(got, "FOR UPDATE") {
+		t.Fatalf("count must not lock: %s", got)
+	}
+	f.queueRows([]string{"1"}, []driver.Value{int64(1)})
+	if _, err := From[Post]().Where("user_id = ?", 5).ForUpdate().Exists(ctx, db); err != nil {
+		t.Fatalf("Exists: %v", err)
+	}
+	if got := f.logged()[1]; !strings.HasSuffix(got, "LIMIT 1 FOR UPDATE") {
+		t.Fatalf("exists keeps the lock: %s", got)
+	}
+}
+
+type Reminder struct {
+	ID     int64
+	Remind sql.NullTime
+}
+
+// sql.NullTime fields bind rio's canonical encoding on the entity write path
+// — the same value must store identically under Insert and Upsert, and on
+// SQLite in rio's own text form.
+func TestNullTimeFieldBindsCanonical(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite)
+
+	at := time.Date(2026, 7, 9, 3, 4, 5, 123456789, time.UTC)
+	f.queueExec(1, 1)
+	if err := Insert(ctx, db, &Reminder{ID: 1, Remind: sql.NullTime{Time: at, Valid: true}}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	args := f.loggedContaining("INSERT")[0].args
+	s, ok := args[1].(string)
+	if !ok || s != "2026-07-09 03:04:05.123456+00:00" {
+		t.Fatalf("NullTime must bind rio's text form (microseconds, UTC): %#v", args[1])
+	}
+
+	f.queueExec(1, 1)
+	if err := Insert(ctx, db, &Reminder{ID: 2, Remind: sql.NullTime{}}); err != nil {
+		t.Fatalf("Insert invalid: %v", err)
+	}
+	if got := f.loggedContaining("INSERT")[1].args[1]; got != nil {
+		t.Fatalf("invalid NullTime must bind NULL: %#v", got)
+	}
+}
+
+// Set-based writes render only their own table with no row order, so Join and
+// OrderBy cannot be honored — refuse loudly rather than drop them silently
+// (a dropped Join leaves the WHERE referencing a table not in the statement).
+func TestSetOpsRefuseJoinAndOrderBy(t *testing.T) {
+	ctx := context.Background()
+	db := newFakeDB().open()
+	if _, err := From[User]().Join("INNER JOIN orgs ON orgs.id = users.org_id").
+		Where("orgs.active = ?", true).UpdateAll(ctx, db, Set{"age": 5}); err == nil || !strings.Contains(err.Error(), "Join") {
+		t.Fatalf("UpdateAll+Join must refuse: %v", err)
+	}
+	if _, err := From[User]().Where("age > ?", 1).OrderBy("id DESC").DeleteAll(ctx, db); err == nil || !strings.Contains(err.Error(), "OrderBy") {
+		t.Fatalf("DeleteAll+OrderBy must refuse: %v", err)
+	}
+	if _, err := From[User]().Where("age > ?", 1).Join("JOIN x ON 1=1").ForceDeleteAll(ctx, db); err == nil || !strings.Contains(err.Error(), "Join") {
+		t.Fatalf("ForceDeleteAll+Join must refuse: %v", err)
+	}
+}
+
+// An embedded struct promotes its exported fields even when the embedded
+// type's own name is unexported — matching encoding/json. Silently dropping
+// them (the old behavior) is the kind of data-omission surprise rio refuses.
+type embeddedMeta struct {
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	Note      string
+	private   int //nolint:unused // fixture: proves unexported fields stay unmapped
+}
+
+type EmbedModel struct {
+	ID   int64
+	Name string
+	embeddedMeta
+}
+
+func TestEmbeddedUnexportedTypeFlattens(t *testing.T) {
+	p, err := planOf[EmbedModel]()
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	cols := map[string]bool{}
+	for _, f := range p.fields {
+		cols[f.column] = true
+	}
+	for _, want := range []string{"id", "name", "created_at", "updated_at", "note"} {
+		if !cols[want] {
+			t.Errorf("embedded exported field %q was dropped", want)
+		}
+	}
+	if cols["private"] {
+		t.Error("unexported inner field must not map")
+	}
+	if p.created == nil || p.updated == nil {
+		t.Fatal("embedded CreatedAt/UpdatedAt not detected")
+	}
+	// End-to-end stamp through the unexported embedding (offset write).
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(MySQL)
+	f.queueExec(1, 1)
+	m := EmbedModel{Name: "x"}
+	if err := Insert(ctx, db, &m); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if m.CreatedAt.IsZero() {
+		t.Fatal("embedded timestamp not stamped")
+	}
+}
+
+// The whitelist-order fix must hold under concurrency: the map-iteration
+// order that originally triggered the miswrite is nondeterministic, so hammer
+// one handle with randomized column orders and assert every statement binds
+// its values into the right columns.
+func TestConcurrentUpdateWhitelistOrder(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	orders := [][]string{{"email", "age"}, {"age", "email"}, {"email", "age"}, {"age", "email"}}
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func(cols []string) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				f.queueExec(0, 1)
+				u := User{ID: 1, Email: "e@x", Age: 42}
+				if err := Update(ctx, db, &u, cols...); err != nil {
+					t.Errorf("update: %v", err)
+					return
+				}
+			}
+		}(orders[g])
+	}
+	wg.Wait()
+	for _, st := range f.loggedContaining("UPDATE") {
+		if len(st.args) >= 2 && (st.args[0] != "e@x" || st.args[1] != int64(42)) {
+			t.Fatalf("mis-bound columns: args=%v sql=%s", st.args, st.sql)
+		}
+	}
+}
+
+// --- round-2 opus audit regressions ---
+
+// Count must refuse Having (with or without GroupBy): a bare HAVING filters
+// the single implicit aggregate group and silently returns 0.
+func TestCountRefusesHaving(t *testing.T) {
+	ctx := context.Background()
+	db := newFakeDB().open()
+	if _, err := From[User]().Having("count(*) > ?", 5).Count(ctx, db); err == nil || !strings.Contains(err.Error(), "Raw") {
+		t.Fatalf("Count with Having must refuse: %v", err)
+	}
+}
+
+// m2m WithCount must INNER JOIN the target, exactly like the With load, so the
+// count matches the rows With would return even without a softdelete column.
+func TestManyToManyWithCountJoinsTarget(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
+	f.queueRows([]string{"account_id", "count"}, []driver.Value{int64(1), int64(2)})
+	_, err := From[CountAcct]().WithCount("Tags").All(ctx, db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	sql := f.logged()[1]
+	if !strings.Contains(sql, "INNER JOIN") {
+		t.Fatalf("m2m WithCount must INNER JOIN target: %s", sql)
+	}
+}
+
+// Duplicate WithCount for one relation counts once, matching With's dedup.
+func TestWithCountDeduplicates(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
+	f.queueRows([]string{"board_id", "count"}, []driver.Value{int64(1), int64(3)})
+	_, err := From[Board]().WithCount("Posts").WithCount("Posts").All(ctx, db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	counts := 0
+	for _, s := range f.logged() {
+		if strings.Contains(s, "count(*)") {
+			counts++
+		}
+	}
+	if counts != 1 {
+		t.Fatalf("duplicate WithCount must issue one count query, got %d", counts)
+	}
+}
+
+// A *time.Time CreatedAt/UpdatedAt is auto-stamped, like the value form and
+// like softdelete's *time.Time acceptance.
+type PtrStamped struct {
+	ID        int64
+	Name      string
+	CreatedAt *time.Time
+	UpdatedAt *time.Time
+}
+
+func TestPointerTimestampsStamped(t *testing.T) {
+	p, err := planOf[PtrStamped]()
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if p.created == nil || p.updated == nil {
+		t.Fatalf("*time.Time CreatedAt/UpdatedAt not detected: created=%v updated=%v", p.created != nil, p.updated != nil)
+	}
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(MySQL)
+	f.queueExec(1, 1)
+	row := PtrStamped{Name: "x"}
+	if err := Insert(ctx, db, &row); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if row.CreatedAt == nil || row.CreatedAt.IsZero() {
+		t.Fatal("*time.Time CreatedAt not stamped")
+	}
+}
+
+// Two fields both claiming the CreatedAt role (reachable via embedding + a
+// column rename) must fail loud, like version/softdelete duplicates.
+type DupCreatedInner struct {
+	CreatedAt time.Time `rio:"made_at"`
+}
+type DupCreated struct {
+	ID        int64
+	CreatedAt time.Time
+	DupCreatedInner
+}
+
+func TestDuplicateCreatedRoleRejected(t *testing.T) {
+	_, err := planOf[DupCreated]()
+	if err == nil || !strings.Contains(err.Error(), "CreatedAt") {
+		t.Fatalf("two CreatedAt roles must be rejected: %v", err)
+	}
+}
+
+// Detach with a byte-kind id type must expand IN (?) to one placeholder per
+// id, not bind the whole slice as one BLOB.
+type ByteTag struct {
+	ID uint8
+}
+type ByteAcct struct {
+	ID   int64
+	Tags ManyToMany[ByteTag] `rio:",join:byte_acct_tags,fk:byte_acct_id,ref:byte_tag_id"`
+}
+
+func TestDetachByteKindIDsExpand(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueExec(0, 2)
+	if err := Detach(ctx, db, &ByteAcct{ID: 1}, "Tags", uint8(1), uint8(2)); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+	sql := f.logged()[0]
+	if !strings.Contains(sql, "IN ($2, $3)") {
+		t.Fatalf("byte-kind ids must expand, got: %s", sql)
+	}
+}
+
+type CountAcct struct {
+	ID        int64
+	TagsCount int64                `rio:",countof:Tags"`
+	Tags      ManyToMany[CountTag] `rio:",join:count_acct_tags"`
+}
+type CountTag struct {
+	ID int64
+}
+
+func (CountAcct) TableName() string { return "count_accts" }
+
+// An explicit role tag wins over the name-based timestamp convention: a field
+// named UpdatedAt but tagged softdelete is the soft-delete column, not also
+// the updated_at stamp (which would fight over the same field).
+type SoftDelNamedTimestamp struct {
+	ID        int64
+	Name      string
+	UpdatedAt time.Time `rio:",softdelete"`
+}
+
+func TestExplicitTagBeatsTimestampName(t *testing.T) {
+	p, err := planOf[SoftDelNamedTimestamp]()
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	f := p.byColumn["updated_at"]
+	if f.isUpdated {
+		t.Error("softdelete-tagged field must not also be the updated_at stamp")
+	}
+	if !f.isSoftDelete || p.softDel == nil {
+		t.Error("softdelete tag must still take effect")
+	}
+	if p.updated != nil {
+		t.Error("p.updated must be nil when the only UpdatedAt is tagged softdelete")
+	}
+}
+
+// --- round-3 opus audit regressions ---
+
+// A slice Set value in UpdateAll must be refused, not IN-expanded into a
+// malformed "SET col = ?, ?".
+func TestUpdateAllRefusesSliceSetValue(t *testing.T) {
+	ctx := context.Background()
+	db := newFakeDB().open()
+	_, err := From[User]().Where("id = ?", 1).UpdateAll(ctx, db, Set{"email": []string{"a", "b"}})
+	if err == nil || !strings.Contains(err.Error(), "slice") {
+		t.Fatalf("slice Set value must be refused: %v", err)
+	}
+}
+
+// WithCount("") must error (unknown relation), not be silently swallowed by
+// the dedup sentinel.
+func TestWithCountEmptyNameErrors(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
+	_, err := From[Board]().WithCount("").All(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "no relation") {
+		t.Fatalf("WithCount(\"\") must error: %v", err)
+	}
+}
+
+// RelLimit's windowed preload must carry an outer ORDER BY so the per-parent
+// child order the user asked for via RelOrder survives.
+func TestRelLimitOuterOrderBy(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows(userCols, userRow(1, "a@x"))
+	f.queueRows(postCols, []driver.Value{int64(10), int64(1), "t"})
+	_, err := From[User]().With("Posts", RelOrder("id DESC"), RelLimit(2)).All(ctx, db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	sql := f.logged()[1]
+	// The outer query (after the rio_w subquery) must ORDER BY the partition
+	// and the row number.
+	if !strings.Contains(sql, `AS "rio_w" WHERE "rio_w"."__rio_rn" <= 2 ORDER BY "rio_w"."user_id", "rio_w"."__rio_rn"`) {
+		t.Fatalf("RelLimit missing outer ORDER BY: %s", sql)
+	}
+}
+
+// The set-based bulk restore is RestoreAll, matching UpdateAll/DeleteAll.
+func TestRestoreAllNaming(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueExec(0, 2)
+	n, err := From[User]().Where("id = ?", 1).RestoreAll(ctx, db)
+	if err != nil {
+		t.Fatalf("RestoreAll: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("RestoreAll affected: %d", n)
+	}
+}
+
+// On MySQL a restore-on-upsert clears deleted_at server-side; rio reconciles
+// the in-memory softdelete field so the row reads as visible without a reload.
+func TestMySQLUpsertReconcilesDeletedAt(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(MySQL)
+	f.queueExec(0, 2) // conflict → update path (affected 2)
+	deleted := testNow.Add(-time.Hour)
+	row := User{ID: 1, Email: "a@x", DeletedAt: &deleted}
+	if err := Upsert(ctx, db, &row, OnConflict("id"), DoUpdate("email")); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if row.DeletedAt != nil && !row.DeletedAt.IsZero() {
+		t.Fatalf("MySQL restore-on-upsert must clear in-memory deleted_at, got %v", row.DeletedAt)
+	}
+}
+
+// --- round-4 opus audit regressions ---
+
+// A basic-kind field that implements driver.Valuer must bind through Value(),
+// not the unsafe fast read that hands the driver the raw underlying value.
+type lowerName string
+
+func (s lowerName) Value() (driver.Value, error) { return strings.ToLower(string(s)), nil }
+
+type ValuerRow struct {
+	ID   int64
+	Name lowerName
+}
+
+func TestValuerBasicFieldBindsThroughValue(t *testing.T) {
+	p, err := planOf[ValuerRow]()
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if !p.byColumn["name"].code.bindValuer {
+		t.Fatal("Valuer basic field must be flagged bindValuer")
+	}
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(MySQL)
+	f.queueExec(1, 1)
+	if err := Insert(ctx, db, &ValuerRow{ID: 1, Name: "MixedCase"}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	// database/sql invokes Value() before the driver sees the arg.
+	args := f.loggedContaining("INSERT")[0].args
+	if args[1] != "mixedcase" {
+		t.Fatalf("Valuer must lowercase on write, got %#v", args[1])
+	}
+}
+
+// RelLimit(0) loads no children (like Query.Limit(0)), not all of them.
+func TestRelLimitZeroLoadsNone(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows(userCols, userRow(1, "a@x"))
+	f.queueRows([]string{"id", "user_id", "title"}) // window query, zero rows
+	_, err := From[User]().With("Posts", RelLimit(0)).All(ctx, db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	// The windowed subquery renders even for limit 0 (rn <= 0 → no rows).
+	if !strings.Contains(f.logged()[1], "ROW_NUMBER()") || !strings.Contains(f.logged()[1], "<= 0") {
+		t.Fatalf("RelLimit(0) must render the bounded window: %s", f.logged()[1])
+	}
+}
+
+// A uint64 above MaxInt64 binds as a decimal string on MySQL/Postgres
+// (BIGINT UNSIGNED / numeric), but fails loud on SQLite, which would coerce
+// the oversized INTEGER literal to REAL and silently lose precision.
+type BigUint struct {
+	ID int64
+	N  uint64
+}
+
+func TestBigUintDialectBinding(t *testing.T) {
+	ctx := context.Background()
+	// MySQL: string bind, no error.
+	fm := newFakeDB()
+	dm := fm.open(MySQL)
+	fm.queueExec(1, 1)
+	if err := Insert(ctx, dm, &BigUint{ID: 1, N: math.MaxUint64}); err != nil {
+		t.Fatalf("mysql big uint: %v", err)
+	}
+	if got := fm.loggedContaining("INSERT")[0].args[1]; got != "18446744073709551615" {
+		t.Fatalf("mysql must bind decimal string, got %#v", got)
+	}
+	// SQLite: fail loud.
+	fs := newFakeDB()
+	ds := fs.open(SQLite)
+	if err := Insert(ctx, ds, &BigUint{ID: 1, N: math.MaxUint64}); err == nil || !strings.Contains(err.Error(), "SQLite") {
+		t.Fatalf("sqlite must fail loud on uint64 overflow: %v", err)
 	}
 }

@@ -110,8 +110,21 @@ func resolveRel(owner *plan, r *relField) (*resolvedRel, error) {
 			}
 			res.joinTable = a + "_" + b
 		}
-		res.joinFK = snakeCase(owner.structName) + "_id"
-		res.joinRef = snakeCase(target.structName) + "_id"
+		// On ManyToMany, fk:/ref: name the join table's two columns: fk is
+		// the owner side, ref the target side.
+		res.joinFK = r.fkTag
+		if res.joinFK == "" {
+			res.joinFK = snakeCase(owner.structName) + "_id"
+		}
+		res.joinRef = r.refTag
+		if res.joinRef == "" {
+			res.joinRef = snakeCase(target.structName) + "_id"
+		}
+		if res.joinFK == res.joinRef {
+			// Self-referential m2m (friends, follows): the convention would
+			// name both join columns identically — physically impossible.
+			return nil, fmt.Errorf("both join-table columns would be %q; a self-referential ManyToMany needs explicit fk: and ref: tags naming the two columns", res.joinFK)
+		}
 	}
 	return res, nil
 }
@@ -130,6 +143,7 @@ type relQuery struct {
 	orders      []string
 	withTrashed bool
 	limit       int
+	limitSet    bool
 }
 
 // RelWhere restricts the preloaded rows. The condition runs inside the
@@ -155,9 +169,10 @@ func RelWithTrashed() RelOption {
 // ROW_NUMBER() OVER (PARTITION BY the foreign key) — the query stays one
 // round trip and pagination-correct. Order within each parent follows
 // RelOrder, defaulting to the target's primary key for determinism.
-// Requires window functions: PostgreSQL, MySQL 8+, SQLite 3.25+.
+// Requires window functions: PostgreSQL, MySQL 8+, SQLite 3.25+. RelLimit(0)
+// loads no children per parent (like Query.Limit(0)), not all of them.
 func RelLimit(n int) RelOption {
-	return func(rq *relQuery) { rq.limit = n }
+	return func(rq *relQuery) { rq.limit, rq.limitSet = n, true }
 }
 
 // preloadInto loads relation paths into rows of one plan.
@@ -233,6 +248,9 @@ func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, r
 
 	// Collect owner-side keys, deduplicated. A nil pointer key (NULL FK on
 	// BelongsTo) resolves that parent to loaded-nil without querying.
+	// canonKey groups (it stringifies []byte, which is not a comparable map
+	// key); the child IN (?) binds the *original* value — a stringified
+	// []byte would not match a BLOB/BYTEA column, silently loading nothing.
 	seen := make(map[any]struct{})
 	var keys []any
 	parentKey := make([]any, rows.Len())
@@ -249,7 +267,7 @@ func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, r
 		parentKey[i] = k
 		if _, dup := seen[k]; !dup {
 			seen[k] = struct{}{}
-			keys = append(keys, k)
+			keys = append(keys, kv.Interface())
 		}
 	}
 
@@ -320,7 +338,8 @@ func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, r
 				}
 				kv = kv.Elem()
 			}
-			byKey[canonKey(kv)] = append(byKey[canonKey(kv)], i)
+			k := canonKey(kv)
+			byKey[k] = append(byKey[k], i)
 		}
 	}
 
@@ -354,7 +373,7 @@ func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, r
 // renderRelSelect renders the preload query. keyed reports whether an extra
 // join-key column is appended after the entity columns (ManyToMany).
 func renderRelSelect(g *grammar, res *resolvedRel, kind relKind, keys []any, rq *relQuery) (string, []any, bool, error) {
-	if rq.limit > 0 {
+	if rq.limitSet {
 		return renderRelSelectLimited(g, res, kind, keys, rq)
 	}
 	d := g.d
@@ -484,8 +503,16 @@ func scanRel(rows *sql.Rows, p *plan, buf reflect.Value, keyed bool, res *resolv
 
 // canonKey normalizes join-key values so int32 FKs match int64 PKs in the
 // grouping map. []byte keys (binary UUIDs) convert to string — slices are
-// not comparable and would panic as map keys.
+// not comparable and would panic as map keys. Pointers dereference to their
+// value (nil to nil): an address would never equal the value key scanned
+// from the other side.
 func canonKey(v reflect.Value) any {
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return nil
+		}
+		v = v.Elem()
+	}
 	switch v.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return v.Int()
@@ -521,7 +548,12 @@ func countInto[T any](ctx context.Context, db Queryer, p *plan, rows []T, counts
 	rv := reflect.ValueOf(rows)
 	sorted := append([]string(nil), counts...)
 	sort.Strings(sorted)
+	prev, first := "", true
 	for _, name := range sorted {
+		if !first && name == prev {
+			continue // deduplicate: WithCount("X").WithCount("X") counts once, like With
+		}
+		first, prev = false, name
 		if err := countRelation(ctx, db, p, name, rv); err != nil {
 			return err
 		}
@@ -546,16 +578,24 @@ func countRelation(ctx context.Context, db Queryer, owner *plan, name string, ro
 		return err
 	}
 
+	// canonKey groups; the IN (?) binds the original value (see loadRelation).
 	seen := make(map[any]struct{})
 	var keys []any
 	parentKey := make([]any, rows.Len())
 	for i := 0; i < rows.Len(); i++ {
 		kv := rows.Index(i).FieldByIndex(res.ref.index)
+		if kv.Kind() == reflect.Pointer {
+			if kv.IsNil() {
+				parentKey[i] = nil // nil pointer key: nothing to count against
+				continue
+			}
+			kv = kv.Elem()
+		}
 		k := canonKey(kv)
 		parentKey[i] = k
 		if _, dup := seen[k]; !dup {
 			seen[k] = struct{}{}
-			keys = append(keys, k)
+			keys = append(keys, kv.Interface())
 		}
 	}
 
@@ -575,18 +615,21 @@ func countRelation(ctx context.Context, db Queryer, owner *plan, name string, ro
 			b = d.quote(b, keyCol)
 			b = append(b, ", count(*) FROM "...)
 			b = d.quote(b, res.joinTable)
+			// Always INNER JOIN the target, exactly as the With load does, so
+			// the count matches the number of rows With would return: a join
+			// row pointing at a missing target counts zero either way. The
+			// softdelete predicate additionally excludes tombstoned targets.
+			b = append(b, " INNER JOIN "...)
+			b = d.quote(b, g.table(res.target))
+			b = append(b, " ON "...)
+			b = d.quote(b, g.table(res.target))
+			b = append(b, '.')
+			b = d.quote(b, res.fk.column)
+			b = append(b, " = "...)
+			b = d.quote(b, res.joinTable)
+			b = append(b, '.')
+			b = d.quote(b, res.joinRef)
 			if res.target.softDel != nil {
-				// Tombstoned targets must not count; join filters them.
-				b = append(b, " INNER JOIN "...)
-				b = d.quote(b, g.table(res.target))
-				b = append(b, " ON "...)
-				b = d.quote(b, g.table(res.target))
-				b = append(b, '.')
-				b = d.quote(b, res.fk.column)
-				b = append(b, " = "...)
-				b = d.quote(b, res.joinTable)
-				b = append(b, '.')
-				b = d.quote(b, res.joinRef)
 				b = append(b, " AND "...)
 				b = d.quote(b, g.table(res.target))
 				b = append(b, '.')
@@ -784,6 +827,24 @@ func renderRelSelectLimited(g *grammar, res *resolvedRel, kind relKind, keys []a
 	b = d.quote(b, "__rio_rn")
 	b = append(b, " <= "...)
 	b = strconv.AppendInt(b, int64(rq.limit), 10)
+	// The inner window ORDER BY only decides which rows survive rn <= n; the
+	// outer query needs its own ORDER BY or the per-parent order the user
+	// asked for via RelOrder is lost. Order by the partition then the row
+	// number: contiguous per-parent blocks, each in the requested order.
+	b = append(b, " ORDER BY "...)
+	if keyed {
+		b = d.quote(b, "rio_w")
+		b = append(b, '.')
+		b = d.quote(b, "__rio_key")
+	} else {
+		b = d.quote(b, "rio_w")
+		b = append(b, '.')
+		b = d.quote(b, res.fk.column)
+	}
+	b = append(b, ", "...)
+	b = d.quote(b, "rio_w")
+	b = append(b, '.')
+	b = d.quote(b, "__rio_rn")
 
 	sqlText, outArgs, err := finishSQL(d, b, args)
 	return sqlText, outArgs, keyed, err

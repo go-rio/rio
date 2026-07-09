@@ -3,6 +3,7 @@ package rio
 import (
 	"context"
 	"database/sql/driver"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -210,5 +211,18 @@ func TestPreloadUnknownRelation(t *testing.T) {
 	_, err := From[User]().With("Nope").All(context.Background(), db)
 	if err == nil || !strings.Contains(err.Error(), `no relation "Nope"`) {
 		t.Fatalf("unknown relation: %v", err)
+	}
+}
+
+// Pointer keys group by value, never by address — a *int64 owner PK must
+// match the int64 keys scanned back from join rows and count queries.
+func TestCanonKeyDereferencesPointers(t *testing.T) {
+	n := int64(7)
+	if canonKey(reflect.ValueOf(&n)) != canonKey(reflect.ValueOf(int64(7))) {
+		t.Fatal("pointer key must group with its value")
+	}
+	var nilp *int64
+	if canonKey(reflect.ValueOf(nilp)) != nil {
+		t.Fatal("nil pointer key must canonicalize to nil")
 	}
 }

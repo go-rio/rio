@@ -129,7 +129,7 @@ func insertChunk[T any](ctx context.Context, db Queryer, p *plan, cols []*field,
 		rv := reflect.ValueOf(&rows[r]).Elem()
 		base := rv.Addr().UnsafePointer()
 		for _, f := range cols {
-			a, err := fieldValue(f, base, rv, d, now)
+			a, err := fieldValue(f, base, rv, d)
 			if err != nil {
 				return err
 			}
@@ -235,7 +235,7 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 					b = append(b, ", "...)
 				}
 				b = append(b, '?')
-				a, err := fieldValue(f, base, rv, d, now)
+				a, err := fieldValue(f, base, rv, d)
 				if err != nil {
 					return err
 				}

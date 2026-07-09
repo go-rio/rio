@@ -189,6 +189,12 @@ type User struct {
 - Composite primary keys: tag multiple fields `rio:",pk"`. `Find` takes all
   parts in field-declaration order. Models without a PK return
   `ErrNoPrimaryKey` from Find/Update/Delete.
+- Embedding: an anonymous struct field flattens its exported fields into the
+  parent — a shared `type Timestamps struct { CreatedAt, UpdatedAt time.Time }`
+  maps the same as if written inline, and this holds even when the embedded
+  type's own name is unexported (`encoding/json` flattens these too; silently
+  dropping mapped columns is the surprise rio refuses). Embed by value:
+  pointer embedding is rejected because offset-based scanning cannot hop a nil.
 - Structs containing relation containers are not comparable (they hold
   slices); use cmp.Diff in tests.
 
@@ -202,8 +208,11 @@ Ecto's `NotLoaded` + Rails/Laravel strict-loading — built in, not bolted on.
 `Set` is exported — manual assembly is a legitimate use. Implicit lazy loading
 does not exist: rio never issues a query you didn't ask for. Foreign keys
 resolve by convention (`Post.UserID` ↔ `users.id`), tags override (`fk:`,
-`ref:`, `join:`); resolution is lazy (first preload) to allow mutually
-referencing models.
+`ref:`, `join:` — on ManyToMany, `fk:`/`ref:` name the join table's owner-side
+and target-side columns); resolution is lazy (first preload) to allow mutually
+referencing models. A self-referential ManyToMany must name its two join
+columns explicitly — the convention would derive the same name for both, so
+rio errors with the fix instead of emitting a broken join.
 
 Preloading always uses per-relation `WHERE fk IN (...)` split queries
 (selectin): no cartesian explosion, pagination-safe, identical behavior on all
@@ -223,6 +232,10 @@ returns a clear error in v1.
 | `Sole` with 2+ rows | `rio.ErrMultipleRows` |
 | `Update/Delete` with `version` mismatch | `rio.ErrStaleObject` (0 rows affected) |
 | `UpdateAll/DeleteAll` without WHERE | `rio.ErrMissingWhere`; `.AllRows()` opts in explicitly |
+| Set-based write with `Limit/Offset/GroupBy/Having` | refused loudly — silently ignoring a Limit would turn "delete ten" into "delete all matching" |
+| Idempotent `Update/Restore` (values already identical) | succeeds on all three dialects — MySQL counts changed rows, so rio issues one PK probe on the ambiguous zero-affected path instead of misreporting `ErrNotFound` |
+| All-defaults insert (every column skipped) | renders `DEFAULT VALUES` (PG/SQLite) / `() VALUES ()` (MySQL); the equivalent Upsert is refused — SQLite cannot attach a conflict clause to DEFAULT VALUES |
+| `Update` column whitelist | rendered and bound in canonical field order regardless of caller order — the SQL cache keys on an order-free column bitmap |
 | Unique violation | `rio.ErrDuplicateKey` (translated by driver modules, driver error stays in chain) |
 | FK violation | `rio.ErrForeignKeyViolated` |
 | NULL into non-pointer field | error naming the column — sole exception: the `softdelete` column reads NULL as zero time |
@@ -234,7 +247,7 @@ returns a clear error in v1.
 | Placeholders | always `?`, rebound per dialect with a per-dialect lexer; `??` escapes a literal `?` (PostgreSQL JSONB operators); `IN (?)` expands slices — sqlx/Bun's established conventions |
 | Scan priority | `rio:"-"` → `json` tag (beats Scanner, documented) → `sql.Scanner` (NULL handed to Scan(nil), no second-guessing) → pointer fields (NULL→nil) → `[]byte` (NULL→nil) → basic conversions (overflow-checked; MySQL unsigned BIGINT > MaxInt64 arrives as bytes and is parsed) → NULL into anything else errors with the column name |
 | Times | written as UTC, monotonic-stripped, truncated to microseconds (PG/MySQL precision — otherwise reload-and-Equal never holds); SQLite text format is rio's own, not the driver's |
-| Partial scans | `Raw[User]` filling half an entity then `rio.Update` writes zero values to the unscanned columns — documented loudly (mirror image of GORM #6860) |
+| Partial scans | `Raw[T]` into an entity requires the result to cover every mapped column — a partial scan errors (naming the missing columns and pointing at a DTO) rather than letting a later `rio.Update` write zeros to the unscanned ones (mirror image of GORM #6860) |
 
 ## Performance
 

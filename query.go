@@ -2,6 +2,7 @@ package rio
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"iter"
@@ -281,10 +282,12 @@ func (q Query[T]) Sole(ctx context.Context, db Queryer) (*T, error) {
 }
 
 // Count runs SELECT count(*) with the query's conditions. Combined with
-// GroupBy the intent (rows vs groups) is ambiguous — use Raw for that.
+// GroupBy or Having the intent (rows vs groups) is ambiguous, and a bare
+// HAVING would filter the single implicit aggregate group and silently
+// return 0 — both route through Raw instead.
 func (q Query[T]) Count(ctx context.Context, db Queryer) (int64, error) {
-	if len(q.s.groups) > 0 {
-		return 0, errors.New("rio: Count with GroupBy is ambiguous (rows or groups?); use Raw")
+	if len(q.s.groups) > 0 || len(q.s.havings) > 0 {
+		return 0, errors.New("rio: Count with GroupBy/Having is a projection (rows or groups?); use Raw")
 	}
 	p, err := planOf[T]()
 	if err != nil {
@@ -504,7 +507,10 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 		// meaningless here and doubling LIMIT clauses is invalid SQL.
 		b = append(b, " LIMIT 1"...)
 	}
-	if s.forUpdate && d.caps().forUpdate {
+	// FOR UPDATE never reaches the count shape: PostgreSQL rejects row locks
+	// on aggregates, and counting locks nothing meaningful anyway. Exists
+	// keeps it — locking the probe row is well-defined.
+	if s.forUpdate && d.caps().forUpdate && shape != selectCount {
 		b = append(b, " FOR UPDATE"...)
 	}
 
@@ -703,6 +709,20 @@ func normalizeArgs(d Dialect, args []any) []any {
 			} else {
 				v = d.bindTime(normalizeTime(*t))
 			}
+		case sql.NullTime:
+			// Left alone, the driver's Valuer path would encode the inner
+			// time in its own format, missing rio's stored SQLite text.
+			if !t.Valid {
+				v = nil
+			} else {
+				v = d.bindTime(normalizeTime(t.Time))
+			}
+		case sql.Null[time.Time]:
+			if !t.Valid {
+				v = nil
+			} else {
+				v = d.bindTime(normalizeTime(t.V))
+			}
 		case uint64:
 			if t <= math.MaxInt64 {
 				continue
@@ -787,6 +807,9 @@ func (q Query[T]) Rows(ctx context.Context, db Queryer) iter.Seq2[T, error] {
 // emails, err := rio.Pluck[string](ctx, db, q, "email"). The column must be
 // one of T's mapped columns — expressions go through Raw.
 func Pluck[V any, T any](ctx context.Context, db Queryer, q Query[T], column string) ([]V, error) {
+	if len(q.s.groups) > 0 || len(q.s.havings) > 0 {
+		return nil, errors.New("rio: Pluck with GroupBy/Having is a projection; use Raw")
+	}
 	p, err := planOf[T]()
 	if err != nil {
 		return nil, err
@@ -825,6 +848,9 @@ func Pluck[V any, T any](ctx context.Context, db Queryer, q Query[T], column str
 		}
 	}
 	b = appendLimitOffset(b, d, &q.s)
+	if q.s.forUpdate && d.caps().forUpdate {
+		b = append(b, " FOR UPDATE"...)
+	}
 
 	sqlText, outArgs, err := finishSQL(d, b, args)
 	if err != nil {

@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 	"time"
@@ -435,4 +436,203 @@ func runV03Sync(t *testing.T, db *rio.DB, dialect string) {
 		t.Fatalf("empty sync: %v n=%d", err, n)
 	}
 	_ = dialect
+}
+
+// AllDefault exercises the dialect-specific all-defaults INSERT form.
+type AllDefault struct {
+	ID   int64
+	Note string `rio:",omitzero"`
+}
+
+// Reminder exercises sql.NullTime storage parity with time.Time.
+type Reminder struct {
+	ID    int64
+	At    time.Time
+	Maybe sql.NullTime
+}
+
+var hardeningDDL = map[string][]string{
+	"sqlite": {
+		`DROP TABLE IF EXISTS all_defaults`, `DROP TABLE IF EXISTS reminders`,
+		"CREATE TABLE all_defaults (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL DEFAULT 'dflt')",
+		"CREATE TABLE reminders (id INTEGER PRIMARY KEY, at DATETIME NOT NULL, maybe DATETIME)",
+	},
+	"postgres": {
+		`DROP TABLE IF EXISTS all_defaults`, `DROP TABLE IF EXISTS reminders`,
+		"CREATE TABLE all_defaults (id BIGSERIAL PRIMARY KEY, note TEXT NOT NULL DEFAULT 'dflt')",
+		"CREATE TABLE reminders (id BIGINT PRIMARY KEY, at TIMESTAMPTZ NOT NULL, maybe TIMESTAMPTZ)",
+	},
+	"mysql": {
+		`DROP TABLE IF EXISTS all_defaults`, `DROP TABLE IF EXISTS reminders`,
+		"CREATE TABLE all_defaults (id BIGINT AUTO_INCREMENT PRIMARY KEY, note VARCHAR(32) NOT NULL DEFAULT 'dflt')",
+		"CREATE TABLE reminders (id BIGINT PRIMARY KEY, at DATETIME(6) NOT NULL, maybe DATETIME(6))",
+	},
+}
+
+func (AllDefault) TableName() string { return "all_defaults" }
+
+// runHardening covers the post-v0.3.0 audit fixes end-to-end on a real
+// database: all-defaults INSERT, idempotent Update (MySQL's changed-rows
+// counting), whitelist column order, NullTime write parity, and UpsertAll.
+func runHardening(t *testing.T, db *rio.DB, dialect string) {
+	ctx := context.Background()
+	for _, ddl := range hardeningDDL[dialect] {
+		if _, err := rio.Exec(ctx, db, ddl); err != nil {
+			t.Fatalf("ddl %q: %v", ddl, err)
+		}
+	}
+
+	// All-defaults insert: every column skipped, DB defaults apply.
+	blank := AllDefault{}
+	if err := rio.Insert(ctx, db, &blank); err != nil {
+		t.Fatalf("all-defaults insert: %v", err)
+	}
+	got, err := rio.Find[AllDefault](ctx, db, blank.ID)
+	if err != nil || got.Note != "dflt" {
+		t.Fatalf("all-defaults reload: %+v %v", got, err)
+	}
+
+	// Idempotent Update on a model without UpdatedAt/version must succeed on
+	// every dialect (MySQL counts changed rows, not matched rows).
+	if err := rio.Update(ctx, db, got); err != nil {
+		t.Fatalf("idempotent update: %v", err)
+	}
+	if err := rio.Update(ctx, db, &AllDefault{ID: got.ID + 999, Note: "x"}); !errors.Is(err, rio.ErrNotFound) {
+		t.Fatalf("missing row must stay ErrNotFound: %v", err)
+	}
+
+	// Whitelist order: both spellings write the same columns.
+	got.Note = "swapped"
+	if err := rio.Update(ctx, db, got, "note"); err != nil {
+		t.Fatalf("whitelist update: %v", err)
+	}
+
+	// sql.NullTime stores rio's canonical encoding: reload compares Equal
+	// against the microsecond-truncated instant, same as time.Time.
+	at := time.Date(2026, 7, 9, 3, 4, 5, 123456789, time.UTC)
+	rem := Reminder{ID: 1, At: at, Maybe: sql.NullTime{Time: at, Valid: true}}
+	if err := rio.Insert(ctx, db, &rem); err != nil {
+		t.Fatalf("reminder insert: %v", err)
+	}
+	back, err := rio.Find[Reminder](ctx, db, 1)
+	if err != nil {
+		t.Fatalf("reminder reload: %v", err)
+	}
+	want := at.Truncate(time.Microsecond)
+	if !back.At.Equal(want) {
+		t.Fatalf("time.Time round-trip: %v != %v", back.At, want)
+	}
+	if !back.Maybe.Valid || !back.Maybe.Time.Equal(want) {
+		t.Fatalf("NullTime round-trip: %+v != %v", back.Maybe, want)
+	}
+	if n, err := rio.From[Reminder]().Where("maybe = ?", sql.NullTime{Time: at, Valid: true}).Count(ctx, db); err != nil || n != 1 {
+		t.Fatalf("NullTime arg must match stored encoding: n=%d %v", n, err)
+	}
+
+	// UpsertAll smoke: insert two, re-upsert with a change. Batch inserts
+	// backfill no ids on MySQL (documented contract) — reload for them.
+	if err := rio.InsertAll(ctx, db, []AllDefault{{Note: "a"}, {Note: "b"}}); err != nil {
+		t.Fatalf("InsertAll: %v", err)
+	}
+	stored, err := rio.From[AllDefault]().Where("note IN (?)", []string{"a", "b"}).OrderBy("note").All(ctx, db)
+	if err != nil || len(stored) != 2 {
+		t.Fatalf("reload batch: %v %d", err, len(stored))
+	}
+	stored[0].Note = "a2"
+	if err := rio.UpsertAll(ctx, db, stored, rio.OnConflict("id"), rio.DoUpdate("note")); err != nil {
+		t.Fatalf("UpsertAll: %v", err)
+	}
+	re, err := rio.Find[AllDefault](ctx, db, stored[0].ID)
+	if err != nil || re.Note != "a2" {
+		t.Fatalf("UpsertAll effect: %+v %v", re, err)
+	}
+
+	// *time.Time CreatedAt/UpdatedAt are auto-stamped and round-trip, like the
+	// value form (round-2 audit fix).
+	if _, err := rio.Exec(ctx, db, "DROP TABLE IF EXISTS ptr_stampeds"); err != nil {
+		t.Fatalf("ptr-stamp drop: %v", err)
+	}
+	if _, err := rio.Exec(ctx, db, ptrStampDDL[dialect]); err != nil {
+		t.Fatalf("ptr-stamp ddl: %v", err)
+	}
+	ps := PtrStamped{Name: "x"}
+	if err := rio.Insert(ctx, db, &ps); err != nil {
+		t.Fatalf("ptr-stamp insert: %v", err)
+	}
+	if ps.CreatedAt == nil || ps.UpdatedAt == nil {
+		t.Fatalf("*time.Time timestamps not stamped: %+v", ps)
+	}
+	psBack, err := rio.Find[PtrStamped](ctx, db, ps.ID)
+	if err != nil {
+		t.Fatalf("ptr-stamp reload: %v", err)
+	}
+	if psBack.CreatedAt == nil || !psBack.CreatedAt.Equal(*ps.CreatedAt) {
+		t.Fatalf("*time.Time CreatedAt round-trip: %v != %v", psBack.CreatedAt, ps.CreatedAt)
+	}
+
+	// A relation keyed by a binary column ([]byte PK/FK) must preload: the
+	// key binds as the original bytes, not a stringified map key that would
+	// miss a BLOB/BYTEA column (round-2 audit found this silently empty).
+	for _, ddl := range binKeyDDL[dialect] {
+		if _, err := rio.Exec(ctx, db, ddl); err != nil {
+			t.Fatalf("bin-key ddl %q: %v", ddl, err)
+		}
+	}
+	pk := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+	if err := rio.Insert(ctx, db, &BinParent{ID: pk}); err != nil {
+		t.Fatalf("bin parent: %v", err)
+	}
+	if err := rio.Insert(ctx, db, &BinChild{ID: 1, ParentID: pk, Label: "kid"}); err != nil {
+		t.Fatalf("bin child: %v", err)
+	}
+	bps, err := rio.From[BinParent]().With("Kids").All(ctx, db)
+	if err != nil {
+		t.Fatalf("bin preload: %v", err)
+	}
+	if len(bps) != 1 || len(bps[0].Kids.Rows()) != 1 || bps[0].Kids.Rows()[0].Label != "kid" {
+		t.Fatalf("[]byte-keyed preload lost children: %+v", bps)
+	}
+}
+
+// BinParent/BinChild verify preloading across a binary ([]byte) key.
+type BinParent struct {
+	ID   []byte                `rio:"id,pk,noautoincr"`
+	Kids rio.HasMany[BinChild] `rio:",fk:parent_id"`
+}
+type BinChild struct {
+	ID       int64
+	ParentID []byte
+	Label    string
+}
+
+var binKeyDDL = map[string][]string{
+	"sqlite": {
+		`DROP TABLE IF EXISTS bin_children`, `DROP TABLE IF EXISTS bin_parents`,
+		"CREATE TABLE bin_parents (id BLOB PRIMARY KEY)",
+		"CREATE TABLE bin_children (id INTEGER PRIMARY KEY, parent_id BLOB, label TEXT)",
+	},
+	"postgres": {
+		`DROP TABLE IF EXISTS bin_children`, `DROP TABLE IF EXISTS bin_parents`,
+		"CREATE TABLE bin_parents (id BYTEA PRIMARY KEY)",
+		"CREATE TABLE bin_children (id BIGINT PRIMARY KEY, parent_id BYTEA, label TEXT)",
+	},
+	"mysql": {
+		`DROP TABLE IF EXISTS bin_children`, `DROP TABLE IF EXISTS bin_parents`,
+		"CREATE TABLE bin_parents (id VARBINARY(16) PRIMARY KEY)",
+		"CREATE TABLE bin_children (id BIGINT PRIMARY KEY, parent_id VARBINARY(16), label TEXT)",
+	},
+}
+
+// PtrStamped verifies *time.Time timestamps auto-stamp and round-trip.
+type PtrStamped struct {
+	ID        int64
+	Name      string
+	CreatedAt *time.Time
+	UpdatedAt *time.Time
+}
+
+var ptrStampDDL = map[string]string{
+	"sqlite":   "CREATE TABLE ptr_stampeds (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, created_at DATETIME, updated_at DATETIME)",
+	"postgres": "CREATE TABLE ptr_stampeds (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ)",
+	"mysql":    "CREATE TABLE ptr_stampeds (id BIGINT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(32) NOT NULL, created_at DATETIME(6), updated_at DATETIME(6))",
 }
