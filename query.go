@@ -155,6 +155,19 @@ func (q Query[T]) AllRows() Query[T] {
 	return q
 }
 
+// Scope applies reusable query functions in order, keeping the chain
+// readable — a scope is just func(Query[T]) Query[T], no registry and no
+// magic:
+//
+//	func Active(q rio.Query[User]) rio.Query[User] { return q.Where("active") }
+//	users, err := rio.From[User]().Scope(Active, Recent).All(ctx, db)
+func (q Query[T]) Scope(fns ...func(Query[T]) Query[T]) Query[T] {
+	for _, fn := range fns {
+		q = fn(q)
+	}
+	return q
+}
+
 // WhereHas keeps only rows whose relation at path has at least one matching
 // row, rendered as EXISTS (...). Options constrain the related rows; nested
 // paths ("Posts.Comments") nest the EXISTS. Related soft-delete models are
@@ -413,24 +426,36 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 	b := make([]byte, 0, 192)
 	var args []any
 
-	b = append(b, "SELECT "...)
 	switch shape {
 	case selectCount:
-		b = append(b, "count(*)"...)
+		b = append(b, "SELECT count(*) FROM "...)
+		b = d.quote(b, table)
 	case selectExists:
-		b = append(b, '1')
+		b = append(b, "SELECT 1 FROM "...)
+		b = d.quote(b, table)
 	default:
-		for i, f := range p.fields {
-			if i > 0 {
-				b = append(b, ", "...)
+		// The qualified column list never changes per plan and grammar;
+		// render it once.
+		head, err := g.cachedSQL(p, "selecthead", 0, 0, func() (string, error) {
+			hb := make([]byte, 0, 128)
+			hb = append(hb, "SELECT "...)
+			for i, f := range p.fields {
+				if i > 0 {
+					hb = append(hb, ", "...)
+				}
+				hb = d.quote(hb, table)
+				hb = append(hb, '.')
+				hb = d.quote(hb, f.column)
 			}
-			b = d.quote(b, table)
-			b = append(b, '.')
-			b = d.quote(b, f.column)
+			hb = append(hb, " FROM "...)
+			hb = d.quote(hb, table)
+			return string(hb), nil
+		})
+		if err != nil {
+			return "", nil, err
 		}
+		b = append(b, head...)
 	}
-	b = append(b, " FROM "...)
-	b = d.quote(b, table)
 
 	for _, j := range s.joins {
 		b = append(b, ' ')

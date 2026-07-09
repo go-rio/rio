@@ -404,3 +404,35 @@ var v02DDL = map[string][]string{
 		"CREATE TABLE author_topics (author_id BIGINT NOT NULL, topic_id BIGINT NOT NULL, PRIMARY KEY (author_id, topic_id))",
 	},
 }
+
+// v0.3: SyncRelation converges the join table on the given set.
+func runV03Sync(t *testing.T, db *rio.DB, dialect string) {
+	ctx := context.Background()
+	// Reuses the v0.2 schema; runV02Suite must have run first.
+	author, err := rio.From[Author]().Where("email = ?", "alice@example.com").First(ctx, db)
+	if err != nil {
+		t.Fatalf("author: %v", err)
+	}
+	topics, err := rio.From[Topic]().OrderBy("id").All(ctx, db)
+	if err != nil || len(topics) < 2 {
+		t.Fatalf("topics: %v %d", err, len(topics))
+	}
+	if err := rio.SyncRelation(ctx, db, author, "Topics", []int64{topics[1].ID}); err != nil {
+		t.Fatalf("SyncRelation: %v", err)
+	}
+	synced, err := rio.From[Author]().Where("id = ?", author.ID).With("Topics").All(ctx, db)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := synced[0].Topics.Rows(); len(got) != 1 || got[0].ID != topics[1].ID {
+		t.Fatalf("synced set: %+v", got)
+	}
+	if err := rio.SyncRelation(ctx, db, author, "Topics", []int64{}); err != nil {
+		t.Fatalf("SyncRelation empty: %v", err)
+	}
+	n, err := rio.From[Author]().WhereHas("Topics").Count(ctx, db)
+	if err != nil || n != 0 {
+		t.Fatalf("empty sync: %v n=%d", err, n)
+	}
+	_ = dialect
+}

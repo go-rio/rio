@@ -31,7 +31,9 @@ func TestSQLiteSuite(t *testing.T) {
 }
 
 func TestSQLiteV02Suite(t *testing.T) {
-	runV02Suite(t, sqliteDB(t), "sqlite")
+	db := sqliteDB(t)
+	runV02Suite(t, db, "sqlite")
+	runV03Sync(t, db, "sqlite")
 }
 
 func TestPostgresSuite(t *testing.T) {
@@ -47,6 +49,7 @@ func TestPostgresSuite(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 	runSuite(t, db, "postgres")
 	runV02Suite(t, db, "postgres")
+	runV03Sync(t, db, "postgres")
 }
 
 func TestMySQLSuite(t *testing.T) {
@@ -77,6 +80,7 @@ func TestMySQLSuite(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 	runSuite(t, db, "mysql")
 	runV02Suite(t, db, "mysql")
+	runV03Sync(t, db, "mysql")
 }
 
 // TestModerncTimeProbe pins how the modernc driver round-trips rio's own

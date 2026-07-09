@@ -87,6 +87,79 @@ func Detach[T any](ctx context.Context, db Queryer, row *T, relation string, ids
 	return err
 }
 
+// SyncRelation makes the ManyToMany relation match ids exactly, inside one
+// transaction (or savepoint, when db already is one): links not in ids are
+// removed, missing ones are added idempotently. An empty ids slice
+// explicitly empties the relation — unlike Detach, where "no ids" is a
+// refused footgun, Sync's whole meaning is "converge on this set".
+//
+// Concurrent SyncRelation calls on the same owner serialize on a row lock
+// (SELECT ... FOR UPDATE on the owner; SQLite's single-writer model
+// serializes anyway) — without it, two syncs interleaving their DELETE and
+// INSERT under READ COMMITTED would converge on the union of both sets,
+// which is exactly not what "sync" promises.
+func SyncRelation[T any, K any](ctx context.Context, db Queryer, row *T, relation string, ids []K) error {
+	p, _, res, ownerKey, err := joinWriteTarget(db, row, relation)
+	if err != nil {
+		return err
+	}
+	return db.Tx(ctx, func(tx *Tx) error {
+		d := tx.gram().d
+		if d.caps().forUpdate {
+			g := tx.gram()
+			lb := make([]byte, 0, 96)
+			lb = append(lb, "SELECT "...)
+			lb = d.quote(lb, res.ref.column)
+			lb = append(lb, " FROM "...)
+			lb = d.quote(lb, g.table(p))
+			lb = append(lb, " WHERE "...)
+			lb = d.quote(lb, res.ref.column)
+			lb = append(lb, " = ? FOR UPDATE"...)
+			lockSQL, lockArgs, err := finishSQL(d, lb, []any{ownerKey})
+			if err != nil {
+				return err
+			}
+			rows, finish, err := runQuery(ctx, tx, "select", p.structName, lockSQL, lockArgs)
+			if err != nil {
+				return err
+			}
+			err = rows.Close()
+			finishQuery(finish, err)
+			if err != nil {
+				return err
+			}
+		}
+		b := make([]byte, 0, 96)
+		b = append(b, "DELETE FROM "...)
+		b = d.quote(b, res.joinTable)
+		b = append(b, " WHERE "...)
+		b = d.quote(b, res.joinFK)
+		b = append(b, " = ?"...)
+		args := []any{ownerKey}
+		if len(ids) > 0 {
+			b = append(b, " AND "...)
+			b = d.quote(b, res.joinRef)
+			b = append(b, " NOT IN (?)"...)
+			args = append(args, ids)
+		}
+		sqlText, outArgs, err := finishSQL(d, b, args)
+		if err != nil {
+			return err
+		}
+		if _, err := run(ctx, tx, "delete", p.structName, sqlText, outArgs); err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		anyIDs := make([]any, len(ids))
+		for i, id := range ids {
+			anyIDs[i] = id
+		}
+		return Attach(ctx, tx, row, relation, anyIDs...)
+	})
+}
+
 // joinWriteTarget resolves the ManyToMany wiring and the owner's key value.
 func joinWriteTarget[T any](db Queryer, row *T, relation string) (*plan, *relField, *resolvedRel, any, error) {
 	p, err := planOf[T]()

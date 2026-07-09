@@ -195,6 +195,36 @@ cached. `rio.WithStmtCache()` additionally caches prepared statements
 (off by default — PgBouncer transaction pooling breaks server-side prepared
 statements; enable it only when talking to the database directly).
 
+## Column constants, without a tool chain
+
+`rio.WriteColumns` generates typo-proof column references from rio's own
+mapping plans — no source parsing, no binary to install, and the output can
+never drift from runtime behavior:
+
+```go
+//go:generate sh -c "go run ./internal/gencols > cols_gen.go"
+// internal/gencols: rio.WriteColumns(os.Stdout, "models", User{}, Post{})
+
+users, err := rio.From[User]().Where(UserCols.Email+" = ?", e).All(ctx, db)
+```
+
+## Pagination that scales
+
+Offset pagination degrades linearly; keyset pagination is a WHERE clause,
+and rio deliberately ships the pattern instead of an API:
+
+```go
+// Page 1: rio.From[Post]().OrderBy("created_at DESC, id DESC").Limit(20)
+// Next page, keyed by the last row you handed out:
+next, err := rio.From[Post]().
+    Where("(created_at, id) < (?, ?)", last.CreatedAt, last.ID).
+    OrderBy("created_at DESC, id DESC").Limit(20).
+    All(ctx, db)
+```
+
+Row-value comparison works on PostgreSQL, MySQL, and SQLite 3.15+. For
+result sets too large to page at all, stream with `Rows`.
+
 ## Observability
 
 ```go

@@ -2,8 +2,11 @@ package rio
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"iter"
 	"sync"
+	"unsafe"
 )
 
 // Compiled is a query compiled once and executed many times, in the spirit
@@ -249,6 +252,64 @@ func (c *Compiled[T]) Sole(ctx context.Context, db Queryer, args ...any) (*T, er
 		return &rows[0], nil
 	}
 	return nil, ErrMultipleRows
+}
+
+// Rows streams the compiled query without materializing the result; see
+// Query.Rows for semantics. Compiled queries carrying With/WithCount refuse
+// to stream.
+func (c *Compiled[T]) Rows(ctx context.Context, db Queryer, args ...any) iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		var zero T
+		if len(c.q.s.withs) > 0 || len(c.q.s.counts) > 0 {
+			yield(zero, errors.New("rio: Rows cannot stream With/WithCount (preloading needs the full result); use All"))
+			return
+		}
+		p, err := planOf[T]()
+		if err != nil {
+			yield(zero, err)
+			return
+		}
+		cs, err := c.sqlFor(db)
+		if err != nil {
+			yield(zero, err)
+			return
+		}
+		bound, err := c.bind(db.gram().d, cs, args)
+		if err != nil {
+			yield(zero, err)
+			return
+		}
+		rows, finish, err := runQuery(ctx, db, "select", p.structName, cs.sql, bound)
+		if err != nil {
+			yield(zero, err)
+			return
+		}
+		defer rows.Close()
+		fields, err := entityFields(rows, p, 0)
+		if err != nil {
+			finishQuery(finish, err)
+			yield(zero, err)
+			return
+		}
+		rs := newRowScanner(fields, nil)
+		for rows.Next() {
+			var row T
+			if err := rs.scan(rows, unsafe.Pointer(&row)); err != nil {
+				finishQuery(finish, err)
+				yield(zero, err)
+				return
+			}
+			if !yield(row, nil) {
+				finishQuery(finish, nil)
+				return
+			}
+		}
+		err = rows.Err()
+		finishQuery(finish, err)
+		if err != nil {
+			yield(zero, err)
+		}
+	}
 }
 
 // Count runs the compiled conditions under SELECT count(*). The count SQL
