@@ -265,7 +265,8 @@ func naiveIdentByte(s string, i int) bool {
 		return false
 	}
 	c := s[i-1]
-	return c == '_' || c == '$' ||
+	// Bytes >= 0x80 are UTF-8 identifier material, mirroring identByteBefore.
+	return c == '_' || c == '$' || c >= 0x80 ||
 		('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') || ('0' <= c && c <= '9')
 }
 
@@ -403,6 +404,9 @@ func FuzzRebind(f *testing.F) {
 		"/*",
 		"/**/?",
 		"/*/*?*/?*/",
+		// CI fuzz regression: a UTF-8 continuation byte before e' is
+		// identifier material, so no E-string opens and the ? stays live.
+		"\xa0e'\\'?",
 	}
 	for _, q := range seeds {
 		for prof := uint8(0); prof < 3; prof++ {
