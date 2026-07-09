@@ -1,0 +1,386 @@
+package rio
+
+import (
+	"context"
+	"fmt"
+	"sync"
+)
+
+// Compiled is a query compiled once and executed many times, in the spirit
+// of regexp.MustCompile: declare it at package level, bind parameters at the
+// call site. Structural validation runs eagerly; SQL renders lazily per
+// grammar (dialect + namer) and is cached, so the hot path only binds.
+type Compiled[T any] struct {
+	q      Query[T]
+	inline bool // frozen constant query: exec args must be empty
+
+	cache sync.Map // *grammar → *compiledSQL | error
+}
+
+type compiledSQL struct {
+	sql  string
+	args []any // inline mode: the frozen bind arguments
+	argc int   // exec mode: expected argument count
+}
+
+// MustCompile compiles a connection-free query for reuse, panicking on
+// structural problems — bad tags, unknown relation paths, mixed inline and
+// exec-time parameters. Passing MustCompile does not mean execution cannot
+// fail: dialect capabilities, exact placeholder arity, and driver errors
+// surface at the execution point. Queries are either fully inline (every ?
+// already has its argument — a frozen constant query) or fully
+// exec-parameterized (no inline arguments; every ? binds at the call).
+// Slice expansion inside IN (?) needs value shapes and is inline-only.
+func MustCompile[T any](q Query[T]) *Compiled[T] {
+	c, err := Compile(q)
+	if err != nil {
+		panic(err)
+	}
+	return c
+}
+
+// Compile is MustCompile returning an error.
+func Compile[T any](q Query[T]) (*Compiled[T], error) {
+	p, err := planOf[T]()
+	if err != nil {
+		return nil, err
+	}
+	if err := validatePaths(p, q.s.withs); err != nil {
+		return nil, err
+	}
+
+	inlineArgs := 0
+	for _, w := range q.s.wheres {
+		inlineArgs += len(w.args)
+	}
+	for _, h := range q.s.havings {
+		inlineArgs += len(h.args)
+	}
+	holes, exact := approxPlaceholders(&q.s)
+
+	c := &Compiled[T]{q: q}
+	switch {
+	case inlineArgs == 0 && holes == 0:
+		c.inline = true // constant query
+	case inlineArgs == 0:
+		c.inline = false
+	case exact && holes == inlineArgs:
+		c.inline = true
+	case exact: // some holes filled, some not
+		return nil, fmt.Errorf("rio: Compile[%s]: %d placeholder(s) but %d inline argument(s); a compiled query is either fully inline or fully exec-parameterized",
+			p.structName, holes, inlineArgs)
+	default:
+		// Dialect-sensitive lexing made the count ambiguous; require the
+		// unambiguous all-or-nothing shape.
+		return nil, fmt.Errorf("rio: Compile[%s]: cannot verify placeholder count independent of dialect; use only exec-time parameters or only inline ones",
+			p.structName)
+	}
+	return c, nil
+}
+
+// validatePaths walks With paths through relation metadata only — no
+// database, no key resolution (that stays lazy).
+func validatePaths(p *plan, specs []preloadSpec) error {
+	for _, s := range specs {
+		cur := p
+		path := s.path
+		for path != "" {
+			head, tail := splitPath(path)
+			rel, ok := cur.rels[head]
+			if !ok {
+				return fmt.Errorf("rio: %s has no relation %q (path %q)", cur.structName, head, s.path)
+			}
+			next, err := planFor(rel.target)
+			if err != nil {
+				return err
+			}
+			cur, path = next, tail
+		}
+	}
+	return nil
+}
+
+// approxPlaceholders counts ? holes in user conditions. When the three
+// dialect lexers agree the count is exact; otherwise the caller falls back
+// to the conservative rule.
+func approxPlaceholders(s *queryState) (n int, exact bool) {
+	count := func(p lexProfile) int {
+		total := 0
+		for _, w := range s.wheres {
+			c := 0
+			_, _, _ = rebindCount(p, w.expr, &c)
+			total += c
+		}
+		for _, h := range s.havings {
+			c := 0
+			_, _, _ = rebindCount(p, h.expr, &c)
+			total += c
+		}
+		return total
+	}
+	pg, my, lite := count(pgLex), count(mysqlLex), count(sqliteLex)
+	if pg == my && my == lite {
+		return pg, true
+	}
+	return pg, false
+}
+
+// sqlFor renders (or fetches) this query's SQL under the handle's grammar.
+func (c *Compiled[T]) sqlFor(db Queryer) (*compiledSQL, error) {
+	g := db.gram()
+	if v, ok := c.cache.Load(g); ok {
+		if cs, ok := v.(*compiledSQL); ok {
+			return cs, nil
+		}
+		return nil, v.(error)
+	}
+	cs, err := c.render(g)
+	if err != nil {
+		c.cache.LoadOrStore(g, err)
+		return nil, err
+	}
+	actual, _ := c.cache.LoadOrStore(g, cs)
+	if cs, ok := actual.(*compiledSQL); ok {
+		return cs, nil
+	}
+	return nil, actual.(error)
+}
+
+func (c *Compiled[T]) render(g *grammar) (*compiledSQL, error) {
+	p, err := planOf[T]()
+	if err != nil {
+		return nil, err
+	}
+	if c.inline {
+		sqlText, args, err := renderSelect(g, p, &c.q.s, selectRows)
+		if err != nil {
+			return nil, err
+		}
+		return &compiledSQL{sql: sqlText, args: args}, nil
+	}
+	// Exec mode: render with placeholder renumbering but no argument
+	// knowledge. Arity is verified precisely here and enforced per call.
+	raw, _, err := renderSelectRaw(g, p, &c.q.s)
+	if err != nil {
+		return nil, err
+	}
+	sqlText, argc, err := rebindTemplate(g.d.lexer(), g.d.style(), raw)
+	if err != nil {
+		return nil, err
+	}
+	return &compiledSQL{sql: sqlText, argc: argc}, nil
+}
+
+// All executes the compiled query, binding args in placeholder order.
+func (c *Compiled[T]) All(ctx context.Context, db Queryer, args ...any) ([]T, error) {
+	p, err := planOf[T]()
+	if err != nil {
+		return nil, err
+	}
+	cs, err := c.sqlFor(db)
+	if err != nil {
+		return nil, err
+	}
+	bound, err := c.bind(db.gram().d, cs, args)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := runQuery(ctx, db, "select", p.structName, cs.sql, bound)
+	if err != nil {
+		return nil, err
+	}
+	out, err := scanAll[T](rows, p, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := preloadInto(ctx, db, p, out, c.q.s.withs); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// First executes the compiled query and returns the first row or
+// ErrNotFound. Compile with Limit(1) to avoid over-fetching.
+func (c *Compiled[T]) First(ctx context.Context, db Queryer, args ...any) (*T, error) {
+	rows, err := c.All(ctx, db, args...)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, ErrNotFound
+	}
+	return &rows[0], nil
+}
+
+// Sole returns the single matching row, ErrNotFound, or ErrMultipleRows.
+func (c *Compiled[T]) Sole(ctx context.Context, db Queryer, args ...any) (*T, error) {
+	rows, err := c.All(ctx, db, args...)
+	if err != nil {
+		return nil, err
+	}
+	switch len(rows) {
+	case 0:
+		return nil, ErrNotFound
+	case 1:
+		return &rows[0], nil
+	}
+	return nil, ErrMultipleRows
+}
+
+// Count runs the compiled conditions under SELECT count(*). The count SQL
+// renders per grammar on first use like everything else.
+func (c *Compiled[T]) Count(ctx context.Context, db Queryer, args ...any) (int64, error) {
+	q := c.q
+	if c.inline && len(args) > 0 {
+		return 0, fmt.Errorf("rio: compiled query is fully inline; it takes no execution arguments")
+	}
+	if !c.inline {
+		var err error
+		q, err = c.rebindInline(db, args)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return q.Count(ctx, db)
+}
+
+// Exists reports whether any row matches.
+func (c *Compiled[T]) Exists(ctx context.Context, db Queryer, args ...any) (bool, error) {
+	q := c.q
+	if c.inline && len(args) > 0 {
+		return false, fmt.Errorf("rio: compiled query is fully inline; it takes no execution arguments")
+	}
+	if !c.inline {
+		var err error
+		q, err = c.rebindInline(db, args)
+		if err != nil {
+			return false, err
+		}
+	}
+	return q.Exists(ctx, db)
+}
+
+// rebindInline reconstructs a regular query with exec args distributed back
+// into the conditions, for the shapes (Count/Exists) that render differently
+// from the cached row SELECT. Placeholders fill left to right.
+func (c *Compiled[T]) rebindInline(db Queryer, args []any) (Query[T], error) {
+	q := c.q
+	lex := db.gram().d.lexer()
+	idx := 0
+	fill := func(conds []cond) ([]cond, error) {
+		out := make([]cond, len(conds))
+		for i, w := range conds {
+			n := 0
+			_, _, _ = rebindCount(lex, w.expr, &n)
+			if idx+n > len(args) {
+				return nil, fmt.Errorf("rio: compiled query expects more arguments: got %d", len(args))
+			}
+			out[i] = cond{expr: w.expr, args: args[idx : idx+n]}
+			idx += n
+		}
+		return out, nil
+	}
+	var err error
+	if q.s.wheres, err = fill(q.s.wheres); err != nil {
+		return q, err
+	}
+	if q.s.havings, err = fill(q.s.havings); err != nil {
+		return q, err
+	}
+	if idx != len(args) {
+		return q, fmt.Errorf("rio: compiled query takes %d argument(s), got %d", idx, len(args))
+	}
+	return q, nil
+}
+
+func (c *Compiled[T]) bind(d Dialect, cs *compiledSQL, args []any) ([]any, error) {
+	if c.inline {
+		if len(args) != 0 {
+			return nil, fmt.Errorf("rio: compiled query is fully inline; it takes no execution arguments")
+		}
+		return cs.args, nil
+	}
+	if len(args) != cs.argc {
+		return nil, fmt.Errorf("rio: compiled query takes %d argument(s), got %d", cs.argc, len(args))
+	}
+	for i, a := range args {
+		if _, isSlice := sliceElems(a); isSlice {
+			return nil, fmt.Errorf("rio: compiled queries cannot expand slice argument %d; IN (?) needs inline values", i+1)
+		}
+	}
+	return normalizeArgs(d, args), nil
+}
+
+// renderSelectRaw renders the row-SELECT with unified ? placeholders and no
+// rebinding, for exec-mode compilation.
+func renderSelectRaw(g *grammar, p *plan, s *queryState) (string, []any, error) {
+	d := g.d
+	table := g.table(p)
+	b := make([]byte, 0, 192)
+	b = append(b, "SELECT "...)
+	for i, f := range p.fields {
+		if i > 0 {
+			b = append(b, ", "...)
+		}
+		b = d.quote(b, table)
+		b = append(b, '.')
+		b = d.quote(b, f.column)
+	}
+	b = append(b, " FROM "...)
+	b = d.quote(b, table)
+	for _, j := range s.joins {
+		b = append(b, ' ')
+		b = append(b, j...)
+	}
+	b, _ = renderWhere(b, nil, d, table, p, s)
+	if len(s.groups) > 0 {
+		b = append(b, " GROUP BY "...)
+		for i, gexpr := range s.groups {
+			if i > 0 {
+				b = append(b, ", "...)
+			}
+			b = append(b, gexpr...)
+		}
+	}
+	for i, h := range s.havings {
+		if i == 0 {
+			b = append(b, " HAVING "...)
+		} else {
+			b = append(b, " AND "...)
+		}
+		b = append(b, '(')
+		b = append(b, h.expr...)
+		b = append(b, ')')
+	}
+	if len(s.orders) > 0 {
+		b = append(b, " ORDER BY "...)
+		for i, o := range s.orders {
+			if i > 0 {
+				b = append(b, ", "...)
+			}
+			b = append(b, o...)
+		}
+	}
+	b = appendLimitOffset(b, d, s)
+	if s.forUpdate && d.caps().forUpdate {
+		b = append(b, " FOR UPDATE"...)
+	}
+	return string(b), nil, nil
+}
+
+// rebindTemplate renumbers placeholders without argument knowledge,
+// returning the dialect-form SQL and the placeholder count.
+func rebindTemplate(p lexProfile, style bindStyle, query string) (string, int, error) {
+	// Feed rebind a placeholder-count probe first, then real args of the
+	// right length so slice detection stays off.
+	n := 0
+	if _, _, err := rebindCount(p, query, &n); err != nil {
+		return "", 0, err
+	}
+	dummy := make([]any, n)
+	sqlText, _, err := rebind(p, style, query, dummy)
+	if err != nil {
+		return "", 0, err
+	}
+	return sqlText, n, nil
+}

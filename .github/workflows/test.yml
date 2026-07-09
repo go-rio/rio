@@ -1,0 +1,103 @@
+name: Test
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+jobs:
+  test:
+    strategy:
+      matrix:
+        go: [ "oldstable", "stable" ]
+        platform: [ ubuntu-latest, macos-latest, windows-latest ]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          cache: true
+          go-version: ${{ matrix.go }}
+      - name: Vet
+        run: go vet ./...
+      - name: Run tests
+        run: go test -race -timeout 10m ./...
+      - name: Run SQLite integration tests
+        working-directory: integration
+        run: go test -race -timeout 10m ./...
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: rio_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: rio_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -uroot -proot --silent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          cache: true
+          go-version: 'stable'
+      - name: Run integration tests against Postgres and MySQL
+        working-directory: integration
+        run: go test -race -timeout 10m ./...
+        env:
+          RIO_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/rio_test?sslmode=disable
+          # parseTime=true makes go-sql-driver return DATETIME columns as
+          # time.Time, which rio's scanner expects for time fields.
+          RIO_MYSQL_DSN: root:root@tcp(localhost:3306)/rio_test?parseTime=true
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          cache: true
+          go-version: 'stable'
+      - name: Run coverage
+        run: |
+          go test -coverprofile=cov.out -covermode=atomic ./...
+          go tool cover -func=cov.out | tail -1
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          cache: true
+          go-version: 'stable'
+      # A single go test invocation accepts exactly one -fuzz pattern, so
+      # every fuzz target gets its own step. Patterns are anchored so that
+      # adding a similarly named target later cannot make a pattern match
+      # more than one fuzz test.
+      - name: Fuzz placeholder rebinding (short)
+        run: go test -run=^$ -fuzz=^FuzzRebind$ -fuzztime=60s .
+      - name: Fuzz snake_case inflection (short)
+        run: go test -run=^$ -fuzz=^FuzzSnakeCase$ -fuzztime=60s .

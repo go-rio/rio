@@ -1,0 +1,39 @@
+# golangci-lint v2 configuration. The go-rio family keeps the linter set
+# small and strict: correctness linters only, no style churn.
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - misspell
+    - staticcheck
+    - unused
+  settings:
+    errcheck:
+      exclude-functions:
+        # Closing an already-consumed result set is idiomatic best-effort;
+        # scan paths surface rows.Err() explicitly instead.
+        - (*database/sql.Rows).Close
+        # The rollback inside the panic-recovery path is best-effort by
+        # design: the panic is re-raised immediately and must not be masked.
+        - (*github.com/go-rio/rio.DB).finishTx
+    staticcheck:
+      checks:
+        - all
+        # The golangci-lint defaults: naming and doc-comment style checks
+        # stay off.
+        - -ST1000
+        - -ST1003
+        - -ST1016
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        # rio error messages quote struct tag syntax verbatim (for example
+        # "override with fk:"), so the no-trailing-punctuation rule is off.
+        - -ST1005
+        # Quickfix suggestions (De Morgan rewrites and friends) are editor
+        # material, not CI failures.
+        - -QF1001
