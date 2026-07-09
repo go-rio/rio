@@ -33,6 +33,10 @@ type QueryEvent struct {
 // (tracing spans); AfterQuery completes it. Hooks must not retain the event
 // past the call and cannot modify the statement — rio has no mutating
 // middleware by design.
+//
+// The event covers statement execution: for row-returning queries, Err and
+// Duration describe sending the query, not consuming the rows — scan and
+// iteration failures surface only through the call's returned error.
 type QueryHook interface {
 	BeforeQuery(ctx context.Context, e *QueryEvent) context.Context
 	AfterQuery(ctx context.Context, e *QueryEvent)

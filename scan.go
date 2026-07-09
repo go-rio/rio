@@ -7,6 +7,7 @@ import (
 	"math"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 )
@@ -449,20 +450,35 @@ func entityFields(rows *sql.Rows, p *plan, extras int) ([]*field, error) {
 }
 
 // namedFields maps result columns to plan fields by name (Raw queries).
-// Unknown columns are an error: silently dropping data is how schema drift
-// hides.
+// Unknown columns are an error — silently dropping data is how schema drift
+// hides — and so are missing ones: a partially scanned entity handed to
+// Update would overwrite the unselected columns with zero values. Partial
+// projections belong in DTO types, whose plan the result then covers fully.
 func namedFields(rows *sql.Rows, p *plan) ([]*field, error) {
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, err
 	}
 	fields := make([]*field, len(cols))
+	seen := make(map[string]bool, len(cols))
 	for i, c := range cols {
 		f, ok := p.byColumn[c]
 		if !ok {
 			return nil, fmt.Errorf("rio: no field of %s maps to result column %q", p.structName, c)
 		}
 		fields[i] = f
+		seen[c] = true
+	}
+	var missing []string
+	for _, f := range p.fields {
+		if !seen[f.column] {
+			missing = append(missing, f.column)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf(
+			"rio: result covers only part of %s (missing %s); a partial entity risks zeroed-out writes — scan into a DTO type instead",
+			p.structName, strings.Join(missing, ", "))
 	}
 	return fields, nil
 }

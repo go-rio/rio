@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 )
@@ -506,6 +507,18 @@ func normalizeArgs(d Dialect, args []any) []any {
 			} else {
 				v = d.bindTime(normalizeTime(*t))
 			}
+		case uint64:
+			if t <= math.MaxInt64 {
+				continue
+			}
+			// database/sql refuses uint64 with the high bit set; the
+			// decimal literal binds fine everywhere (mirrors bindArg).
+			v = strconv.FormatUint(t, 10)
+		case uint:
+			if uint64(t) <= math.MaxInt64 {
+				continue
+			}
+			v = strconv.FormatUint(uint64(t), 10)
 		default:
 			continue
 		}

@@ -232,14 +232,7 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 		}
 
 		if d.caps().conflictTarget {
-			b = append(b, " ON CONFLICT ("...)
-			for i, c := range spec.conflict {
-				if i > 0 {
-					b = append(b, ", "...)
-				}
-				b = d.quote(b, c)
-			}
-			b = append(b, ") "...)
+			b = appendConflictClause(b, d, &spec)
 			if spec.doNothing {
 				b = append(b, "DO NOTHING"...)
 			} else {

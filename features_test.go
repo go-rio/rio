@@ -492,3 +492,53 @@ func TestRestoreEntity(t *testing.T) {
 		t.Fatalf("write-back: %+v", u)
 	}
 }
+
+// Codex review: Upsert(DoNothing) without OnConflict rendered the invalid
+// "ON CONFLICT ()" on PG/SQLite; the idempotent-insert shape must work bare.
+func TestUpsertDoNothingWithoutTarget(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id"}, []driver.Value{int64(9)})
+
+	u := &User{Email: "a@x"}
+	if err := Upsert(ctx, db, u, DoNothing()); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	got := f.logged()[0]
+	if !strings.Contains(got, ") ON CONFLICT DO NOTHING") || strings.Contains(got, "ON CONFLICT ()") {
+		t.Fatalf("bare DoNothing must omit the empty target: %s", got)
+	}
+}
+
+// Codex review: partial entity scans through Raw risked zeroed-out writes;
+// missing mapped columns now fail with DTO guidance.
+func TestRawPartialEntityRefused(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id", "email"}, []driver.Value{int64(1), "a@x"})
+
+	_, err := Raw[User]("SELECT id, email FROM users").All(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "DTO") {
+		t.Fatalf("partial entity scan must error with guidance: %v", err)
+	}
+}
+
+// Codex review: uint64 keys above MaxInt64 must bind on query paths too,
+// not just through entity writes.
+func TestHugeUint64QueryArgs(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(MySQL)
+	f.queueRows([]string{"id", "org_id"})
+
+	huge := uint64(1) << 63
+	if _, err := From[Account]().Where("id = ?", huge).All(ctx, db); err != nil {
+		t.Fatalf("huge uint64 arg: %v", err)
+	}
+	stmt := f.loggedContaining("SELECT")[0]
+	if s, ok := stmt.args[0].(string); !ok || s != "9223372036854775808" {
+		t.Fatalf("huge uint64 must bind as decimal string, got %T %v", stmt.args[0], stmt.args[0])
+	}
+}

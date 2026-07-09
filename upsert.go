@@ -101,14 +101,7 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 
 	table := g.table(p)
 	if d.caps().conflictTarget {
-		b = append(b, " ON CONFLICT ("...)
-		for i, c := range spec.conflict {
-			if i > 0 {
-				b = append(b, ", "...)
-			}
-			b = d.quote(b, c)
-		}
-		b = append(b, ") "...)
+		b = appendConflictClause(b, d, &spec)
 		if spec.doNothing {
 			b = append(b, "DO NOTHING"...)
 		} else {
@@ -228,6 +221,24 @@ func upsertUpdateSet(p *plan, spec *upsertSpec) ([]*field, error) {
 		return nil, fmt.Errorf("rio: upsert on %s has nothing to update on conflict (every column is a key or rio-maintained); use DoNothing()", p.structName)
 	}
 	return out, nil
+}
+
+// appendConflictClause renders "ON CONFLICT (cols) " — or the bare
+// "ON CONFLICT " when DoNothing has no target, since "ON CONFLICT ()" is a
+// syntax error on PostgreSQL and SQLite.
+func appendConflictClause(b []byte, d Dialect, spec *upsertSpec) []byte {
+	b = append(b, " ON CONFLICT"...)
+	if len(spec.conflict) == 0 {
+		return append(b, ' ')
+	}
+	b = append(b, " ("...)
+	for i, c := range spec.conflict {
+		if i > 0 {
+			b = append(b, ", "...)
+		}
+		b = d.quote(b, c)
+	}
+	return append(b, ") "...)
 }
 
 // appendConflictSets renders the DO UPDATE SET list. newRow is "excluded"
