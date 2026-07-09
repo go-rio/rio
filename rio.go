@@ -231,19 +231,41 @@ func run(ctx context.Context, q Queryer, op, model, sqlText string, args []any) 
 }
 
 // runQuery executes a row-returning statement through the shared pipeline.
-func runQuery(ctx context.Context, q Queryer, op, model, sqlText string, args []any) (*sql.Rows, error) {
+// The returned finish callback (nil without hooks — the hot path stays
+// allocation-free) fires AfterQuery once the rows are consumed, so hooks see
+// scan errors and a duration that includes row consumption.
+func runQuery(ctx context.Context, q Queryer, op, model, sqlText string, args []any) (*sql.Rows, func(error), error) {
 	cfg := q.conf()
 	if len(cfg.hooks) == 0 {
 		rows, err := query(ctx, q, sqlText, args)
-		return rows, translateErr(err, cfg, q.gram().d)
+		return rows, nil, translateErr(err, cfg, q.gram().d)
 	}
 	ev := &QueryEvent{Op: op, Model: model, Query: sqlText, Args: args}
 	hctx := cfg.beforeQuery(ctx, ev)
 	start := time.Now()
 	rows, err := query(ctx, q, sqlText, args)
 	err = translateErr(err, cfg, q.gram().d)
-	cfg.afterQuery(hctx, ev, start, err, -1)
-	return rows, err
+	if err != nil {
+		cfg.afterQuery(hctx, ev, start, err, -1)
+		return nil, nil, err
+	}
+	finish := func(scanErr error) {
+		cfg.afterQuery(hctx, ev, start, scanErr, -1)
+	}
+	return rows, finish, nil
+}
+
+// finishQuery fires a runQuery finish callback, tolerating the no-hook nil.
+// A miss (ErrNotFound) is a successfully executed query, not a failure —
+// telemetry would otherwise count every First/Find miss as an error.
+func finishQuery(finish func(error), err error) {
+	if finish == nil {
+		return
+	}
+	if errors.Is(err, ErrNotFound) {
+		err = nil
+	}
+	finish(err)
 }
 
 func execute(ctx context.Context, q Queryer, sqlText string, args []any) (sql.Result, error) {

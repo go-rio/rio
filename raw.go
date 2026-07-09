@@ -31,19 +31,24 @@ func (r RawQuery[T]) All(ctx context.Context, db Queryer) ([]T, error) {
 		return nil, err
 	}
 	args = normalizeArgs(d, args)
-	rows, err := runQuery(ctx, db, "raw", "", sqlText, args)
+	rows, finish, err := runQuery(ctx, db, "raw", "", sqlText, args)
 	if err != nil {
 		return nil, err
 	}
 	if isScalarType(reflect.TypeFor[T]()) {
-		return scanScalars[T](rows)
+		out, err := scanScalars[T](rows)
+		finishQuery(finish, err)
+		return out, err
 	}
 	p, err := planOf[T]()
 	if err != nil {
 		rows.Close()
+		finishQuery(finish, err)
 		return nil, err
 	}
-	return scanAll[T](rows, p, true)
+	out, err := scanAll[T](rows, p, true)
+	finishQuery(finish, err)
+	return out, err
 }
 
 // First returns the first row or ErrNotFound. rio does not append LIMIT to

@@ -240,3 +240,88 @@ func BenchmarkInsert_Gorm(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkUpdate_Rio(b *testing.B) {
+	raw := benchRawDB(b, "rio_upd")
+	seed(b, raw, 100)
+	db := rio.New(raw, rio.SQLite)
+	ctx := context.Background()
+	u, err := rio.Find[BenchUser](ctx, db, 1)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		u.Age = 20 + i%50
+		if err := rio.Update(ctx, db, u); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkUpdate_Stdlib(b *testing.B) {
+	raw := benchRawDB(b, "std_upd")
+	seed(b, raw, 100)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		now := time.Now().UTC().Truncate(time.Microsecond).Format("2006-01-02 15:04:05.999999+00:00")
+		if _, err := raw.Exec(`UPDATE bench_users SET email = ?, age = ?, updated_at = ? WHERE id = ?`,
+			"u1@example.com", 20+i%50, now, int64(1)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkUpdate_Gorm(b *testing.B) {
+	gdb := benchGorm(b, "gorm_upd")
+	sqlDB, _ := gdb.DB()
+	seed(b, sqlDB, 100)
+	ctx := context.Background()
+	var u BenchUser
+	if err := gdb.WithContext(ctx).Take(&u, 1).Error; err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		u.Age = 20 + i%50
+		if err := gdb.WithContext(ctx).Save(&u).Error; err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkInsertBatch100_Rio(b *testing.B) {
+	raw := benchRawDB(b, "rio_batch")
+	db := rio.New(raw, rio.SQLite)
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rows := make([]BenchUser, 100)
+		for j := range rows {
+			rows[j] = BenchUser{Email: "x@example.com", Age: j}
+		}
+		if err := rio.InsertAll(ctx, db, rows); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkInsertBatch100_Gorm(b *testing.B) {
+	gdb := benchGorm(b, "gorm_batch")
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rows := make([]BenchUser, 100)
+		for j := range rows {
+			rows[j] = BenchUser{Email: "x@example.com", Age: j}
+		}
+		if err := gdb.WithContext(ctx).Create(&rows).Error; err != nil {
+			b.Fatal(err)
+		}
+	}
+}

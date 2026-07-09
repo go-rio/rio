@@ -114,11 +114,13 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 			if err != nil {
 				return err
 			}
-			rows, err := runQuery(ctx, db, "upsert", p.structName, sqlText, outArgs)
+			rows, finish, err := runQuery(ctx, db, "upsert", p.structName, sqlText, outArgs)
 			if err != nil {
 				return err
 			}
-			return scanBackRow(rows, p, unsafe.Pointer(row))
+			err = scanBackRow(rows, p, unsafe.Pointer(row))
+			finishQuery(finish, err)
+			return err
 		}
 		if d.caps().returning && spec.doNothing && len(back) > 0 {
 			// A fresh insert still reports its generated columns; on
@@ -135,11 +137,12 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 			if err != nil {
 				return err
 			}
-			rows, err := runQuery(ctx, db, "upsert", p.structName, sqlText, outArgs)
+			rows, finish, err := runQuery(ctx, db, "upsert", p.structName, sqlText, outArgs)
 			if err != nil {
 				return err
 			}
 			_, err = scanBackColsIfRow(rows, back, unsafe.Pointer(row))
+			finishQuery(finish, err)
 			return err
 		}
 		sqlText, outArgs, err := finishSQL(d, b, args)

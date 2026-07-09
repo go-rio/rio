@@ -63,9 +63,16 @@ func Compile[T any](q Query[T]) (*Compiled[T], error) {
 	case inlineArgs == 0 && holes == 0:
 		c.inline = true // constant query
 	case inlineArgs == 0:
+		if hasArgsInHasConds(&q.s) {
+			return nil, fmt.Errorf("rio: Compile[%s]: WhereHas arguments are inline and cannot mix with exec-time parameters",
+				p.structName)
+		}
 		c.inline = false
 	case exact && holes == inlineArgs:
 		c.inline = true
+	case exact && hasArgsInHasConds(&q.s):
+		return nil, fmt.Errorf("rio: Compile[%s]: WhereHas arguments are inline; compile a fully inline query or run it uncompiled",
+			p.structName)
 	case exact: // some holes filled, some not
 		return nil, fmt.Errorf("rio: Compile[%s]: %d placeholder(s) but %d inline argument(s); a compiled query is either fully inline or fully exec-parameterized",
 			p.structName, holes, inlineArgs)
@@ -76,6 +83,22 @@ func Compile[T any](q Query[T]) (*Compiled[T], error) {
 			p.structName)
 	}
 	return c, nil
+}
+
+// hasArgsInHasConds reports whether any WhereHas carries inline arguments.
+func hasArgsInHasConds(s *queryState) bool {
+	for _, hc := range s.hasConds {
+		var rq relQuery
+		for _, opt := range hc.opts {
+			opt(&rq)
+		}
+		for _, w := range rq.wheres {
+			if len(w.args) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // validatePaths walks With paths through relation metadata only — no
@@ -185,11 +208,12 @@ func (c *Compiled[T]) All(ctx context.Context, db Queryer, args ...any) ([]T, er
 	if err != nil {
 		return nil, err
 	}
-	rows, err := runQuery(ctx, db, "select", p.structName, cs.sql, bound)
+	rows, finish, err := runQuery(ctx, db, "select", p.structName, cs.sql, bound)
 	if err != nil {
 		return nil, err
 	}
 	out, err := scanAll[T](rows, p, false)
+	finishQuery(finish, err)
 	if err != nil {
 		return nil, err
 	}
@@ -332,7 +356,10 @@ func renderSelectRaw(g *grammar, p *plan, s *queryState) (string, []any, error) 
 		b = append(b, ' ')
 		b = append(b, j...)
 	}
-	b, _ = renderWhere(b, nil, d, table, p, s)
+	b, _, err := renderWhere(b, nil, g, table, p, s)
+	if err != nil {
+		return "", nil, err
+	}
 	if len(s.groups) > 0 {
 		b = append(b, " GROUP BY "...)
 		for i, gexpr := range s.groups {

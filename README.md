@@ -217,11 +217,15 @@ SQLite driver (Apple M4; `rio/bench`, reproducible with
 | read one (compiled) | 8.8 µs | 7.8 µs | 11.6 µs |
 | read one (`Find`) | 8.8 µs | 7.8 µs | 11.6 µs |
 | read 100 rows | 119 µs | 120 µs | 158 µs |
-| insert | 11.2 µs | 7.8 µs | 20.2 µs |
+| insert | 11.0 µs | 7.8 µs | 19.9 µs |
+| update | 6.7 µs | 6.2 µs | 15.5 µs |
+| insert 100 (batch) | 262 µs | — | 294 µs |
 
 Reads beat GORM by ~25% and land within ~12% of hand-written scanning
-(scanning 100 rows is a dead heat); inserts are ~45% faster than GORM with
-less than half the allocations. The techniques: per-type mapping plans,
+(scanning 100 rows is a dead heat); inserts are ~45% faster than GORM,
+updates ~57% faster and within 7% of hand-written SQL. Batch inserts are
+driver-dominated — both sides send one multi-VALUES statement — so the ~11%
+edge there is mostly allocation discipline. The techniques: per-type mapping plans,
 per-grammar SQL caches, offset-based scanning with a reflect fallback, and
 `[]byte`-appended rendering — no code generation anywhere.
 

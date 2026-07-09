@@ -58,11 +58,13 @@ func Insert[T any](ctx context.Context, db Queryer, row *T) error {
 		return err
 	}
 	if returning {
-		rows, err := runQuery(ctx, db, "insert", p.structName, sqlText, args)
+		rows, finish, err := runQuery(ctx, db, "insert", p.structName, sqlText, args)
 		if err != nil {
 			return err
 		}
-		return scanBackCols(rows, back, unsafe.Pointer(row))
+		err = scanBackCols(rows, back, unsafe.Pointer(row))
+		finishQuery(finish, err)
+		return err
 	}
 	res, err := run(ctx, db, "insert", p.structName, sqlText, args)
 	if err != nil {
@@ -97,42 +99,36 @@ func Update[T any](ctx context.Context, db Queryer, row *T, cols ...string) erro
 		setTime(p.updated, rv, now)
 	}
 
-	table := g.table(p)
-	b := make([]byte, 0, 160)
-	b = append(b, "UPDATE "...)
-	b = d.quote(b, table)
-	b = append(b, " SET "...)
-	var args []any
-	for i, f := range set {
-		if i > 0 {
+	bits, cacheable := setBits(p, set)
+	sqlText, err := crudSQL(g, p, "update", bits, cacheable, func() []byte {
+		b := make([]byte, 0, 160)
+		b = append(b, "UPDATE "...)
+		b = d.quote(b, g.table(p))
+		b = append(b, " SET "...)
+		for i, f := range set {
+			if i > 0 {
+				b = append(b, ", "...)
+			}
+			b = d.quote(b, f.column)
+			b = append(b, " = ?"...)
+		}
+		if p.version != nil {
 			b = append(b, ", "...)
+			b = d.quote(b, p.version.column)
+			b = append(b, " = "...)
+			b = d.quote(b, p.version.column)
+			b = append(b, " + 1"...)
 		}
-		b = d.quote(b, f.column)
-		b = append(b, " = ?"...)
-		a, err := bindArg(f, rv.FieldByIndex(f.index), d, now)
-		if err != nil {
-			return err
-		}
-		args = append(args, a)
-	}
-	if p.version != nil {
-		b = append(b, ", "...)
-		b = d.quote(b, p.version.column)
-		b = append(b, " = "...)
-		b = d.quote(b, p.version.column)
-		b = append(b, " + 1"...)
-	}
-
-	b, args, err = appendPKWhere(b, args, d, p, rv, now)
+		return appendPKWhereSQL(b, d, p)
+	})
 	if err != nil {
 		return err
 	}
-
-	sqlText, outArgs, err := finishSQL(d, b, args)
+	args, err := bindFields(p, rv, d, now, set)
 	if err != nil {
 		return err
 	}
-	res, err := run(ctx, db, "update", p.structName, sqlText, outArgs)
+	res, err := run(ctx, db, "update", p.structName, sqlText, args)
 	if err != nil {
 		return err
 	}
@@ -185,36 +181,38 @@ func softDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 	d := g.d
 	now := normalizeTime(db.conf().clock())
 
-	b := make([]byte, 0, 128)
-	b = append(b, "UPDATE "...)
-	b = d.quote(b, g.table(p))
-	b = append(b, " SET "...)
-	b = d.quote(b, p.softDel.column)
-	b = append(b, " = ?"...)
+	sqlText, err := crudSQL(g, p, "softdelete", 0, true, func() []byte {
+		b := make([]byte, 0, 128)
+		b = append(b, "UPDATE "...)
+		b = d.quote(b, g.table(p))
+		b = append(b, " SET "...)
+		b = d.quote(b, p.softDel.column)
+		b = append(b, " = ?"...)
+		if p.updated != nil {
+			b = append(b, ", "...)
+			b = d.quote(b, p.updated.column)
+			b = append(b, " = ?"...)
+		}
+		if p.version != nil {
+			b = append(b, ", "...)
+			b = d.quote(b, p.version.column)
+			b = append(b, " = "...)
+			b = d.quote(b, p.version.column)
+			b = append(b, " + 1"...)
+		}
+		return appendPKWhereSQL(b, d, p)
+	})
+	if err != nil {
+		return err
+	}
 	args := []any{d.bindTime(now)}
 	if p.updated != nil {
-		b = append(b, ", "...)
-		b = d.quote(b, p.updated.column)
-		b = append(b, " = ?"...)
 		args = append(args, d.bindTime(now))
 	}
-	if p.version != nil {
-		b = append(b, ", "...)
-		b = d.quote(b, p.version.column)
-		b = append(b, " = "...)
-		b = d.quote(b, p.version.column)
-		b = append(b, " + 1"...)
-	}
-	var err error
-	b, args, err = appendPKWhere(b, args, d, p, rv, now)
-	if err != nil {
+	if args, err = appendKeyArgs(args, p, rv, d, now); err != nil {
 		return err
 	}
-	sqlText, outArgs, err := finishSQL(d, b, args)
-	if err != nil {
-		return err
-	}
-	res, err := run(ctx, db, "delete", p.structName, sqlText, outArgs)
+	res, err := run(ctx, db, "delete", p.structName, sqlText, args)
 	if err != nil {
 		return err
 	}
@@ -247,20 +245,20 @@ func hardDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 	d := g.d
 	now := normalizeTime(db.conf().clock())
 
-	b := make([]byte, 0, 96)
-	b = append(b, "DELETE FROM "...)
-	b = d.quote(b, g.table(p))
-	var args []any
-	var err error
-	b, args, err = appendPKWhere(b, args, d, p, rv, now)
+	sqlText, err := crudSQL(g, p, "delete", 0, true, func() []byte {
+		b := make([]byte, 0, 96)
+		b = append(b, "DELETE FROM "...)
+		b = d.quote(b, g.table(p))
+		return appendPKWhereSQL(b, d, p)
+	})
 	if err != nil {
 		return err
 	}
-	sqlText, outArgs, err := finishSQL(d, b, args)
+	args, err := appendKeyArgs(nil, p, rv, d, now)
 	if err != nil {
 		return err
 	}
-	res, err := run(ctx, db, "delete", p.structName, sqlText, outArgs)
+	res, err := run(ctx, db, "delete", p.structName, sqlText, args)
 	if err != nil {
 		return err
 	}
@@ -396,6 +394,12 @@ func insertColumns(p *plan, rv reflect.Value, d Dialect, now time.Time) (cols, b
 
 // crudSQL fetches or renders a cached entity-CRUD statement.
 func crudSQL(g *grammar, p *plan, op string, bits uint64, cacheable bool, build func() []byte) (string, error) {
+	return crudSQLRows(g, p, op, bits, 0, cacheable, build)
+}
+
+// crudSQLRows is crudSQL with a VALUES tuple count in the cache key, for
+// batch statements whose shape repeats at a fixed chunk size.
+func crudSQLRows(g *grammar, p *plan, op string, bits uint64, rows int, cacheable bool, build func() []byte) (string, error) {
 	render := func() (string, error) {
 		s, _, err := rebindTemplate(g.d.lexer(), g.d.style(), string(build()))
 		return s, err
@@ -403,7 +407,7 @@ func crudSQL(g *grammar, p *plan, op string, bits uint64, cacheable bool, build 
 	if !cacheable {
 		return render()
 	}
-	return g.cachedSQL(p, op, bits, render)
+	return g.cachedSQL(p, op, bits, rows, render)
 }
 
 func renderInsertHead(g *grammar, p *plan, cols []*field) []byte {
@@ -490,9 +494,21 @@ func scanBackRow(rows *sql.Rows, p *plan, base unsafe.Pointer) error {
 	return rows.Err()
 }
 
-// appendPKWhere renders WHERE pk1 = ? AND ... [AND version = ?].
-func appendPKWhere(b []byte, args []any, d Dialect, p *plan, rv reflect.Value, now time.Time) ([]byte, []any, error) {
-	base := rv.Addr().UnsafePointer()
+// setBits maps a field set to the SQL-cache bitmap.
+func setBits(p *plan, fields []*field) (uint64, bool) {
+	if len(p.fields) > 64 {
+		return 0, false
+	}
+	var bits uint64
+	for _, f := range fields {
+		bits |= 1 << uint(f.ordinal)
+	}
+	return bits, true
+}
+
+// appendPKWhereSQL renders the WHERE pk [AND version] tail, placeholders in
+// unified ? form — the render half of appendPKWhere, cacheable per grammar.
+func appendPKWhereSQL(b []byte, d Dialect, p *plan) []byte {
 	for i, pk := range p.pks {
 		if i == 0 {
 			b = append(b, " WHERE "...)
@@ -501,23 +517,48 @@ func appendPKWhere(b []byte, args []any, d Dialect, p *plan, rv reflect.Value, n
 		}
 		b = d.quote(b, pk.column)
 		b = append(b, " = ?"...)
-		a, err := fieldValue(pk, base, rv, d, now)
-		if err != nil {
-			return nil, nil, err
-		}
-		args = append(args, a)
 	}
 	if p.version != nil {
 		b = append(b, " AND "...)
 		b = d.quote(b, p.version.column)
 		b = append(b, " = ?"...)
-		a, err := fieldValue(p.version, base, rv, d, now)
+	}
+	return b // still in unified ? form; crudSQL rebinds the whole statement
+}
+
+// appendKeyArgs binds the PK (+version) values matching appendPKWhereSQL.
+func appendKeyArgs(args []any, p *plan, rv reflect.Value, d Dialect, now time.Time) ([]any, error) {
+	base := rv.Addr().UnsafePointer()
+	for _, pk := range p.pks {
+		a, err := fieldValue(pk, base, rv, d, now)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		args = append(args, a)
 	}
-	return b, args, nil
+	if p.version != nil {
+		a, err := fieldValue(p.version, base, rv, d, now)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, a)
+	}
+	return args, nil
+}
+
+// bindFields extracts the bind values for a rendered field list plus the
+// key/version tail.
+func bindFields(p *plan, rv reflect.Value, d Dialect, now time.Time, set []*field) ([]any, error) {
+	base := rv.Addr().UnsafePointer()
+	args := make([]any, 0, len(set)+len(p.pks)+1)
+	for _, f := range set {
+		a, err := fieldValue(f, base, rv, d, now)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, a)
+	}
+	return appendKeyArgs(args, p, rv, d, now)
 }
 
 func fillLastInsertID(p *plan, rv reflect.Value, lastID func() (int64, error)) error {
@@ -556,35 +597,38 @@ func Restore[T any](ctx context.Context, db Queryer, row *T) error {
 	d := g.d
 	now := normalizeTime(db.conf().clock())
 
-	b := make([]byte, 0, 128)
-	b = append(b, "UPDATE "...)
-	b = d.quote(b, g.table(p))
-	b = append(b, " SET "...)
-	b = d.quote(b, p.softDel.column)
-	b = append(b, " = NULL"...)
+	sqlText, err := crudSQL(g, p, "restore", 0, true, func() []byte {
+		b := make([]byte, 0, 128)
+		b = append(b, "UPDATE "...)
+		b = d.quote(b, g.table(p))
+		b = append(b, " SET "...)
+		b = d.quote(b, p.softDel.column)
+		b = append(b, " = NULL"...)
+		if p.updated != nil {
+			b = append(b, ", "...)
+			b = d.quote(b, p.updated.column)
+			b = append(b, " = ?"...)
+		}
+		if p.version != nil {
+			b = append(b, ", "...)
+			b = d.quote(b, p.version.column)
+			b = append(b, " = "...)
+			b = d.quote(b, p.version.column)
+			b = append(b, " + 1"...)
+		}
+		return appendPKWhereSQL(b, d, p)
+	})
+	if err != nil {
+		return err
+	}
 	var args []any
 	if p.updated != nil {
-		b = append(b, ", "...)
-		b = d.quote(b, p.updated.column)
-		b = append(b, " = ?"...)
 		args = append(args, d.bindTime(now))
 	}
-	if p.version != nil {
-		b = append(b, ", "...)
-		b = d.quote(b, p.version.column)
-		b = append(b, " = "...)
-		b = d.quote(b, p.version.column)
-		b = append(b, " + 1"...)
-	}
-	b, args, err = appendPKWhere(b, args, d, p, rv, now)
-	if err != nil {
+	if args, err = appendKeyArgs(args, p, rv, d, now); err != nil {
 		return err
 	}
-	sqlText, outArgs, err := finishSQL(d, b, args)
-	if err != nil {
-		return err
-	}
-	res, err := run(ctx, db, "update", p.structName, sqlText, outArgs)
+	res, err := run(ctx, db, "update", p.structName, sqlText, args)
 	if err != nil {
 		return err
 	}

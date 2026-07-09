@@ -27,7 +27,7 @@ func (q Query[T]) UpdateAll(ctx context.Context, db Queryer, set Set) (int64, er
 	if len(set) == 0 {
 		return 0, fmt.Errorf("rio: UpdateAll with an empty Set")
 	}
-	if len(q.s.wheres) == 0 && !q.s.allRows {
+	if len(q.s.wheres) == 0 && len(q.s.hasConds) == 0 && !q.s.allRows {
 		return 0, ErrMissingWhere
 	}
 	p, err := planOf[T]()
@@ -88,7 +88,10 @@ func (q Query[T]) UpdateAll(ctx context.Context, db Queryer, set Set) (int64, er
 		args = append(args, v)
 	}
 
-	b, args = renderWhere(b, args, d, table, p, &q.s)
+	b, args, err = renderWhere(b, args, g, table, p, &q.s)
+	if err != nil {
+		return 0, err
+	}
 	sqlText, outArgs, err := finishSQL(d, b, args)
 	if err != nil {
 		return 0, err
@@ -105,7 +108,7 @@ func (q Query[T]) UpdateAll(ctx context.Context, db Queryer, set Set) (int64, er
 // are excluded by the default filter), a real DELETE otherwise. It refuses
 // to run without conditions unless AllRows() was called.
 func (q Query[T]) DeleteAll(ctx context.Context, db Queryer) (int64, error) {
-	if len(q.s.wheres) == 0 && !q.s.allRows {
+	if len(q.s.wheres) == 0 && len(q.s.hasConds) == 0 && !q.s.allRows {
 		return 0, ErrMissingWhere
 	}
 	p, err := planOf[T]()
@@ -122,7 +125,7 @@ func (q Query[T]) DeleteAll(ctx context.Context, db Queryer) (int64, error) {
 // ForceDeleteAll hard-deletes matching rows even on soft-delete models.
 // Combined with OnlyTrashed it empties the recycle bin.
 func (q Query[T]) ForceDeleteAll(ctx context.Context, db Queryer) (int64, error) {
-	if len(q.s.wheres) == 0 && !q.s.allRows {
+	if len(q.s.wheres) == 0 && len(q.s.hasConds) == 0 && !q.s.allRows {
 		return 0, ErrMissingWhere
 	}
 	p, err := planOf[T]()
@@ -140,7 +143,10 @@ func (q Query[T]) forceDeleteAll(ctx context.Context, db Queryer, p *plan) (int6
 	b = append(b, "DELETE FROM "...)
 	b = d.quote(b, table)
 	var args []any
-	b, args = renderWhere(b, args, d, table, p, &q.s)
+	b, args, err := renderWhere(b, args, g, table, p, &q.s)
+	if err != nil {
+		return 0, err
+	}
 	sqlText, outArgs, err := finishSQL(d, b, args)
 	if err != nil {
 		return 0, err

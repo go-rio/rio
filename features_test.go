@@ -542,3 +542,293 @@ func TestHugeUint64QueryArgs(t *testing.T) {
 		t.Fatalf("huge uint64 must bind as decimal string, got %T %v", stmt.args[0], stmt.args[0])
 	}
 }
+
+// --- v0.2: WhereHas / WhereHasNot ---
+
+func TestWhereHas(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows(userCols)
+
+	_, err := From[User]().WhereHas("Posts", RelWhere("title <> ?", "")).All(ctx, db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	got := f.logged()[0]
+	want := `EXISTS (SELECT 1 FROM "posts" AS "rio_h1" WHERE "rio_h1"."user_id" = "users"."id" AND (title <> $1))`
+	if !strings.Contains(got, want) {
+		t.Fatalf("sql:\n got: %s\nwant fragment: %s", got, want)
+	}
+}
+
+func TestWhereHasNotAndNested(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows(userCols)
+
+	_, err := From[User]().WhereHasNot("Posts.Author").All(ctx, db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	got := f.logged()[0]
+	for _, frag := range []string{
+		`NOT EXISTS (SELECT 1 FROM "posts" AS "rio_h1"`,
+		`AND EXISTS (SELECT 1 FROM "users" AS "rio_h2" WHERE "rio_h2"."id" = "rio_h1"."user_id"`,
+		`AND "rio_h2"."deleted_at" IS NULL`, // nested soft-delete filtering
+	} {
+		if !strings.Contains(got, frag) {
+			t.Fatalf("missing %q in:\n%s", frag, got)
+		}
+	}
+}
+
+func TestWhereHasManyToMany(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id", "org_id"})
+
+	_, err := From[Account]().WhereHas("Tags", RelWhere("name = ?", "go")).All(ctx, db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	got := f.logged()[0]
+	want := `EXISTS (SELECT 1 FROM "account_tags" AS "rio_j1" INNER JOIN "tags" AS "rio_h1" ON "rio_j1"."tag_id" = "rio_h1"."id" WHERE "rio_j1"."account_id" = "accounts"."id" AND (name = $1))`
+	if !strings.Contains(got, want) {
+		t.Fatalf("m2m exists:\n got: %s\nwant fragment: %s", got, want)
+	}
+}
+
+func TestWhereHasWorksOnSetOps(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueExec(0, 2)
+
+	n, err := From[User]().WhereHas("Posts").UpdateAll(ctx, db, Set{"age": 1})
+	if err != nil || n != 2 {
+		t.Fatalf("UpdateAll: %v n=%d", err, n)
+	}
+	if !strings.Contains(f.logged()[0], "EXISTS (SELECT 1 FROM") {
+		t.Fatalf("sql: %s", f.logged()[0])
+	}
+}
+
+func TestCompiledRejectsParamedWhereHas(t *testing.T) {
+	_, err := Compile[User](From[User]().Where("age > ?").WhereHas("Posts", RelWhere("title = ?", "x")))
+	if err == nil || !strings.Contains(err.Error(), "WhereHas") {
+		t.Fatalf("exec-mode compile with paramed WhereHas must be refused: %v", err)
+	}
+	// Fully inline compiles fine.
+	if _, err := Compile[User](From[User]().Where("age > ?", 1).WhereHas("Posts", RelWhere("title = ?", "x"))); err != nil {
+		t.Fatalf("inline compile: %v", err)
+	}
+}
+
+// --- v0.2: WithCount + RelLimit ---
+
+type Board struct {
+	ID         int64
+	PostsCount int64 `rio:",countof:Posts"`
+	Posts      HasMany[BoardPost]
+}
+
+type BoardPost struct {
+	ID      int64
+	BoardID int64
+}
+
+func TestWithCount(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)}, []driver.Value{int64(2)})
+	f.queueRows([]string{"board_id", "count"}, []driver.Value{int64(1), int64(3)})
+
+	boards, err := From[Board]().WithCount("Posts").All(ctx, db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	rel := f.logged()[1]
+	want := `SELECT "board_posts"."board_id", count(*) FROM "board_posts" WHERE "board_posts"."board_id" IN ($1, $2) GROUP BY "board_posts"."board_id"`
+	if rel != want {
+		t.Fatalf("count sql:\n got: %s\nwant: %s", rel, want)
+	}
+	if boards[0].PostsCount != 3 || boards[1].PostsCount != 0 {
+		t.Fatalf("counts: %+v", boards)
+	}
+	// The count target itself is not a column.
+	if !strings.Contains(f.logged()[0], `SELECT "boards"."id" FROM "boards"`) {
+		t.Fatalf("countof field must not map to a column: %s", f.logged()[0])
+	}
+}
+
+func TestWithCountRejectsBelongsTo(t *testing.T) {
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows(postCols, []driver.Value{int64(1), int64(1), "x"})
+	_, err := From[Post]().WithCount("Author").All(context.Background(), db)
+	if err == nil || !strings.Contains(err.Error(), "count target") {
+		t.Fatalf("BelongsTo count needs a countof target first: %v", err)
+	}
+}
+
+func TestRelLimitWindowQuery(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows(userCols, userRow(1, "a@x"))
+	f.queueRows(postCols,
+		[]driver.Value{int64(10), int64(1), "first"},
+		[]driver.Value{int64(11), int64(1), "second"},
+	)
+
+	users, err := From[User]().With("Posts", RelOrder("id DESC"), RelLimit(2)).All(ctx, db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	rel := f.logged()[1]
+	for _, frag := range []string{
+		`SELECT "id", "user_id", "title" FROM (SELECT "posts"."id", "posts"."user_id", "posts"."title", ROW_NUMBER() OVER (PARTITION BY "posts"."user_id" ORDER BY id DESC) AS "__rio_rn" FROM "posts" WHERE "posts"."user_id" IN ($1)`,
+		`) AS "rio_w" WHERE "rio_w"."__rio_rn" <= 2`,
+	} {
+		if !strings.Contains(rel, frag) {
+			t.Fatalf("missing %q in:\n%s", frag, rel)
+		}
+	}
+	if len(users[0].Posts.Rows()) != 2 {
+		t.Fatalf("rows: %+v", users[0].Posts.Rows())
+	}
+}
+
+func TestRelLimitManyToMany(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id", "org_id"}, []driver.Value{int64(1), nil})
+	f.queueRows([]string{"id", "name", "__rio_key"}, []driver.Value{int64(100), "go", int64(1)})
+
+	accounts, err := From[Account]().With("Tags", RelLimit(1)).All(ctx, db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	rel := f.logged()[1]
+	for _, frag := range []string{
+		`"account_tags"."account_id" AS "__rio_key"`,
+		`ROW_NUMBER() OVER (PARTITION BY "account_tags"."account_id" ORDER BY "tags"."id")`,
+		`WHERE "rio_w"."__rio_rn" <= 1`,
+	} {
+		if !strings.Contains(rel, frag) {
+			t.Fatalf("missing %q in:\n%s", frag, rel)
+		}
+	}
+	if got := accounts[0].Tags.Rows(); len(got) != 1 || got[0].Name != "go" {
+		t.Fatalf("tags: %+v", got)
+	}
+}
+
+// --- v0.2: Attach/Detach, Rows, Pluck ---
+
+func TestAttachDetach(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+
+	acc := &Account{ID: 7}
+	f.queueExec(0, 2)
+	if err := Attach(ctx, db, acc, "Tags", 100, 101); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	got := f.logged()[0]
+	want := `INSERT INTO "account_tags" ("account_id", "tag_id") VALUES ($1, $2), ($3, $4) ON CONFLICT DO NOTHING`
+	if got != want {
+		t.Fatalf("attach sql:\n got: %s\nwant: %s", got, want)
+	}
+
+	f.queueExec(0, 1)
+	if err := Detach(ctx, db, acc, "Tags", 100); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+	got = f.logged()[1]
+	want = `DELETE FROM "account_tags" WHERE "account_id" = $1 AND "tag_id" IN ($2)`
+	if got != want {
+		t.Fatalf("detach sql:\n got: %s\nwant: %s", got, want)
+	}
+
+	if err := Detach(ctx, db, acc, "Tags"); err == nil {
+		t.Fatal("Detach without ids must refuse")
+	}
+	if err := Attach(ctx, db, acc, "Tags"); err != nil {
+		t.Fatalf("Attach with zero ids is a no-op: %v", err)
+	}
+	if err := Attach(ctx, db, &User{ID: 1}, "Posts", 1); err == nil || !strings.Contains(err.Error(), "ManyToMany") {
+		t.Fatalf("HasMany attach must refuse: %v", err)
+	}
+}
+
+func TestAttachMySQLForm(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(MySQL)
+	f.queueExec(0, 1)
+	if err := Attach(ctx, db, &Account{ID: 7}, "Tags", 100); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	if !strings.Contains(f.logged()[0], "ON DUPLICATE KEY UPDATE `account_id` = `account_id`") {
+		t.Fatalf("mysql attach: %s", f.logged()[0])
+	}
+}
+
+func TestRowsStreams(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows(userCols, userRow(1, "a@x"), userRow(2, "b@x"), userRow(3, "c@x"))
+
+	var seen []int64
+	for u, err := range From[User]().Where("age > ?", 0).Rows(ctx, db) {
+		if err != nil {
+			t.Fatalf("iter: %v", err)
+		}
+		seen = append(seen, u.ID)
+		if len(seen) == 2 {
+			break // early break must close cleanly
+		}
+	}
+	if len(seen) != 2 || seen[0] != 1 || seen[1] != 2 {
+		t.Fatalf("streamed: %v", seen)
+	}
+
+	for _, err := range From[User]().With("Posts").Rows(ctx, db) {
+		if err == nil || !strings.Contains(err.Error(), "cannot stream") {
+			t.Fatalf("With must refuse streaming: %v", err)
+		}
+		break
+	}
+}
+
+func TestPluck(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"email"}, []driver.Value{"a@x"}, []driver.Value{"b@x"})
+
+	emails, err := Pluck[string](ctx, db, From[User]().Where("age > ?", 18).OrderBy("id"), "email")
+	if err != nil {
+		t.Fatalf("Pluck: %v", err)
+	}
+	if len(emails) != 2 || emails[0] != "a@x" {
+		t.Fatalf("emails: %v", emails)
+	}
+	got := f.logged()[0]
+	want := `SELECT "users"."email" FROM "users" WHERE (age > $1) AND "users"."deleted_at" IS NULL ORDER BY id`
+	if got != want {
+		t.Fatalf("pluck sql:\n got: %s\nwant: %s", got, want)
+	}
+
+	if _, err := Pluck[string](ctx, db, From[User](), "no_such"); err == nil || !strings.Contains(err.Error(), "Raw") {
+		t.Fatalf("unknown column must point at Raw: %v", err)
+	}
+}

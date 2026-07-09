@@ -7,6 +7,7 @@ import (
 	"math"
 	"reflect"
 	"sort"
+	"strconv"
 	"unsafe"
 )
 
@@ -128,6 +129,7 @@ type relQuery struct {
 	wheres      []cond
 	orders      []string
 	withTrashed bool
+	limit       int
 }
 
 // RelWhere restricts the preloaded rows. The condition runs inside the
@@ -147,6 +149,15 @@ func RelOrder(expr string) RelOption {
 // model declares a softdelete column.
 func RelWithTrashed() RelOption {
 	return func(rq *relQuery) { rq.withTrashed = true }
+}
+
+// RelLimit caps the preloaded rows per parent (not overall), via
+// ROW_NUMBER() OVER (PARTITION BY the foreign key) — the query stays one
+// round trip and pagination-correct. Order within each parent follows
+// RelOrder, defaulting to the target's primary key for determinism.
+// Requires window functions: PostgreSQL, MySQL 8+, SQLite 3.25+.
+func RelLimit(n int) RelOption {
+	return func(rq *relQuery) { rq.limit = n }
 }
 
 // preloadInto loads relation paths into rows of one plan.
@@ -268,11 +279,12 @@ func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, r
 			if err != nil {
 				return err
 			}
-			sqlRows, err := runQuery(ctx, db, "select", target.structName, sqlText, args)
+			sqlRows, finish, err := runQuery(ctx, db, "select", target.structName, sqlText, args)
 			if err != nil {
 				return err
 			}
 			part, partKeys, err := scanRel(sqlRows, target, buf, keyed, res)
+			finishQuery(finish, err)
 			if err != nil {
 				return err
 			}
@@ -342,6 +354,9 @@ func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, r
 // renderRelSelect renders the preload query. keyed reports whether an extra
 // join-key column is appended after the entity columns (ManyToMany).
 func renderRelSelect(g *grammar, res *resolvedRel, kind relKind, keys []any, rq *relQuery) (string, []any, bool, error) {
+	if rq.limit > 0 {
+		return renderRelSelectLimited(g, res, kind, keys, rq)
+	}
 	d := g.d
 	target := res.target
 	table := g.table(target)
@@ -496,3 +511,280 @@ func canonKey(v reflect.Value) any {
 }
 
 var _ = unsafe.Pointer(nil) // unsafe is used via UnsafePointer accessors
+
+// countInto fills WithCount targets: one GROUP BY query per relation, the
+// aggregate sibling of selectin preloading.
+func countInto[T any](ctx context.Context, db Queryer, p *plan, rows []T, counts []string) error {
+	if len(rows) == 0 || len(counts) == 0 {
+		return nil
+	}
+	rv := reflect.ValueOf(rows)
+	sorted := append([]string(nil), counts...)
+	sort.Strings(sorted)
+	for _, name := range sorted {
+		if err := countRelation(ctx, db, p, name, rv); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func countRelation(ctx context.Context, db Queryer, owner *plan, name string, rows reflect.Value) error {
+	rel, ok := owner.rels[name]
+	if !ok {
+		return fmt.Errorf("rio: %s has no relation %q", owner.structName, name)
+	}
+	target, ok := owner.counts[name]
+	if !ok {
+		return fmt.Errorf("rio: %s has no count target for %q; declare a field tagged `rio:\",countof:%s\"`", owner.structName, name, name)
+	}
+	if rel.kind != relHasMany && rel.kind != relManyToMany {
+		return fmt.Errorf("rio: WithCount(%q): counting a %s relation is meaningless (0 or 1); load it instead", name, rel.kind)
+	}
+	res, err := rel.resolve(owner)
+	if err != nil {
+		return err
+	}
+
+	seen := make(map[any]struct{})
+	var keys []any
+	parentKey := make([]any, rows.Len())
+	for i := 0; i < rows.Len(); i++ {
+		kv := rows.Index(i).FieldByIndex(res.ref.index)
+		k := canonKey(kv)
+		parentKey[i] = k
+		if _, dup := seen[k]; !dup {
+			seen[k] = struct{}{}
+			keys = append(keys, k)
+		}
+	}
+
+	g := db.gram()
+	d := g.d
+	byKey := make(map[any]int64, len(keys))
+	chunk := d.caps().maxBindParams
+	for start := 0; start < len(keys); start += chunk {
+		end := min(start+chunk, len(keys))
+		b := make([]byte, 0, 160)
+		var keyCol string
+		b = append(b, "SELECT "...)
+		if rel.kind == relManyToMany {
+			keyCol = res.joinFK
+			b = d.quote(b, res.joinTable)
+			b = append(b, '.')
+			b = d.quote(b, keyCol)
+			b = append(b, ", count(*) FROM "...)
+			b = d.quote(b, res.joinTable)
+			if res.target.softDel != nil {
+				// Tombstoned targets must not count; join filters them.
+				b = append(b, " INNER JOIN "...)
+				b = d.quote(b, g.table(res.target))
+				b = append(b, " ON "...)
+				b = d.quote(b, g.table(res.target))
+				b = append(b, '.')
+				b = d.quote(b, res.fk.column)
+				b = append(b, " = "...)
+				b = d.quote(b, res.joinTable)
+				b = append(b, '.')
+				b = d.quote(b, res.joinRef)
+				b = append(b, " AND "...)
+				b = d.quote(b, g.table(res.target))
+				b = append(b, '.')
+				b = d.quote(b, res.target.softDel.column)
+				b = append(b, " IS NULL"...)
+			}
+			b = append(b, " WHERE "...)
+			b = d.quote(b, res.joinTable)
+			b = append(b, '.')
+			b = d.quote(b, keyCol)
+		} else {
+			keyCol = res.fk.column
+			table := g.table(res.target)
+			b = d.quote(b, table)
+			b = append(b, '.')
+			b = d.quote(b, keyCol)
+			b = append(b, ", count(*) FROM "...)
+			b = d.quote(b, table)
+			b = append(b, " WHERE "...)
+			b = d.quote(b, table)
+			b = append(b, '.')
+			b = d.quote(b, keyCol)
+		}
+		b = append(b, " IN (?)"...)
+		args := []any{keys[start:end]}
+		if rel.kind != relManyToMany && res.target.softDel != nil {
+			b = append(b, " AND "...)
+			b = d.quote(b, g.table(res.target))
+			b = append(b, '.')
+			b = d.quote(b, res.target.softDel.column)
+			b = append(b, " IS NULL"...)
+		}
+		b = append(b, " GROUP BY "...)
+		if rel.kind == relManyToMany {
+			b = d.quote(b, res.joinTable)
+		} else {
+			b = d.quote(b, g.table(res.target))
+		}
+		b = append(b, '.')
+		b = d.quote(b, keyCol)
+
+		sqlText, outArgs, err := finishSQL(d, b, args)
+		if err != nil {
+			return err
+		}
+		sqlRows, finish, err := runQuery(ctx, db, "select", res.target.structName, sqlText, outArgs)
+		if err != nil {
+			return err
+		}
+		err = scanCounts(sqlRows, res.ref.typ, byKey)
+		finishQuery(finish, err)
+		if err != nil {
+			return err
+		}
+	}
+
+	for i := 0; i < rows.Len(); i++ {
+		n := byKey[parentKey[i]]
+		rows.Index(i).FieldByIndex(target).SetInt(n)
+	}
+	return nil
+}
+
+// scanCounts drains (key, count) pairs into the grouping map.
+func scanCounts(rows *sql.Rows, keyType reflect.Type, byKey map[any]int64) error {
+	defer rows.Close()
+	keyBuf := reflect.New(keyType)
+	kf := &field{name: "count key", column: "<key>", typ: keyType}
+	codec, err := codecFor(kf)
+	if err != nil {
+		return err
+	}
+	kf.code = codec
+	cell := colScanner{f: kf, base: keyBuf.UnsafePointer()}
+	for rows.Next() {
+		var n int64
+		if err := rows.Scan(&cell, &n); err != nil {
+			return err
+		}
+		byKey[canonKey(keyBuf.Elem())] = n
+	}
+	return rows.Err()
+}
+
+// renderRelSelectLimited wraps the preload in a window subquery so the limit
+// applies per parent: the inner query numbers rows within each foreign-key
+// partition, the outer one keeps the first N and projects exactly the entity
+// columns (plus the join key) — the row number never leaves the subquery.
+func renderRelSelectLimited(g *grammar, res *resolvedRel, kind relKind, keys []any, rq *relQuery) (string, []any, bool, error) {
+	d := g.d
+	target := res.target
+	table := g.table(target)
+	b := make([]byte, 0, 256)
+	var args []any
+	keyed := kind == relManyToMany
+
+	b = append(b, "SELECT "...)
+	for i, f := range target.fields {
+		if i > 0 {
+			b = append(b, ", "...)
+		}
+		b = d.quote(b, f.column)
+	}
+	if keyed {
+		b = append(b, ", "...)
+		b = d.quote(b, "__rio_key")
+	}
+	b = append(b, " FROM (SELECT "...)
+	for i, f := range target.fields {
+		if i > 0 {
+			b = append(b, ", "...)
+		}
+		b = d.quote(b, table)
+		b = append(b, '.')
+		b = d.quote(b, f.column)
+	}
+	partition := table + "." + res.fk.column
+	if keyed {
+		b = append(b, ", "...)
+		b = d.quote(b, res.joinTable)
+		b = append(b, '.')
+		b = d.quote(b, res.joinFK)
+		b = append(b, " AS "...)
+		b = d.quote(b, "__rio_key")
+		partition = res.joinTable + "." + res.joinFK
+	}
+	b = append(b, ", ROW_NUMBER() OVER (PARTITION BY "...)
+	b = d.quote(b, partition)
+	b = append(b, " ORDER BY "...)
+	if len(rq.orders) > 0 {
+		for i, o := range rq.orders {
+			if i > 0 {
+				b = append(b, ", "...)
+			}
+			b = append(b, o...)
+		}
+	} else {
+		// Deterministic default: the target's primary key.
+		pkCol := target.fields[0].column
+		if len(target.pks) > 0 {
+			pkCol = target.pks[0].column
+		}
+		b = d.quote(b, table)
+		b = append(b, '.')
+		b = d.quote(b, pkCol)
+	}
+	b = append(b, ") AS "...)
+	b = d.quote(b, "__rio_rn")
+	b = append(b, " FROM "...)
+	b = d.quote(b, table)
+
+	switch kind {
+	case relManyToMany:
+		b = append(b, " INNER JOIN "...)
+		b = d.quote(b, res.joinTable)
+		b = append(b, " ON "...)
+		b = d.quote(b, res.joinTable)
+		b = append(b, '.')
+		b = d.quote(b, res.joinRef)
+		b = append(b, " = "...)
+		b = d.quote(b, table)
+		b = append(b, '.')
+		b = d.quote(b, res.fk.column)
+		b = append(b, " WHERE "...)
+		b = d.quote(b, res.joinTable)
+		b = append(b, '.')
+		b = d.quote(b, res.joinFK)
+	default:
+		b = append(b, " WHERE "...)
+		b = d.quote(b, table)
+		b = append(b, '.')
+		b = d.quote(b, res.fk.column)
+	}
+	b = append(b, " IN (?)"...)
+	args = append(args, keys)
+
+	if target.softDel != nil && !rq.withTrashed {
+		b = append(b, " AND "...)
+		b = d.quote(b, table)
+		b = append(b, '.')
+		b = d.quote(b, target.softDel.column)
+		b = append(b, " IS NULL"...)
+	}
+	for _, w := range rq.wheres {
+		b = append(b, " AND ("...)
+		b = append(b, w.expr...)
+		b = append(b, ')')
+		args = append(args, w.args...)
+	}
+	b = append(b, ") AS "...)
+	b = d.quote(b, "rio_w")
+	b = append(b, " WHERE "...)
+	b = d.quote(b, "rio_w")
+	b = append(b, '.')
+	b = d.quote(b, "__rio_rn")
+	b = append(b, " <= "...)
+	b = strconv.AppendInt(b, int64(rq.limit), 10)
+
+	sqlText, outArgs, err := finishSQL(d, b, args)
+	return sqlText, outArgs, keyed, err
+}

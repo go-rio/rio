@@ -30,6 +30,10 @@ func TestSQLiteSuite(t *testing.T) {
 	runSuite(t, sqliteDB(t), "sqlite")
 }
 
+func TestSQLiteV02Suite(t *testing.T) {
+	runV02Suite(t, sqliteDB(t), "sqlite")
+}
+
 func TestPostgresSuite(t *testing.T) {
 	dsn := os.Getenv("RIO_POSTGRES_DSN")
 	if dsn == "" {
@@ -42,6 +46,7 @@ func TestPostgresSuite(t *testing.T) {
 	db := rio.New(raw, rio.Postgres)
 	t.Cleanup(func() { _ = db.Close() })
 	runSuite(t, db, "postgres")
+	runV02Suite(t, db, "postgres")
 }
 
 func TestMySQLSuite(t *testing.T) {
@@ -71,6 +76,7 @@ func TestMySQLSuite(t *testing.T) {
 	}))
 	t.Cleanup(func() { _ = db.Close() })
 	runSuite(t, db, "mysql")
+	runV02Suite(t, db, "mysql")
 }
 
 // TestModerncTimeProbe pins how the modernc driver round-trips rio's own

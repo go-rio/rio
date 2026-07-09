@@ -34,15 +34,17 @@ type plan struct {
 
 	rels     map[string]*relField
 	relNames []string
+	counts   map[string][]int // relation name → field index of its count target
 }
 
 // field maps one struct field to one column.
 type field struct {
-	name   string
-	column string
-	index  []int   // reflect traversal path (embedding)
-	offset uintptr // cumulative offset — valid because only value embedding is allowed
-	typ    reflect.Type
+	name    string
+	column  string
+	index   []int   // reflect traversal path (embedding)
+	offset  uintptr // cumulative offset — valid because only value embedding is allowed
+	ordinal int     // position in plan.fields, the bit in SQL-cache bitmaps
+	typ     reflect.Type
 
 	isPK, isAutoIncr, omitZero, jsonCol bool
 	isVersion, isSoftDelete             bool
@@ -103,6 +105,7 @@ func buildPlan(t reflect.Type) (*plan, error) {
 		defaultTable: tableName(t.Name()),
 		byColumn:     make(map[string]*field),
 		rels:         make(map[string]*relField),
+		counts:       make(map[string][]int),
 	}
 	if tn, ok := reflect.New(t).Interface().(TableNamer); ok {
 		p.tableOverride = tn.TableName()
@@ -112,7 +115,8 @@ func buildPlan(t reflect.Type) (*plan, error) {
 	if err := p.addFields(t, nil, 0); err != nil {
 		errs = append(errs, err)
 	}
-	for _, f := range p.fields {
+	for i, f := range p.fields {
+		f.ordinal = i
 		if f.isPK {
 			p.pks = append(p.pks, f)
 		}
@@ -153,6 +157,16 @@ func (p *plan) addFields(t reflect.Type, prefix []int, baseOffset uintptr) error
 				fkTag: opts.fk, refTag: opts.ref, joinTag: opts.join,
 			}
 			p.relNames = append(p.relNames, sf.Name)
+			continue
+		}
+		if opts.countOf != "" {
+			// A count target is populated by WithCount, never mapped to a
+			// column of its own.
+			if sf.Type.Kind() != reflect.Int64 {
+				errs = append(errs, fmt.Errorf("field %s: countof targets must be int64, got %s", sf.Name, sf.Type))
+				continue
+			}
+			p.counts[opts.countOf] = index
 			continue
 		}
 		if opts.fk != "" || opts.ref != "" || opts.join != "" {
@@ -279,6 +293,7 @@ type tagOpts struct {
 	noAutoIncr bool
 	fk, ref    string
 	join       string
+	countOf    string
 }
 
 func parseTag(sf reflect.StructField) (column string, opts tagOpts, err error) {
@@ -314,6 +329,8 @@ func parseTag(sf reflect.StructField) (column string, opts tagOpts, err error) {
 			opts.ref = part[len("ref:"):]
 		case strings.HasPrefix(part, "join:"):
 			opts.join = part[len("join:"):]
+		case strings.HasPrefix(part, "countof:"):
+			opts.countOf = part[len("countof:"):]
 		case part == "":
 			// tolerated: `rio:"name,"`
 		default:

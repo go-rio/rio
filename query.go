@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"math"
 	"strconv"
 	"time"
+	"unsafe"
 )
 
 type cond struct {
@@ -38,7 +40,18 @@ type queryState struct {
 	trashed   trashMode
 	allRows   bool
 
-	withs []preloadSpec
+	withs    []preloadSpec
+	hasConds []hasCond
+	counts   []string
+}
+
+// hasCond is one WhereHas/WhereHasNot: filter parents by the existence of
+// related rows, rendered as an EXISTS subquery — no row explosion, and the
+// same shape on all three dialects.
+type hasCond struct {
+	path string
+	not  bool
+	opts []RelOption
 }
 
 // Query is an immutable, connection-free query description. Every builder
@@ -142,6 +155,30 @@ func (q Query[T]) AllRows() Query[T] {
 	return q
 }
 
+// WhereHas keeps only rows whose relation at path has at least one matching
+// row, rendered as EXISTS (...). Options constrain the related rows; nested
+// paths ("Posts.Comments") nest the EXISTS. Related soft-delete models are
+// filtered like preloading; RelWithTrashed applies to the leaf.
+func (q Query[T]) WhereHas(path string, opts ...RelOption) Query[T] {
+	q.s.hasConds = appendOne(q.s.hasConds, hasCond{path: path, opts: opts})
+	return q
+}
+
+// WhereHasNot keeps only rows whose relation at path has no matching row —
+// NOT EXISTS (...).
+func (q Query[T]) WhereHasNot(path string, opts ...RelOption) Query[T] {
+	q.s.hasConds = appendOne(q.s.hasConds, hasCond{path: path, not: true, opts: opts})
+	return q
+}
+
+// WithCount fills the relation's count target field — declared as
+// `PostsCount int64 \`rio:",countof:Posts"\“ — with one GROUP BY query per
+// relation, the aggregate sibling of With. HasMany and ManyToMany only.
+func (q Query[T]) WithCount(relation string) Query[T] {
+	q.s.counts = appendOne(q.s.counts, relation)
+	return q
+}
+
 // With preloads a relation after the main query, using one IN query per
 // relation (never JOINs — no row explosion, pagination stays correct).
 // Paths nest with dots: With("Posts.Comments"). Options customize the leaf.
@@ -162,15 +199,19 @@ func (q Query[T]) All(ctx context.Context, db Queryer) ([]T, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
+	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
 	if err != nil {
 		return nil, err
 	}
 	out, err := scanAll[T](rows, p, false)
+	finishQuery(finish, err)
 	if err != nil {
 		return nil, err
 	}
 	if err := preloadInto(ctx, db, p, out, q.s.withs); err != nil {
+		return nil, err
+	}
+	if err := countInto(ctx, db, p, out, q.s.counts); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -179,14 +220,35 @@ func (q Query[T]) All(ctx context.Context, db Queryer) ([]T, error) {
 // First returns the first matching row, or ErrNotFound. No implicit ORDER BY
 // is added: like SQL itself, order is undefined unless you ask for one.
 func (q Query[T]) First(ctx context.Context, db Queryer) (*T, error) {
-	rows, err := q.Limit(1).All(ctx, db)
+	p, err := planOf[T]()
 	if err != nil {
 		return nil, err
 	}
-	if len(rows) == 0 {
-		return nil, ErrNotFound
+	one := q.Limit(1)
+	sqlText, args, err := renderSelect(db.gram(), p, &one.s, selectRows)
+	if err != nil {
+		return nil, err
 	}
-	return &rows[0], nil
+	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
+	if err != nil {
+		return nil, err
+	}
+	out, err := scanOne[T](rows, p)
+	finishQuery(finish, err)
+	if err != nil {
+		return nil, err
+	}
+	if len(q.s.withs) > 0 || len(q.s.counts) > 0 {
+		single := []T{*out}
+		if err := preloadInto(ctx, db, p, single, q.s.withs); err != nil {
+			return nil, err
+		}
+		if err := countInto(ctx, db, p, single, q.s.counts); err != nil {
+			return nil, err
+		}
+		*out = single[0]
+	}
+	return out, nil
 }
 
 // Sole returns the single matching row; ErrNotFound when none match and
@@ -219,11 +281,12 @@ func (q Query[T]) Count(ctx context.Context, db Queryer) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	rows, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
+	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
 	if err != nil {
 		return 0, err
 	}
 	ns, err := scanScalars[int64](rows)
+	finishQuery(finish, err)
 	if err != nil {
 		return 0, err
 	}
@@ -243,11 +306,12 @@ func (q Query[T]) Exists(ctx context.Context, db Queryer) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	rows, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
+	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
 	if err != nil {
 		return false, err
 	}
 	ns, err := scanScalars[int64](rows)
+	finishQuery(finish, err)
 	if err != nil {
 		return false, err
 	}
@@ -310,11 +374,13 @@ func Find[T any](ctx context.Context, db Queryer, key ...any) (*T, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := runQuery(ctx, db, "select", p.structName, sqlText, normalizeArgs(d, key))
+	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, normalizeArgs(d, key))
 	if err != nil {
 		return nil, err
 	}
-	return scanOne[T](rows, p)
+	out, err := scanOne[T](rows, p)
+	finishQuery(finish, err)
+	return out, err
 }
 
 func pkColumns(p *plan) string {
@@ -371,7 +437,10 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 		b = append(b, j...)
 	}
 
-	b, args = renderWhere(b, args, d, table, p, s)
+	b, args, err := renderWhere(b, args, g, table, p, s)
+	if err != nil {
+		return "", nil, err
+	}
 
 	if len(s.groups) > 0 {
 		b = append(b, " GROUP BY "...)
@@ -439,8 +508,10 @@ func appendLimitOffset(b []byte, d Dialect, s *queryState) []byte {
 	return b
 }
 
-// renderWhere renders user conditions plus the soft-delete filter.
-func renderWhere(b []byte, args []any, d Dialect, table string, p *plan, s *queryState) ([]byte, []any) {
+// renderWhere renders user conditions, EXISTS relation filters, and the
+// soft-delete filter.
+func renderWhere(b []byte, args []any, g *grammar, table string, p *plan, s *queryState) ([]byte, []any, error) {
+	d := g.d
 	first := true
 	and := func() {
 		if first {
@@ -456,6 +527,24 @@ func renderWhere(b []byte, args []any, d Dialect, table string, p *plan, s *quer
 		b = append(b, w.expr...)
 		b = append(b, ')')
 		args = append(args, w.args...)
+	}
+	for _, hc := range s.hasConds {
+		if p == nil {
+			return nil, nil, fmt.Errorf("rio: WhereHas needs an entity query")
+		}
+		and()
+		if hc.not {
+			b = append(b, "NOT "...)
+		}
+		var rq relQuery
+		for _, opt := range hc.opts {
+			opt(&rq)
+		}
+		var err error
+		b, args, err = renderExists(b, args, g, p, table, hc.path, &rq, 1)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	if p != nil && p.softDel != nil {
 		switch s.trashed {
@@ -473,7 +562,89 @@ func renderWhere(b []byte, args []any, d Dialect, table string, p *plan, s *quer
 			b = append(b, " IS NOT NULL"...)
 		}
 	}
-	return b, args
+	return b, args, nil
+}
+
+// renderExists renders one EXISTS(...) level for a relation path. The
+// related table always gets a depth-numbered alias so self-referencing
+// relations never collide with the outer table, and rendering stays uniform.
+func renderExists(b []byte, args []any, g *grammar, owner *plan, ownerRef string, path string, leaf *relQuery, depth int) ([]byte, []any, error) {
+	d := g.d
+	head, tail := splitPath(path)
+	rel, ok := owner.rels[head]
+	if !ok {
+		return nil, nil, fmt.Errorf("rio: %s has no relation %q", owner.structName, head)
+	}
+	res, err := rel.resolve(owner)
+	if err != nil {
+		return nil, nil, err
+	}
+	target := res.target
+	alias := "rio_h" + strconv.Itoa(depth)
+
+	b = append(b, "EXISTS (SELECT 1 FROM "...)
+	joinAlias := ""
+	if rel.kind == relManyToMany {
+		joinAlias = "rio_j" + strconv.Itoa(depth)
+		b = d.quote(b, res.joinTable)
+		b = append(b, " AS "...)
+		b = d.quote(b, joinAlias)
+		b = append(b, " INNER JOIN "...)
+		b = d.quote(b, g.table(target))
+		b = append(b, " AS "...)
+		b = d.quote(b, alias)
+		b = append(b, " ON "...)
+		b = d.quote(b, joinAlias)
+		b = append(b, '.')
+		b = d.quote(b, res.joinRef)
+		b = append(b, " = "...)
+		b = d.quote(b, alias)
+		b = append(b, '.')
+		b = d.quote(b, res.fk.column)
+		b = append(b, " WHERE "...)
+		b = d.quote(b, joinAlias)
+		b = append(b, '.')
+		b = d.quote(b, res.joinFK)
+		b = append(b, " = "...)
+		b = d.quote(b, ownerRef)
+		b = append(b, '.')
+		b = d.quote(b, res.ref.column)
+	} else {
+		b = d.quote(b, g.table(target))
+		b = append(b, " AS "...)
+		b = d.quote(b, alias)
+		b = append(b, " WHERE "...)
+		// HasMany/HasOne: child.fk = owner.ref; BelongsTo: target.pk = owner.fk.
+		b = d.quote(b, alias)
+		b = append(b, '.')
+		b = d.quote(b, res.fk.column)
+		b = append(b, " = "...)
+		b = d.quote(b, ownerRef)
+		b = append(b, '.')
+		b = d.quote(b, res.ref.column)
+	}
+	if target.softDel != nil && !(tail == "" && leaf.withTrashed) {
+		b = append(b, " AND "...)
+		b = d.quote(b, alias)
+		b = append(b, '.')
+		b = d.quote(b, target.softDel.column)
+		b = append(b, " IS NULL"...)
+	}
+	if tail != "" {
+		b = append(b, " AND "...)
+		b, args, err = renderExists(b, args, g, target, alias, tail, leaf, depth+1)
+		if err != nil {
+			return nil, nil, err
+		}
+	} else {
+		for _, w := range leaf.wheres {
+			b = append(b, " AND ("...)
+			b = append(b, w.expr...)
+			b = append(b, ')')
+			args = append(args, w.args...)
+		}
+	}
+	return append(b, ')'), args, nil
 }
 
 // finishSQL runs the rebind pipeline: IN expansion first, placeholder
@@ -529,4 +700,116 @@ func normalizeArgs(d Dialect, args []any) []any {
 		out[i] = v
 	}
 	return out
+}
+
+// Rows streams the result without materializing it, for result sets too
+// large to hold: for u, err := range q.Rows(ctx, db). Iteration stops on the
+// first error (yielded with a zero T) and closing happens automatically,
+// including on early break. Preloading needs the full set and cannot stream
+// — With/WithCount on a streamed query yields an error immediately.
+func (q Query[T]) Rows(ctx context.Context, db Queryer) iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		var zero T
+		if len(q.s.withs) > 0 || len(q.s.counts) > 0 {
+			yield(zero, errors.New("rio: Rows cannot stream With/WithCount (preloading needs the full result); use All"))
+			return
+		}
+		p, err := planOf[T]()
+		if err != nil {
+			yield(zero, err)
+			return
+		}
+		sqlText, args, err := renderSelect(db.gram(), p, &q.s, selectRows)
+		if err != nil {
+			yield(zero, err)
+			return
+		}
+		rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
+		if err != nil {
+			yield(zero, err)
+			return
+		}
+		defer rows.Close()
+
+		fields, err := entityFields(rows, p, 0)
+		if err != nil {
+			finishQuery(finish, err)
+			yield(zero, err)
+			return
+		}
+		rs := newRowScanner(fields, nil)
+		for rows.Next() {
+			var row T
+			if err := rs.scan(rows, unsafe.Pointer(&row)); err != nil {
+				finishQuery(finish, err)
+				yield(zero, err)
+				return
+			}
+			if !yield(row, nil) {
+				finishQuery(finish, nil)
+				return
+			}
+		}
+		err = rows.Err()
+		finishQuery(finish, err)
+		if err != nil {
+			yield(zero, err)
+		}
+	}
+}
+
+// Pluck extracts a single column under the query's conditions:
+// emails, err := rio.Pluck[string](ctx, db, q, "email"). The column must be
+// one of T's mapped columns — expressions go through Raw.
+func Pluck[V any, T any](ctx context.Context, db Queryer, q Query[T], column string) ([]V, error) {
+	p, err := planOf[T]()
+	if err != nil {
+		return nil, err
+	}
+	f, ok := p.byColumn[column]
+	if !ok {
+		return nil, fmt.Errorf("rio: Pluck: %s has no column %q (expressions go through Raw)", p.structName, column)
+	}
+	g := db.gram()
+	d := g.d
+	table := g.table(p)
+
+	b := make([]byte, 0, 128)
+	b = append(b, "SELECT "...)
+	b = d.quote(b, table)
+	b = append(b, '.')
+	b = d.quote(b, f.column)
+	b = append(b, " FROM "...)
+	b = d.quote(b, table)
+	for _, j := range q.s.joins {
+		b = append(b, ' ')
+		b = append(b, j...)
+	}
+	var args []any
+	b, args, err = renderWhere(b, args, g, table, p, &q.s)
+	if err != nil {
+		return nil, err
+	}
+	if len(q.s.orders) > 0 {
+		b = append(b, " ORDER BY "...)
+		for i, o := range q.s.orders {
+			if i > 0 {
+				b = append(b, ", "...)
+			}
+			b = append(b, o...)
+		}
+	}
+	b = appendLimitOffset(b, d, &q.s)
+
+	sqlText, outArgs, err := finishSQL(d, b, args)
+	if err != nil {
+		return nil, err
+	}
+	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, outArgs)
+	if err != nil {
+		return nil, err
+	}
+	out, err := scanScalars[V](rows)
+	finishQuery(finish, err)
+	return out, err
 }

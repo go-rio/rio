@@ -93,41 +93,57 @@ func batchColumns[T any](p *plan, rows []T) (cols []*field, backfill bool, err e
 func insertChunk[T any](ctx context.Context, db Queryer, p *plan, cols []*field, rows []T, backfill bool, now time.Time) error {
 	g := db.gram()
 	d := g.d
-	b := renderInsertHead(g, p, cols)
-	b = append(b, " VALUES "...)
-	args := make([]any, 0, len(rows)*len(cols))
-	for r := range rows {
-		if r > 0 {
-			b = append(b, ", "...)
-		}
-		b = append(b, '(')
-		rv := reflect.ValueOf(&rows[r]).Elem()
-		for i, f := range cols {
-			if i > 0 {
+	bits, cacheable := setBits(p, cols)
+	returning := backfill && d.caps().returning
+	op := "insertall"
+	if returning {
+		op = "insertall+ret"
+	}
+	sqlText, err := crudSQLRows(g, p, op, bits, len(rows), cacheable, func() []byte {
+		b := renderInsertHead(g, p, cols)
+		b = append(b, " VALUES "...)
+		for r := range rows {
+			if r > 0 {
 				b = append(b, ", "...)
 			}
-			b = append(b, '?')
-			a, err := bindArg(f, rv.FieldByIndex(f.index), d, now)
+			b = append(b, '(')
+			for i := range cols {
+				if i > 0 {
+					b = append(b, ", "...)
+				}
+				b = append(b, '?')
+			}
+			b = append(b, ')')
+		}
+		if returning {
+			b = append(b, " RETURNING "...)
+			b = d.quote(b, p.autoIncr.column)
+		}
+		return b
+	})
+	if err != nil {
+		return err
+	}
+	args := make([]any, 0, len(rows)*len(cols))
+	for r := range rows {
+		rv := reflect.ValueOf(&rows[r]).Elem()
+		base := rv.Addr().UnsafePointer()
+		for _, f := range cols {
+			a, err := fieldValue(f, base, rv, d, now)
 			if err != nil {
 				return err
 			}
 			args = append(args, a)
 		}
-		b = append(b, ')')
 	}
 
-	if backfill && d.caps().returning {
-		b = append(b, " RETURNING "...)
-		b = d.quote(b, p.autoIncr.column)
-		sqlText, outArgs, err := finishSQL(d, b, args)
-		if err != nil {
-			return err
-		}
-		sqlRows, err := runQuery(ctx, db, "insert", p.structName, sqlText, outArgs)
+	if returning {
+		sqlRows, finish, err := runQuery(ctx, db, "insert", p.structName, sqlText, args)
 		if err != nil {
 			return err
 		}
 		ids, err := scanScalars[int64](sqlRows)
+		finishQuery(finish, err)
 		if err != nil {
 			return err
 		}
@@ -151,11 +167,7 @@ func insertChunk[T any](ctx context.Context, db Queryer, p *plan, cols []*field,
 		return nil
 	}
 
-	sqlText, outArgs, err := finishSQL(d, b, args)
-	if err != nil {
-		return err
-	}
-	_, err = run(ctx, db, "insert", p.structName, sqlText, outArgs)
+	_, err = run(ctx, db, "insert", p.structName, sqlText, args)
 	return err
 }
 
@@ -217,12 +229,13 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 			}
 			b = append(b, '(')
 			rv := reflect.ValueOf(&part[r]).Elem()
+			base := rv.Addr().UnsafePointer()
 			for i, f := range cols {
 				if i > 0 {
 					b = append(b, ", "...)
 				}
 				b = append(b, '?')
-				a, err := bindArg(f, rv.FieldByIndex(f.index), d, now)
+				a, err := fieldValue(f, base, rv, d, now)
 				if err != nil {
 					return err
 				}
