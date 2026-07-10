@@ -78,6 +78,16 @@ func WithoutArgs() Option {
 // (cap configurable) because IN (?) expansion makes every slice length a
 // distinct statement. On schema-change errors the entry is evicted and the
 // error propagates; rio never retries on its own.
+//
+// Whether it pays depends on the driver. go-sql-driver/mysql runs every
+// parameterized query as prepare+execute — two blocking round-trips — so the
+// cache halves single-statement latency there (measured −35% to −46% against
+// a local MySQL 8.4; the DSN option interpolateParams=true is the
+// alternative, see the go-rio/mysql README). pgx's database/sql adapter
+// already caches statements per connection, and stacking database/sql's
+// Stmt layer on top measured slower, not faster — leave it off for pgx.
+// modernc SQLite is in-process; the cache saves parsing, worth measuring
+// per workload.
 func WithStmtCache(capacity ...int) Option {
 	return func(c *config) {
 		c.stmtCache = true

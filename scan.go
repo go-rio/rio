@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 )
@@ -25,6 +26,11 @@ type fieldCodec struct {
 	// *T cell itself instead of rebuilding scaffolding per row.
 	elemKind scanKind
 	elemBits int
+
+	// elemSlice/elemSize serve scanPtr's chunked cell allocator: []T for
+	// reflect.MakeSlice and T's byte size for slot arithmetic.
+	elemSlice reflect.Type
+	elemSize  int
 }
 
 type scanKind uint8
@@ -76,6 +82,7 @@ func codecFor(f *field) (fieldCodec, error) {
 		return fieldCodec{
 			kind: scanPtr, bindValuer: t.Implements(valuerType),
 			elemKind: ec.kind, elemBits: ec.bits,
+			elemSlice: reflect.SliceOf(elem), elemSize: int(elem.Size()),
 		}, nil
 	}
 	c, err := basicCodec(t, f)
@@ -125,6 +132,38 @@ func basicCodec(t reflect.Type, f *field) (fieldCodec, error) {
 type colScanner struct {
 	f    *field
 	base unsafe.Pointer // start of the row's struct, set per row
+
+	// scanPtr cell chunk: non-NULL *T cells come out of a shared per-column
+	// backing array (1, 4, 16, 64, then 128-cell chunks) instead of one
+	// reflect.New per cell — a single row still pays exactly one minimal
+	// allocation, a hundred rows pay five per column. Each cell remains an
+	// independent slot (rescans hand out a fresh one, writes never alias);
+	// the one observable consequence is lifetime: a surviving *T keeps its
+	// chunk — at most 128 cells, never the whole column — alive. chunk is an
+	// unsafe.Pointer field, so the GC sees the backing array while cells are
+	// being handed out; afterwards the published pointers themselves keep it
+	// alive.
+	chunk unsafe.Pointer
+	used  int // cells handed out of the current chunk
+	csize int // current chunk capacity, in cells
+}
+
+// nextCell returns a zeroed slot for one non-NULL scanPtr cell, growing the
+// chunk when exhausted.
+func (s *colScanner) nextCell() unsafe.Pointer {
+	if s.used == s.csize {
+		n := s.csize * 4
+		if n == 0 {
+			n = 1
+		} else if n > 128 {
+			n = 128
+		}
+		s.chunk = reflect.MakeSlice(s.f.code.elemSlice, n, n).UnsafePointer()
+		s.used, s.csize = 0, n
+	}
+	p := unsafe.Add(s.chunk, s.used*s.f.code.elemSize)
+	s.used++
+	return p
 }
 
 func (s *colScanner) Scan(src any) error {
@@ -269,13 +308,13 @@ scan:
 	case scanScanner:
 		return s.slowScanner(src)
 	case scanPtr:
-		// The element was classified at plan time (codecFor): allocate the
-		// cell — the one allocation *T semantics requires — and re-dispatch
-		// on the elem codec, instead of rebuilding field/colScanner
-		// scaffolding and re-deriving the codec on every row. basicCodec
-		// never yields scanPtr, so this jump cannot recurse.
-		cell := reflect.New(f.typ.Elem())
-		publish, p = p, cell.UnsafePointer()
+		// The element was classified at plan time (codecFor): take a fresh
+		// cell from the column's chunk — the allocation *T semantics
+		// requires, amortized — and re-dispatch on the elem codec, instead
+		// of rebuilding field/colScanner scaffolding and re-deriving the
+		// codec on every row. basicCodec never yields scanPtr, so this jump
+		// cannot recurse.
+		publish, p = p, s.nextCell()
 		kind, bits = f.code.elemKind, f.code.elemBits
 		goto scan
 	default:
@@ -443,31 +482,41 @@ func parseTime(s string, f *field) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("rio: column %q: cannot parse %q as time.Time", f.column, s)
 }
 
-// rowScanner scans consecutive rows into values of one plan. dests and cells
-// are allocated once and rebased per row.
+// rowScanner scans consecutive rows into values of one plan. cells and dests
+// are pooled across queries — zero steady-state allocations per query.
 type rowScanner struct {
-	fields []*field
-	cells  []colScanner
-	dests  []any
+	cells []colScanner
+	dests []any
 }
 
-// newRowScanner returns by value: the struct stays on the caller's stack
-// (only cells and dests live on the heap — two allocations per query, and
-// the cell pointers inside dests keep working across the copy because slice
-// headers share their backing arrays).
-func newRowScanner(fields []*field, extras []any) rowScanner {
-	rs := rowScanner{
-		fields: fields,
-		cells:  make([]colScanner, len(fields)),
-		dests:  make([]any, 0, len(fields)+len(extras)),
+var rsPool = sync.Pool{New: func() any { return new(rowScanner) }}
+
+// newRowScanner acquires a scanner from the pool, sized and fully reset for
+// this query's field list — a pooled cell must never leak chunk state, or a
+// query could hand out cells another query's structs already point at.
+// Callers release() once the last Scan returned; the driver never touches
+// dests after rows.Scan returns, so releasing before rows.Close is fine.
+func newRowScanner(fields []*field, extras []any) *rowScanner {
+	rs := rsPool.Get().(*rowScanner)
+	n := len(fields)
+	if cap(rs.cells) < n || cap(rs.dests) < n+len(extras) {
+		rs.cells = make([]colScanner, n)
+		rs.dests = make([]any, 0, n+len(extras))
 	}
+	rs.cells = rs.cells[:n]
+	rs.dests = rs.dests[:0]
 	for i, f := range fields {
-		rs.cells[i].f = f
+		rs.cells[i] = colScanner{f: f}
 		rs.dests = append(rs.dests, &rs.cells[i])
 	}
 	rs.dests = append(rs.dests, extras...)
 	return rs
 }
+
+// release returns the scanner to the pool. The last chunk pointer rides
+// along until reuse resets it or the pool drops the object under GC pressure
+// — bounded at one chunk per column of the released query.
+func (rs *rowScanner) release() { rsPool.Put(rs) }
 
 func (rs *rowScanner) scan(rows *sql.Rows, base unsafe.Pointer) error {
 	for i := range rs.cells {
@@ -548,6 +597,7 @@ func scanAll[T any](rows *sql.Rows, p *plan, byName bool) ([]T, error) {
 		return nil, err
 	}
 	rs := newRowScanner(fields, nil)
+	defer rs.release()
 	out := []T{}
 	for rows.Next() {
 		out = append(out, *new(T))
@@ -774,6 +824,7 @@ func scanOne[T any](rows *sql.Rows, p *plan) (*T, error) {
 	}
 	out := new(T)
 	rs := newRowScanner(fields, nil)
+	defer rs.release()
 	if err := rs.scan(rows, unsafe.Pointer(out)); err != nil {
 		return nil, err
 	}

@@ -441,6 +441,7 @@ func (c *Compiled[T]) Rows(ctx context.Context, db Queryer, args ...any) iter.Se
 			return
 		}
 		rs := newRowScanner(fields, nil)
+		defer rs.release()
 		for rows.Next() {
 			var row T
 			if err := rs.scan(rows, unsafe.Pointer(&row)); err != nil {

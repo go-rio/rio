@@ -426,6 +426,25 @@ func rowValue[T any](op string, row *T) (reflect.Value, error) {
 // bits is the participating-column bitmap used as the SQL-cache key;
 // cacheable is false past 64 columns (render directly, no cache).
 func insertColumns(p *plan, rv reflect.Value, b *binder) (cols, back []*field, args []any, bits uint64, cacheable bool, err error) {
+	cacheable = len(p.fields) <= 64
+	base := rv.Addr().UnsafePointer()
+	if !p.hasOmitZero {
+		// The partition is one of two plan-time shapes (see plan.insCols):
+		// binding is the only per-row work left.
+		cols, bits = p.fields, p.allBits
+		if p.autoIncr != nil && fieldIsZero(p.autoIncr, base, rv) {
+			cols, back, bits = p.insCols, p.insBack, p.insBits
+		}
+		args = make([]any, 0, len(cols))
+		for _, f := range cols {
+			a, err := fieldValue(f, base, rv, b)
+			if err != nil {
+				return nil, nil, nil, 0, false, err
+			}
+			args = append(args, a)
+		}
+		return cols, back, args, bits, cacheable, nil
+	}
 	// cols and back partition p.fields, so one buffer serves both: cols
 	// grows from the front while back fills the tail in reverse, restored to
 	// plan order below.
@@ -433,8 +452,6 @@ func insertColumns(p *plan, rv reflect.Value, b *binder) (cols, back []*field, a
 	cols = buf[:0]
 	nb := len(buf)
 	args = make([]any, 0, len(p.fields))
-	cacheable = len(p.fields) <= 64
-	base := rv.Addr().UnsafePointer()
 	for i, f := range p.fields {
 		if (f.isAutoIncr || f.omitZero) && fieldIsZero(f, base, rv) {
 			nb--
@@ -559,6 +576,7 @@ func scanBackColsIfRow(rows *sql.Rows, back []*field, base unsafe.Pointer) (scan
 		return false, rows.Err()
 	}
 	rs := newRowScanner(back, nil)
+	defer rs.release()
 	if err := rs.scan(rows, base); err != nil {
 		return true, fmt.Errorf("rio: scanning RETURNING row: %w", err)
 	}
@@ -580,6 +598,7 @@ func scanBackRow(rows *sql.Rows, p *plan, base unsafe.Pointer) error {
 		return errors.New("rio: RETURNING produced no row")
 	}
 	rs := newRowScanner(fields, nil)
+	defer rs.release()
 	if err := rs.scan(rows, base); err != nil {
 		return err
 	}

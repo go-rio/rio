@@ -267,7 +267,7 @@ func TestAllocDiagnostics(t *testing.T) {
 }
 
 // TestCRUDAllocBudget pins DESIGN.md's allocation contract: entity CRUD pays
-// at most 4 extra allocations per call over a hand-written database/sql
+// at most 2 extra allocations per call over a hand-written database/sql
 // equivalent on the same driver, and Upsert at most its conflict-shape
 // machinery on top. Budgets are the values measured when this test was
 // written — a regression fails loudly; an improvement is the cue to tighten
@@ -275,14 +275,14 @@ func TestAllocDiagnostics(t *testing.T) {
 // across Go releases and cancel out of the difference.
 func TestCRUDAllocBudget(t *testing.T) {
 	budgets := map[string]float64{
-		"find/pg":           3,
-		"insert/sqlite":     3, // RETURNING path
-		"insert/mysql":      2, // exec + LastInsertId path
+		"find/pg":           1,
+		"insert/sqlite":     0, // RETURNING path
+		"insert/mysql":      1, // exec + LastInsertId path
 		"update/pg":         2,
 		"delete/pg":         1,
-		"upsert/pg":         8, // conflict shape: spec, option appends, update set, cache key
-		"upsert/pg-hoisted": 8,
-		"upsert/mysql":      6,
+		"upsert/pg":         5, // conflict shape: spec, option appends, update set, cache key
+		"upsert/pg-hoisted": 5,
+		"upsert/mysql":      5,
 	}
 	ctx := context.Background()
 	pairs := allocMeasurements(ctx)

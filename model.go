@@ -33,6 +33,16 @@ type plan struct {
 	created   *field
 	updated   *field
 
+	// Precomputed insert partitions. Without omitzero columns the per-row
+	// partition depends only on whether the auto-increment PK participates,
+	// so both shapes are fixed at plan time: every column (allBits), or
+	// every column but the skipped PK (insCols/insBack/insBits).
+	insCols     []*field
+	insBack     []*field
+	allBits     uint64
+	insBits     uint64
+	hasOmitZero bool
+
 	rels     map[string]*relField
 	relNames []string
 	counts   map[string][]int // relation name → field index of its count target
@@ -404,6 +414,24 @@ func (p *plan) classify() []error {
 			continue
 		}
 		p.updatable = append(p.updatable, f)
+	}
+	for _, f := range p.fields {
+		if f.omitZero {
+			p.hasOmitZero = true
+		}
+		if f.ordinal < 64 {
+			p.allBits |= 1 << uint(f.ordinal)
+		}
+		if f != p.autoIncr {
+			p.insCols = append(p.insCols, f)
+		}
+	}
+	p.insBits = p.allBits
+	if p.autoIncr != nil {
+		p.insBack = []*field{p.autoIncr}
+		if p.autoIncr.ordinal < 64 {
+			p.insBits &^= 1 << uint(p.autoIncr.ordinal)
+		}
 	}
 	return errs
 }

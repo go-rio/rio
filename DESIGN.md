@@ -275,7 +275,12 @@ it is missing plan caches and sloppy string assembly.
 - Per-type plans cached forever; per-grammar SQL caches (see pipeline).
 - Rendering appends to `[]byte` (no fmt in hot paths).
 - Scanning appends a zero value and scans into `&s[len(s)-1]` in place;
-  dest slices and null-scanners are allocated once per query, reused per row.
+  dest slices are pooled across queries (zero steady-state allocations) and
+  reused per row. Non-NULL pointer cells (`*T` fields) come out of chunked
+  per-column backing arrays (1→4→16→64, then 128-cell chunks) instead of one
+  `reflect.New` per cell: a hundred nullable rows cost five allocations per
+  column, not a hundred; a surviving `*T` keeps at most its chunk alive,
+  never the whole column.
 - **Unsafe fast path**: plans record field offsets; fixed-layout kinds
   (ints/uints/floats/bool/string/[]byte/time.Time) are written via
   `unsafe.Add` directly, skipping reflect.Value.Set (Bun/sonic-class
@@ -285,11 +290,11 @@ it is missing plan caches and sloppy string assembly.
   paths alike — runs under -race, which enables checkptr.
   Entity SELECTs render columns in plan order and verify the result set
   matches once per query; Raw always matches by column name.
-- Entity CRUD ≤4 extra allocs per call over hand-written database/sql on the
-  same driver — measured Find +3, Insert +3 (RETURNING) / +2 (exec),
+- Entity CRUD ≤2 extra allocs per call over hand-written database/sql on the
+  same driver — measured Find +1, Insert +0 (RETURNING) / +1 (exec),
   Update +2, Delete +1 — asserted with testing.AllocsPerRun
   (TestCRUDAllocBudget). Upsert adds its conflict-shape machinery on top:
-  +8 (PostgreSQL) / +6 (MySQL), asserted at those budgets.
+  +5 (PostgreSQL) / +5 (MySQL), asserted at those budgets.
 - Benchmarks in-repo against hand-written database/sql (fake driver in
   perf_test.go isolates rio's own overhead; bench/ adds real SQLite and a
   GORM comparison, the source of the README numbers). Honest methodology or

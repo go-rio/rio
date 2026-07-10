@@ -865,6 +865,7 @@ func (q Query[T]) Rows(ctx context.Context, db Queryer) iter.Seq2[T, error] {
 			return
 		}
 		rs := newRowScanner(fields, nil)
+		defer rs.release()
 		for rows.Next() {
 			var row T
 			if err := rs.scan(rows, unsafe.Pointer(&row)); err != nil {

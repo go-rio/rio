@@ -3,6 +3,7 @@ package rio
 import (
 	"context"
 	"database/sql/driver"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -126,6 +127,46 @@ func TestScanPtrRescanReplacesPointer(t *testing.T) {
 	}
 	if *second.I != 2 {
 		t.Errorf("second scan = %d, want 2", *second.I)
+	}
+}
+
+// TestScanPtrCellsIndependent pins the chunked cell allocator's aliasing
+// contract: cells handed out across rows are distinct slots — writing through
+// one row's pointers never changes another row's values — and values stay
+// intact once the scan (and its chunk bookkeeping) is gone.
+func TestScanPtrCellsIndependent(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+	const n = 100 // spans several chunk sizes (1, 4, 16, 64, 128)
+	rows := make([][]driver.Value, n)
+	for i := range rows {
+		rows[i] = []driver.Value{
+			int64(i + 1), int64(1), int64(1000 + i), int64(9), 0.5, true, "s", []byte{byte(i)}, testNow,
+		}
+	}
+	f.queueRows(ptrKindsCols, rows...)
+	got, err := From[ptrKinds]().All(context.Background(), db)
+	if err != nil || len(got) != n {
+		t.Fatalf("All: %v, %d rows", err, len(got))
+	}
+	seen := make(map[*int64]bool, n)
+	for i := range got {
+		if seen[got[i].I] {
+			t.Fatalf("row %d shares a cell with an earlier row", i)
+		}
+		seen[got[i].I] = true
+	}
+	for i := range got {
+		*got[i].I = -int64(i) // write through every pointer...
+	}
+	runtime.GC() // ...and make sure chunks survive on the strength of the cells alone
+	for i := range got {
+		if *got[i].I != -int64(i) {
+			t.Fatalf("row %d cell = %d after neighbor writes, want %d", i, *got[i].I, -i)
+		}
+		if *got[i].I8 != 1 || *got[i].U != 9 || *got[i].F != 0.5 || *got[i].S != "s" {
+			t.Fatalf("row %d neighbors mutated: %+v", i, got[i])
+		}
 	}
 }
 

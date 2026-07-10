@@ -530,6 +530,7 @@ func scanRel(rows *sql.Rows, p *plan, buf reflect.Value, keyed bool, res *resolv
 	}
 
 	rs := newRowScanner(fields, extras)
+	defer rs.release()
 	keyBuf := reflect.New(res.ref.typ) // cell the key scans into
 	elemType := p.typ
 	for rows.Next() {
