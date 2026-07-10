@@ -19,6 +19,12 @@ type fieldCodec struct {
 	bits          int  // integer/float width for overflow checks
 	bindValuer    bool // bind the field value itself so Value() runs
 	bindPtrValuer bool // bind the field address so pointer-receiver Value() runs
+
+	// elemKind/elemBits are scanPtr's element strategy, classified at plan
+	// time like everything else: the per-cell path then allocates only the
+	// *T cell itself instead of rebuilding scaffolding per row.
+	elemKind scanKind
+	elemBits int
 }
 
 type scanKind uint8
@@ -33,7 +39,7 @@ const (
 	scanTime
 	scanJSON    // slow path: reflect + encoding/json
 	scanScanner // slow path: delegate to sql.Scanner, including NULL
-	scanPtr     // slow path: *T with allocation
+	scanPtr     // *T: one reflect.New per non-NULL cell, element written via the plan-time elem codec
 )
 
 var (
@@ -63,10 +69,14 @@ func codecFor(f *field) (fieldCodec, error) {
 	}
 	if t.Kind() == reflect.Pointer {
 		elem := t.Elem()
-		if _, err := basicCodec(elem, f); err != nil {
+		ec, err := basicCodec(elem, f)
+		if err != nil {
 			return fieldCodec{}, fmt.Errorf("field %s: unsupported pointer type %s", f.name, t)
 		}
-		return fieldCodec{kind: scanPtr, bindValuer: t.Implements(valuerType)}, nil
+		return fieldCodec{
+			kind: scanPtr, bindValuer: t.Implements(valuerType),
+			elemKind: ec.kind, elemBits: ec.bits,
+		}, nil
 	}
 	c, err := basicCodec(t, f)
 	if err != nil {
@@ -150,16 +160,26 @@ func (s *colScanner) Scan(src any) error {
 			f.column, f.name, f.typ)
 	}
 
-	switch f.code.kind {
+	// publish is the scanPtr hand-off: the case below allocates the element
+	// cell, retargets p at it, swaps in the plan-time elem codec, and jumps
+	// back — one switch body serves fields and pointer elements without a
+	// per-cell function call on the plain path. The field slot is written
+	// only after the element scanned cleanly, so a conversion error leaves
+	// the struct untouched, exactly like every other kind.
+	kind, bits := f.code.kind, f.code.bits
+	var publish unsafe.Pointer
+
+scan:
+	switch kind {
 	case scanInt:
 		n, err := srcInt(src, f)
 		if err != nil {
 			return err
 		}
-		if f.code.bits < 64 && (n > int64(1)<<(f.code.bits-1)-1 || n < -int64(1)<<(f.code.bits-1)) {
+		if bits < 64 && (n > int64(1)<<(bits-1)-1 || n < -int64(1)<<(bits-1)) {
 			return fmt.Errorf("rio: column %q value %d overflows %s", f.column, n, f.typ)
 		}
-		switch f.code.bits {
+		switch bits {
 		case 8:
 			*(*int8)(p) = int8(n)
 		case 16:
@@ -169,16 +189,15 @@ func (s *colScanner) Scan(src any) error {
 		default:
 			*(*int64)(p) = n // int is 64-bit on every supported platform
 		}
-		return nil
 	case scanUint:
 		n, err := srcUint(src, f)
 		if err != nil {
 			return err
 		}
-		if f.code.bits < 64 && n > uint64(1)<<f.code.bits-1 {
+		if bits < 64 && n > uint64(1)<<bits-1 {
 			return fmt.Errorf("rio: column %q value %d overflows %s", f.column, n, f.typ)
 		}
-		switch f.code.bits {
+		switch bits {
 		case 8:
 			*(*uint8)(p) = uint8(n)
 		case 16:
@@ -188,13 +207,12 @@ func (s *colScanner) Scan(src any) error {
 		default:
 			*(*uint64)(p) = n
 		}
-		return nil
 	case scanFloat:
 		fl, err := srcFloat(src, f)
 		if err != nil {
 			return err
 		}
-		if f.code.bits == 32 {
+		if bits == 32 {
 			if !math.IsInf(fl, 0) && (fl > math.MaxFloat32 || fl < -math.MaxFloat32) {
 				return fmt.Errorf("rio: column %q value overflows float32", f.column)
 			}
@@ -202,14 +220,12 @@ func (s *colScanner) Scan(src any) error {
 		} else {
 			*(*float64)(p) = fl
 		}
-		return nil
 	case scanBool:
 		b, err := srcBool(src, f)
 		if err != nil {
 			return err
 		}
 		*(*bool)(p) = b
-		return nil
 	case scanString:
 		switch v := src.(type) {
 		case string:
@@ -219,7 +235,6 @@ func (s *colScanner) Scan(src any) error {
 		default:
 			return convErr(f, src)
 		}
-		return nil
 	case scanBytes:
 		switch v := src.(type) {
 		case []byte:
@@ -231,14 +246,12 @@ func (s *colScanner) Scan(src any) error {
 		default:
 			return convErr(f, src)
 		}
-		return nil
 	case scanTime:
 		t, err := srcTime(src, f)
 		if err != nil {
 			return err
 		}
 		*(*time.Time)(p) = t
-		return nil
 	case scanJSON:
 		var data []byte
 		switch v := src.(type) {
@@ -253,31 +266,25 @@ func (s *colScanner) Scan(src any) error {
 		if err := json.Unmarshal(data, dst.Interface()); err != nil {
 			return fmt.Errorf("rio: column %q: decoding JSON into %s: %w", f.column, f.typ, err)
 		}
-		return nil
 	case scanScanner:
 		return s.slowScanner(src)
 	case scanPtr:
-		elem := f.typ.Elem()
-		cell := reflect.New(elem)
-		tmp := &colScanner{f: &field{
-			name: f.name, column: f.column, typ: elem,
-			code: mustBasicCodec(elem),
-		}, base: unsafe.Pointer(cell.Pointer())}
-		if err := tmp.Scan(src); err != nil {
-			return err
-		}
-		reflect.NewAt(f.typ, p).Elem().Set(cell)
-		return nil
+		// The element was classified at plan time (codecFor): allocate the
+		// cell — the one allocation *T semantics requires — and re-dispatch
+		// on the elem codec, instead of rebuilding field/colScanner
+		// scaffolding and re-deriving the codec on every row. basicCodec
+		// never yields scanPtr, so this jump cannot recurse.
+		cell := reflect.New(f.typ.Elem())
+		publish, p = p, cell.UnsafePointer()
+		kind, bits = f.code.elemKind, f.code.elemBits
+		goto scan
+	default:
+		return convErr(f, src)
 	}
-	return convErr(s.f, src)
-}
-
-func mustBasicCodec(t reflect.Type) fieldCodec {
-	c, err := basicCodec(t, &field{typ: t})
-	if err != nil {
-		panic(err) // unreachable: codecFor validated the element at plan time
+	if publish != nil {
+		*(*unsafe.Pointer)(publish) = p
 	}
-	return c
+	return nil
 }
 
 func (s *colScanner) slowScanner(src any) error {
@@ -444,8 +451,12 @@ type rowScanner struct {
 	dests  []any
 }
 
-func newRowScanner(fields []*field, extras []any) *rowScanner {
-	rs := &rowScanner{
+// newRowScanner returns by value: the struct stays on the caller's stack
+// (only cells and dests live on the heap — two allocations per query, and
+// the cell pointers inside dests keep working across the copy because slice
+// headers share their backing arrays).
+func newRowScanner(fields []*field, extras []any) rowScanner {
+	rs := rowScanner{
 		fields: fields,
 		cells:  make([]colScanner, len(fields)),
 		dests:  make([]any, 0, len(fields)+len(extras)),
@@ -592,11 +603,34 @@ func isScalarType(t reflect.Type) bool {
 	return k != reflect.Struct
 }
 
+// binder is one write call's binding context: the dialect plus the call's
+// clock instant with its rendered bind value memoized. Stamped columns all
+// carry the same now, so SQLite's text encoding and the interface boxing
+// happen once per call instead of once per stamped column — batch paths
+// would otherwise re-render the identical instant on every row. Callers
+// build it on the stack; zero now (no stamps in play) still memoizes
+// correctly because the memo is keyed by value equality.
+type binder struct {
+	d       Dialect
+	now     time.Time // normalized clock instant, zero when the call stamps nothing
+	nowBind any       // lazily rendered d.bindTime(now)
+}
+
+func (b *binder) time(nt time.Time) any {
+	if nt == b.now {
+		if b.nowBind == nil {
+			b.nowBind = b.d.bindTime(nt)
+		}
+		return b.nowBind
+	}
+	return b.d.bindTime(nt)
+}
+
 // bindArgFast extracts a bind value through the field's offset, skipping the
 // reflect.Value round-trip for fixed-layout kinds. ok=false falls back to
 // bindArg. The same discipline as the scan fast path applies: offsets only
 // cross value-embedded structs, never pointers.
-func bindArgFast(f *field, base unsafe.Pointer, d Dialect) (any, bool, error) {
+func bindArgFast(f *field, base unsafe.Pointer, b *binder) (any, bool, error) {
 	p := unsafe.Add(base, f.offset)
 	switch f.code.kind {
 	case scanInt:
@@ -623,7 +657,7 @@ func bindArgFast(f *field, base unsafe.Pointer, d Dialect) (any, bool, error) {
 			n = *(*uint64)(p)
 		}
 		if n > math.MaxInt64 {
-			v, err := bindOverflowUint(d, n)
+			v, err := bindOverflowUint(b.d, n)
 			return v, true, err
 		}
 		return int64(n), true, nil
@@ -655,7 +689,7 @@ func bindArgFast(f *field, base unsafe.Pointer, d Dialect) (any, bool, error) {
 			// caller-provided nanosecond or zoned times.
 			*(*time.Time)(p) = nt
 		}
-		return d.bindTime(nt), true, nil
+		return b.time(nt), true, nil
 	}
 	return nil, false, nil
 }
@@ -707,13 +741,13 @@ func zeroFast(f *field, base unsafe.Pointer) (isZero, ok bool) {
 // fieldValue binds one field, fast path first. A driver.Valuer basic type
 // skips the fast path so bindArg hands the driver the value itself, letting
 // Value() run.
-func fieldValue(f *field, base unsafe.Pointer, rv reflect.Value, d Dialect) (any, error) {
+func fieldValue(f *field, base unsafe.Pointer, rv reflect.Value, b *binder) (any, error) {
 	if !f.code.bindValuer && !f.code.bindPtrValuer {
-		if a, ok, err := bindArgFast(f, base, d); ok {
+		if a, ok, err := bindArgFast(f, base, b); ok {
 			return a, err
 		}
 	}
-	return bindArg(f, rv.FieldByIndex(f.index), d)
+	return bindArg(f, rv.FieldByIndex(f.index), b)
 }
 
 // fieldIsZero checks one field, fast path first.
@@ -746,7 +780,7 @@ func scanOne[T any](rows *sql.Rows, p *plan) (*T, error) {
 }
 
 // bindArg converts a field value into a driver-facing argument.
-func bindArg(f *field, v reflect.Value, d Dialect) (any, error) {
+func bindArg(f *field, v reflect.Value, b *binder) (any, error) {
 	if f.jsonCol {
 		if v.Kind() == reflect.Pointer && v.IsNil() {
 			return nil, nil // a nil *T stores SQL NULL, not the string "null"
@@ -785,7 +819,7 @@ func bindArg(f *field, v reflect.Value, d Dialect) (any, error) {
 			if nt != nv.Time && v.CanSet() {
 				v.Set(reflect.ValueOf(sql.NullTime{Time: nt, Valid: true}))
 			}
-			return d.bindTime(nt), nil
+			return b.time(nt), nil
 		}
 		return nil, nil
 	}
@@ -795,7 +829,7 @@ func bindArg(f *field, v reflect.Value, d Dialect) (any, error) {
 			if nt != nv.V && v.CanSet() {
 				v.Set(reflect.ValueOf(sql.Null[time.Time]{V: nt, Valid: true}))
 			}
-			return d.bindTime(nt), nil
+			return b.time(nt), nil
 		}
 		return nil, nil
 	}
@@ -808,11 +842,11 @@ func bindArg(f *field, v reflect.Value, d Dialect) (any, error) {
 		if nt != t && v.CanSet() {
 			v.Set(reflect.ValueOf(nt))
 		}
-		return d.bindTime(nt), nil
+		return b.time(nt), nil
 	}
 	if isUintKind(v.Kind()) {
 		if n := v.Uint(); n > math.MaxInt64 {
-			return bindOverflowUint(d, n)
+			return bindOverflowUint(b.d, n)
 		}
 	}
 	return v.Interface(), nil

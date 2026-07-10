@@ -1,0 +1,156 @@
+package rio
+
+import (
+	"context"
+	"database/sql/driver"
+	"strings"
+	"testing"
+	"time"
+)
+
+// ptrKinds exercises every element kind the scanPtr plan-time codec covers:
+// the direct element write must behave exactly like scanning the plain type,
+// plus the NULL→nil rule.
+type ptrKinds struct {
+	ID    int64
+	I8    *int8
+	I     *int64
+	U     *uint16
+	F     *float64
+	B     *bool
+	S     *string
+	Bytes *[]byte
+	T     *time.Time
+}
+
+var ptrKindsCols = []string{"id", "i8", "i", "u", "f", "b", "s", "bytes", "t"}
+
+func TestScanPtrWritesEveryElemKind(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueRows(ptrKindsCols, []driver.Value{
+		int64(1), int64(-8), int64(42), int64(9), 2.5, true, "hi", []byte{1, 2}, testNow,
+	})
+	got, err := Find[ptrKinds](context.Background(), db, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.I8 == nil || *got.I8 != -8 {
+		t.Errorf("I8 = %v, want -8", got.I8)
+	}
+	if got.I == nil || *got.I != 42 {
+		t.Errorf("I = %v, want 42", got.I)
+	}
+	if got.U == nil || *got.U != 9 {
+		t.Errorf("U = %v, want 9", got.U)
+	}
+	if got.F == nil || *got.F != 2.5 {
+		t.Errorf("F = %v, want 2.5", got.F)
+	}
+	if got.B == nil || !*got.B {
+		t.Errorf("B = %v, want true", got.B)
+	}
+	if got.S == nil || *got.S != "hi" {
+		t.Errorf("S = %v, want hi", got.S)
+	}
+	if got.Bytes == nil || string(*got.Bytes) != "\x01\x02" {
+		t.Errorf("Bytes = %v, want [1 2]", got.Bytes)
+	}
+	if got.T == nil || !got.T.Equal(testNow) {
+		t.Errorf("T = %v, want %v", got.T, testNow)
+	}
+}
+
+func TestScanPtrTextSourcesAndNulls(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+	// Text-encoded numerics and time (SQLite delivers TEXT affinities), and
+	// NULL into every pointer column.
+	f.queueRows(ptrKindsCols, []driver.Value{
+		int64(1), "-8", "42", "9", "2.5", "1", []byte("hi"), "raw", "2026-07-09 12:00:00+00:00",
+	})
+	got, err := Find[ptrKinds](context.Background(), db, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.I8 == nil || *got.I8 != -8 || got.U == nil || *got.U != 9 || got.F == nil || *got.F != 2.5 {
+		t.Errorf("text numerics = %v %v %v", got.I8, got.U, got.F)
+	}
+	if got.B == nil || !*got.B || got.S == nil || *got.S != "hi" || got.Bytes == nil || string(*got.Bytes) != "raw" {
+		t.Errorf("text bool/string/bytes = %v %v %v", got.B, got.S, got.Bytes)
+	}
+	if got.T == nil || !got.T.Equal(testNow) {
+		t.Errorf("T = %v, want %v", got.T, testNow)
+	}
+
+	f.queueRows(ptrKindsCols, []driver.Value{
+		int64(2), nil, nil, nil, nil, nil, nil, nil, nil,
+	})
+	got, err = Find[ptrKinds](context.Background(), db, int64(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.I8 != nil || got.I != nil || got.U != nil || got.F != nil ||
+		got.B != nil || got.S != nil || got.Bytes != nil || got.T != nil {
+		t.Errorf("NULL columns must scan to nil pointers, got %+v", got)
+	}
+}
+
+// TestScanPtrRescanReplacesPointer pins the rebase semantics: scanning a new
+// row over the same struct swaps the pointer for a fresh cell — a previously
+// scanned pointer held by the caller is never overwritten in place.
+func TestScanPtrRescanReplacesPointer(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueRows(ptrKindsCols, []driver.Value{
+		int64(1), nil, int64(1), nil, nil, nil, nil, nil, nil,
+	})
+	first, err := Find[ptrKinds](context.Background(), db, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := first.I
+
+	f.queueRows(ptrKindsCols, []driver.Value{
+		int64(1), nil, int64(2), nil, nil, nil, nil, nil, nil,
+	})
+	second, err := Find[ptrKinds](context.Background(), db, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *held != 1 {
+		t.Errorf("previously scanned cell mutated: %d", *held)
+	}
+	if second.I == held {
+		t.Error("rescan reused the previous cell instead of allocating")
+	}
+	if *second.I != 2 {
+		t.Errorf("second scan = %d, want 2", *second.I)
+	}
+}
+
+func TestScanPtrOverflowAndConversionErrors(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name string
+		row  []driver.Value
+		want string
+	}{
+		{"int8 overflow", []driver.Value{int64(1), int64(1000), nil, nil, nil, nil, nil, nil, nil}, "overflows"},
+		{"negative uint", []driver.Value{int64(1), nil, nil, int64(-3), nil, nil, nil, nil, nil}, "negative"},
+		{"uint16 overflow", []driver.Value{int64(1), nil, nil, int64(70000), nil, nil, nil, nil, nil}, "overflows"},
+		{"bad time text", []driver.Value{int64(1), nil, nil, nil, nil, nil, nil, nil, "not-a-time"}, "cannot parse"},
+		{"bad conversion", []driver.Value{int64(1), nil, 3.5, nil, nil, nil, nil, nil, nil}, "cannot convert"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeDB()
+			db := f.open(SQLite)
+			f.queueRows(ptrKindsCols, tc.row)
+			_, err := Find[ptrKinds](ctx, db, int64(1))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}

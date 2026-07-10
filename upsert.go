@@ -2,9 +2,11 @@ package rio
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"time"
 	"unsafe"
 )
@@ -28,7 +30,9 @@ func OnConflict(cols ...string) UpsertOption {
 }
 
 // DoUpdate lists the columns to overwrite on conflict. With no columns,
-// every non-PK, non-CreatedAt, non-conflict-target column updates.
+// every non-PK, non-CreatedAt, non-conflict-target column updates. Listed
+// columns render deduplicated in canonical field order regardless of call
+// order — the same rule as Update's whitelist, for the same SQL-cache reason.
 func DoUpdate(cols ...string) UpsertOption {
 	return func(s *upsertSpec) { s.update = append(s.update, cols...) }
 }
@@ -115,7 +119,8 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 	}
 	now := normalizeTime(db.conf().clock())
 	prepareUpsertRow(p, rv, &spec, now)
-	cols, back, args, _, _, err := insertColumns(p, rv, d, now)
+	bn := binder{d: d, now: now}
+	cols, back, args, bits, cacheable, err := insertColumns(p, rv, &bn)
 	if err != nil {
 		return err
 	}
@@ -130,32 +135,72 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 		return err
 	}
 
-	b := renderInsertHead(g, p, cols)
-	b = append(b, " VALUES ("...)
-	for i := range cols {
-		if i > 0 {
-			b = append(b, ", "...)
-		}
-		b = append(b, '?')
-	}
-	b = append(b, ')')
-
 	table := g.table(p)
-	if d.caps().conflictTarget {
-		b = appendConflictClause(b, d, &spec)
-		if spec.doNothing {
-			b = append(b, "DO NOTHING"...)
-		} else {
-			b = append(b, "DO UPDATE SET "...)
-			b = appendConflictSets(b, d, table, p, update, &spec, "excluded")
-		}
-		if d.caps().returning && !spec.doNothing {
-			b = appendReturning(b, d, table, p)
-			sqlText, outArgs, err := finishSQL(d, b, args)
-			if err != nil {
-				return err
+	returning := d.caps().returning
+	// The whole statement — conflict clause and RETURNING included — is a
+	// pure function of the cache key (see upsertSQL), so it renders once per
+	// grammar and shape like every other entity-CRUD statement. Arguments
+	// come from insertColumns exactly as on the Insert path: the conflict
+	// assignments bind nothing.
+	sqlText, err := upsertSQL(g, p, "upsert", bits, 0, &spec, update, cacheable, func() []byte {
+		b := renderInsertHead(g, p, cols)
+		b = appendInsertValues(b, d, len(cols))
+		if d.caps().conflictTarget {
+			b = appendConflictClause(b, d, &spec)
+			if spec.doNothing {
+				b = append(b, "DO NOTHING"...)
+			} else {
+				b = append(b, "DO UPDATE SET "...)
+				b = appendConflictSets(b, d, table, p, update, &spec, "excluded")
 			}
-			rows, finish, err := runQuery(ctx, db, "upsert", p.structName, sqlText, outArgs)
+			if returning && !spec.doNothing {
+				b = appendReturning(b, d, table, p)
+			}
+			if returning && spec.doNothing && len(back) > 0 {
+				// A fresh insert still reports its generated columns; on
+				// conflict RETURNING yields no row and the struct stays as
+				// given — matching MySQL's insert-path-only backfill.
+				b = append(b, " RETURNING "...)
+				for i, f := range back {
+					if i > 0 {
+						b = append(b, ", "...)
+					}
+					b = d.quote(b, f.column)
+				}
+			}
+			return b
+		}
+		// MySQL: ON DUPLICATE KEY UPDATE. The VALUES() function for referring
+		// to the would-be inserted row is deprecated, so the DoUpdate branch
+		// names that row with an alias instead — 8.0.19+ syntax that MariaDB
+		// and older MySQL reject. DoNothing's no-op assignment never
+		// references the new row, so it renders alias-free and stays portable.
+		if !spec.doNothing {
+			b = appendMySQLUpsertAlias(b)
+		}
+		b = append(b, " ON DUPLICATE KEY UPDATE "...)
+		if spec.doNothing {
+			// A no-op assignment needs some column; models without a PK still
+			// have at least one mapped field.
+			col := p.fields[0].column
+			if len(p.pks) > 0 {
+				col = p.pks[0].column
+			}
+			b = d.quote(b, col)
+			b = append(b, " = "...)
+			b = d.quote(b, col)
+		} else {
+			b = appendConflictSets(b, d, table, p, update, &spec, mysqlUpsertAlias)
+		}
+		return b
+	})
+	if err != nil {
+		return err
+	}
+
+	if d.caps().conflictTarget {
+		if returning && !spec.doNothing {
+			rows, finish, err := runQuery(ctx, db, "upsert", p.structName, sqlText, args)
 			if err != nil {
 				return err
 			}
@@ -163,22 +208,8 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 			finishQuery(finish, err)
 			return err
 		}
-		if d.caps().returning && spec.doNothing && len(back) > 0 {
-			// A fresh insert still reports its generated columns; on
-			// conflict RETURNING yields no row and the struct stays as
-			// given — matching MySQL's insert-path-only backfill.
-			b = append(b, " RETURNING "...)
-			for i, f := range back {
-				if i > 0 {
-					b = append(b, ", "...)
-				}
-				b = d.quote(b, f.column)
-			}
-			sqlText, outArgs, err := finishSQL(d, b, args)
-			if err != nil {
-				return err
-			}
-			rows, finish, err := runQuery(ctx, db, "upsert", p.structName, sqlText, outArgs)
+		if returning && spec.doNothing && len(back) > 0 {
+			rows, finish, err := runQuery(ctx, db, "upsert", p.structName, sqlText, args)
 			if err != nil {
 				return err
 			}
@@ -186,41 +217,11 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 			finishQuery(finish, err)
 			return err
 		}
-		sqlText, outArgs, err := finishSQL(d, b, args)
-		if err != nil {
-			return err
-		}
-		_, err = run(ctx, db, "upsert", p.structName, sqlText, outArgs)
+		_, err = run(ctx, db, "upsert", p.structName, sqlText, args)
 		return err
 	}
 
-	// MySQL: ON DUPLICATE KEY UPDATE. The VALUES() function for referring to
-	// the would-be inserted row is deprecated, so the DoUpdate branch names
-	// that row with an alias instead — 8.0.19+ syntax that MariaDB and older
-	// MySQL reject. DoNothing's no-op assignment never references the new
-	// row, so it renders alias-free and stays portable.
-	if !spec.doNothing {
-		b = appendMySQLUpsertAlias(b)
-	}
-	b = append(b, " ON DUPLICATE KEY UPDATE "...)
-	if spec.doNothing {
-		// A no-op assignment needs some column; models without a PK still
-		// have at least one mapped field.
-		col := p.fields[0].column
-		if len(p.pks) > 0 {
-			col = p.pks[0].column
-		}
-		b = d.quote(b, col)
-		b = append(b, " = "...)
-		b = d.quote(b, col)
-	} else {
-		b = appendConflictSets(b, d, table, p, update, &spec, mysqlUpsertAlias)
-	}
-	sqlText, outArgs, err := finishSQL(d, b, args)
-	if err != nil {
-		return err
-	}
-	res, err := run(ctx, db, "upsert", p.structName, sqlText, outArgs)
+	res, err := run(ctx, db, "upsert", p.structName, sqlText, args)
 	if err != nil {
 		return err
 	}
@@ -230,6 +231,49 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 		return fillLastInsertID(p, rv, res.LastInsertId)
 	}
 	return nil
+}
+
+// upsertSQL is crudSQLKeyed for the upsert family: the key additionally
+// carries the normalized conflict shape. Caching the text is safe because
+// the conflict assignments bind no parameters — they reference the
+// excluded/alias row, "version + 1", and NULL only — so two calls with the
+// same shape differ exclusively in the VALUES arguments.
+func upsertSQL(g *grammar, p *plan, op string, bits uint64, rows int, spec *upsertSpec, update []*field, cacheable bool, build func() []byte) (string, error) {
+	key := ""
+	if cacheable {
+		key = upsertSpecKey(spec, update)
+	}
+	return crudSQLKeyed(g, p, op, bits, rows, key, cacheable, build)
+}
+
+// upsertSpecKey normalizes an upsertSpec into the cache key's spec string:
+// one flags byte, the resolved conflict-update set as an ordinal bitmap
+// (upsertUpdateSet renders canonical order, so the set determines the text;
+// callers only cache ≤64-column plans), and the conflict target columns
+// verbatim — they render in caller order, and NUL separators keep distinct
+// lists ("a","bc" vs "ab","c") from colliding.
+func upsertSpecKey(spec *upsertSpec, update []*field) string {
+	n := 9 + len(spec.conflict)
+	for _, c := range spec.conflict {
+		n += len(c)
+	}
+	b := make([]byte, 1, n)
+	if spec.doNothing {
+		b[0] |= 1
+	}
+	if spec.keepTrashed {
+		b[0] |= 2
+	}
+	var set uint64
+	for _, f := range update {
+		set |= 1 << uint(f.ordinal)
+	}
+	b = binary.BigEndian.AppendUint64(b, set)
+	for _, c := range spec.conflict {
+		b = append(b, c...)
+		b = append(b, 0)
+	}
+	return byteString(b)
 }
 
 const mysqlUpsertAlias = "_rio_new"
@@ -261,12 +305,12 @@ func prepareUpsertRow(p *plan, rv reflect.Value, spec *upsertSpec, now time.Time
 // columns and the zero auto-increment PK): excluded.col for an uninserted
 // column is its DB DEFAULT, so referencing one would silently reset the
 // existing row's data on conflict — the default set leaves those columns
-// untouched and the whitelist refuses them. The derivation stays a pure
+// untouched and the whitelist refuses them. The derivation is a pure
 // function of (insert column set, spec) — skipped is the insert bitmap's
-// complement — so it can join the cached-SQL key later. An empty resolved
-// set with no maintained columns to render either would emit "DO UPDATE SET"
-// with no assignments — invalid SQL on every dialect — so it errors with
-// the fix.
+// complement — and the resolved set joins the cached-SQL key as an ordinal
+// bitmap (upsertSpecKey). An empty resolved set with no maintained columns
+// to render either would emit "DO UPDATE SET" with no assignments — invalid
+// SQL on every dialect — so it errors with the fix.
 func upsertUpdateSet(p *plan, spec *upsertSpec, skipped []*field) ([]*field, error) {
 	if spec.doNothing {
 		return nil, nil
@@ -284,8 +328,17 @@ func upsertUpdateSet(p *plan, spec *upsertSpec, skipped []*field) ([]*field, err
 			if fieldIn(skipped, f) {
 				return nil, fmt.Errorf("rio: DoUpdate: column %q is tagged omitzero and %s.%s is zero, so this statement inserts no value the conflict update could reference; set the field or drop the column from DoUpdate", c, p.structName, f.name)
 			}
+			if fieldIn(out, f) {
+				continue // dedup by identity; whitelists are a handful of columns
+			}
 			out = append(out, f)
 		}
+		// Canonical order, always — updateSet's rule for the same reason: the
+		// SQL cache keys on an order-free column set, so rendering must not
+		// depend on caller order. Conflict assignments are order-independent
+		// (each references only the excluded/alias row or constants), so the
+		// reordering cannot change what the statement writes.
+		slices.SortFunc(out, func(a, b *field) int { return a.ordinal - b.ordinal })
 		return out, nil
 	}
 	inTarget := make(map[string]bool, len(spec.conflict))

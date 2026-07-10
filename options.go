@@ -104,12 +104,13 @@ type crudKey struct {
 	op   string
 	bits uint64 // participating-column bitmap for shape-variable statements
 	rows int    // VALUES tuple count for batch statements
+	spec string // normalized upsert conflict shape (upsertSpecKey), "" otherwise
 }
 
 // cachedSQL renders entity-CRUD SQL once per grammar and shape. The hot path
 // pays one sync.Map lookup instead of a render plus a rebind.
-func (g *grammar) cachedSQL(p *plan, op string, bits uint64, rows int, build func() (string, error)) (string, error) {
-	key := crudKey{plan: p, op: op, bits: bits, rows: rows}
+func (g *grammar) cachedSQL(p *plan, op string, bits uint64, rows int, spec string, build func() (string, error)) (string, error) {
+	key := crudKey{plan: p, op: op, bits: bits, rows: rows, spec: spec}
 	if v, ok := g.crud.Load(key); ok {
 		return v.(string), nil
 	}

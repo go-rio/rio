@@ -501,7 +501,7 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 	default:
 		// The qualified column list never changes per plan and grammar;
 		// render it once.
-		head, err := g.cachedSQL(p, "selecthead", 0, 0, func() (string, error) {
+		head, err := g.cachedSQL(p, "selecthead", 0, 0, "", func() (string, error) {
 			hb := make([]byte, 0, 128)
 			hb = append(hb, "SELECT "...)
 			for i, f := range p.fields {

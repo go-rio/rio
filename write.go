@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"sort"
+	"slices"
 	"time"
 	"unsafe"
 )
@@ -36,7 +36,8 @@ func Insert[T any](ctx context.Context, db Queryer, row *T) error {
 	now := normalizeTime(db.conf().clock())
 	stampForInsert(p, rv, now)
 
-	cols, back, args, bits, cacheable, err := insertColumns(p, rv, d, now)
+	bn := binder{d: d, now: now}
+	cols, back, args, bits, cacheable, err := insertColumns(p, rv, &bn)
 	if err != nil {
 		return err
 	}
@@ -129,7 +130,8 @@ func Update[T any](ctx context.Context, db Queryer, row *T, cols ...string) erro
 	if err != nil {
 		return err
 	}
-	args, err := bindFields(p, rv, d, set)
+	bn := binder{d: d, now: now}
+	args, err := bindFields(p, rv, &bn, set)
 	if err != nil {
 		return err
 	}
@@ -220,11 +222,12 @@ func softDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 	if err != nil {
 		return err
 	}
-	args := []any{d.bindTime(now)}
+	bn := binder{d: d, now: now}
+	args := []any{bn.time(now)}
 	if p.updated != nil {
-		args = append(args, d.bindTime(now))
+		args = append(args, bn.time(now))
 	}
-	if args, err = appendKeyArgs(args, p, rv, d); err != nil {
+	if args, err = appendKeyArgs(args, p, rv, &bn); err != nil {
 		return err
 	}
 	res, err := run(ctx, db, "delete", p.structName, sqlText, args)
@@ -279,7 +282,8 @@ func hardDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 	if err != nil {
 		return err
 	}
-	args, err := appendKeyArgs(nil, p, rv, d)
+	bn := binder{d: d}
+	args, err := appendKeyArgs(nil, p, rv, &bn)
 	if err != nil {
 		return err
 	}
@@ -340,7 +344,7 @@ func updateSet(p *plan, cols []string) ([]*field, error) {
 	// bitmap: if rendering followed caller order, Update("a","b") and a later
 	// Update("b","a") would share one cached statement while each binds values
 	// in its own order — silently writing values into the wrong columns.
-	sort.Slice(out, func(i, j int) bool { return out[i].ordinal < out[j].ordinal })
+	slices.SortFunc(out, func(a, b *field) int { return a.ordinal - b.ordinal })
 	return out, nil
 }
 
@@ -421,17 +425,23 @@ func rowValue[T any](op string, row *T) (reflect.Value, error) {
 // a RETURNING clause needs: every other value is already in the struct.
 // bits is the participating-column bitmap used as the SQL-cache key;
 // cacheable is false past 64 columns (render directly, no cache).
-func insertColumns(p *plan, rv reflect.Value, d Dialect, now time.Time) (cols, back []*field, args []any, bits uint64, cacheable bool, err error) {
-	cols = make([]*field, 0, len(p.fields))
+func insertColumns(p *plan, rv reflect.Value, b *binder) (cols, back []*field, args []any, bits uint64, cacheable bool, err error) {
+	// cols and back partition p.fields, so one buffer serves both: cols
+	// grows from the front while back fills the tail in reverse, restored to
+	// plan order below.
+	buf := make([]*field, len(p.fields))
+	cols = buf[:0]
+	nb := len(buf)
 	args = make([]any, 0, len(p.fields))
 	cacheable = len(p.fields) <= 64
 	base := rv.Addr().UnsafePointer()
 	for i, f := range p.fields {
 		if (f.isAutoIncr || f.omitZero) && fieldIsZero(f, base, rv) {
-			back = append(back, f)
+			nb--
+			buf[nb] = f
 			continue
 		}
-		a, err := fieldValue(f, base, rv, d)
+		a, err := fieldValue(f, base, rv, b)
 		if err != nil {
 			return nil, nil, nil, 0, false, err
 		}
@@ -441,25 +451,36 @@ func insertColumns(p *plan, rv reflect.Value, d Dialect, now time.Time) (cols, b
 			bits |= 1 << uint(i)
 		}
 	}
+	back = buf[nb:]
+	slices.Reverse(back)
 	return cols, back, args, bits, cacheable, nil
 }
 
 // crudSQL fetches or renders a cached entity-CRUD statement.
 func crudSQL(g *grammar, p *plan, op string, bits uint64, cacheable bool, build func() []byte) (string, error) {
-	return crudSQLRows(g, p, op, bits, 0, cacheable, build)
+	return crudSQLKeyed(g, p, op, bits, 0, "", cacheable, build)
 }
 
 // crudSQLRows is crudSQL with a VALUES tuple count in the cache key, for
 // batch statements whose shape repeats at a fixed chunk size.
 func crudSQLRows(g *grammar, p *plan, op string, bits uint64, rows int, cacheable bool, build func() []byte) (string, error) {
+	return crudSQLKeyed(g, p, op, bits, rows, "", cacheable, build)
+}
+
+// crudSQLKeyed is the full-key form; spec carries the normalized upsert
+// conflict shape (upsertSQL) and stays "" for every other statement.
+func crudSQLKeyed(g *grammar, p *plan, op string, bits uint64, rows int, spec string, cacheable bool, build func() []byte) (string, error) {
 	render := func() (string, error) {
-		s, _, err := rebindTemplate(g.d.lexer(), g.d.style(), string(build()))
+		// build returns a fresh function-local buffer, so handing it to
+		// rebindTemplate uncopied follows finishSQL's ownership rule (the
+		// rebind may return it re-interpreted as the final string).
+		s, _, err := rebindTemplate(g.d.lexer(), g.d.style(), byteString(build()))
 		return s, err
 	}
 	if !cacheable {
 		return render()
 	}
-	return g.cachedSQL(p, op, bits, rows, render)
+	return g.cachedSQL(p, op, bits, rows, spec, render)
 }
 
 func renderInsertHead(g *grammar, p *plan, cols []*field) []byte {
@@ -529,22 +550,17 @@ func scanBackCols(rows *sql.Rows, back []*field, base unsafe.Pointer) error {
 
 // scanBackColsIfRow fills generated columns when RETURNING yielded a row and
 // reports scanned=false when it did not (a DoNothing upsert hitting a
-// conflict), leaving the struct as given.
+// conflict), leaving the struct as given. The column list is rio's own
+// render, so no pre-Scan shape check: database/sql's Scan reports a count
+// mismatch just as loudly, without the extra Columns() copy per insert.
 func scanBackColsIfRow(rows *sql.Rows, back []*field, base unsafe.Pointer) (scanned bool, err error) {
 	defer rows.Close()
-	cols, err := rows.Columns()
-	if err != nil {
-		return false, err
-	}
-	if len(cols) != len(back) {
-		return false, fmt.Errorf("rio: RETURNING yielded %d columns, expected %d", len(cols), len(back))
-	}
 	if !rows.Next() {
 		return false, rows.Err()
 	}
 	rs := newRowScanner(back, nil)
 	if err := rs.scan(rows, base); err != nil {
-		return true, err
+		return true, fmt.Errorf("rio: scanning RETURNING row: %w", err)
 	}
 	return true, rows.Err()
 }
@@ -637,7 +653,8 @@ func zeroAffectedMeansMissing(ctx context.Context, db Queryer, p *plan, rv refle
 	if err != nil {
 		return false, err
 	}
-	args, err := appendKeyArgs(nil, p, rv, d)
+	bn := binder{d: d}
+	args, err := appendKeyArgs(nil, p, rv, &bn)
 	if err != nil {
 		return false, err
 	}
@@ -653,17 +670,17 @@ func zeroAffectedMeansMissing(ctx context.Context, db Queryer, p *plan, rv refle
 }
 
 // appendKeyArgs binds the PK (+version) values matching appendPKWhereSQL.
-func appendKeyArgs(args []any, p *plan, rv reflect.Value, d Dialect) ([]any, error) {
+func appendKeyArgs(args []any, p *plan, rv reflect.Value, b *binder) ([]any, error) {
 	base := rv.Addr().UnsafePointer()
 	for _, pk := range p.pks {
-		a, err := fieldValue(pk, base, rv, d)
+		a, err := fieldValue(pk, base, rv, b)
 		if err != nil {
 			return nil, err
 		}
 		args = append(args, a)
 	}
 	if p.version != nil {
-		a, err := fieldValue(p.version, base, rv, d)
+		a, err := fieldValue(p.version, base, rv, b)
 		if err != nil {
 			return nil, err
 		}
@@ -674,17 +691,17 @@ func appendKeyArgs(args []any, p *plan, rv reflect.Value, d Dialect) ([]any, err
 
 // bindFields extracts the bind values for a rendered field list plus the
 // key/version tail.
-func bindFields(p *plan, rv reflect.Value, d Dialect, set []*field) ([]any, error) {
+func bindFields(p *plan, rv reflect.Value, b *binder, set []*field) ([]any, error) {
 	base := rv.Addr().UnsafePointer()
 	args := make([]any, 0, len(set)+len(p.pks)+1)
 	for _, f := range set {
-		a, err := fieldValue(f, base, rv, d)
+		a, err := fieldValue(f, base, rv, b)
 		if err != nil {
 			return nil, err
 		}
 		args = append(args, a)
 	}
-	return appendKeyArgs(args, p, rv, d)
+	return appendKeyArgs(args, p, rv, b)
 }
 
 func fillLastInsertID(p *plan, rv reflect.Value, lastID func() (int64, error)) error {
@@ -750,11 +767,12 @@ func Restore[T any](ctx context.Context, db Queryer, row *T) error {
 	if err != nil {
 		return err
 	}
+	bn := binder{d: d, now: now}
 	var args []any
 	if p.updated != nil {
-		args = append(args, d.bindTime(now))
+		args = append(args, bn.time(now))
 	}
-	if args, err = appendKeyArgs(args, p, rv, d); err != nil {
+	if args, err = appendKeyArgs(args, p, rv, &bn); err != nil {
 		return err
 	}
 	res, err := run(ctx, db, "update", p.structName, sqlText, args)

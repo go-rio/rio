@@ -284,7 +284,11 @@ it is missing plan caches and sloppy string assembly.
   fuzz-compared for equality and the whole matrix runs under -race/checkptr.
   Entity SELECTs render columns in plan order and verify the result set
   matches once per query; Raw always matches by column name.
-- Entity CRUD ≤4 extra allocs per call, asserted with testing.AllocsPerRun.
+- Entity CRUD ≤4 extra allocs per call over hand-written database/sql on the
+  same driver — measured Find +3, Insert +3 (RETURNING) / +2 (exec),
+  Update +2, Delete +1 — asserted with testing.AllocsPerRun
+  (TestCRUDAllocBudget). Upsert adds its conflict-shape machinery on top:
+  +8 (PostgreSQL) / +6 (MySQL), asserted at those budgets.
 - Benchmarks in-repo against hand-written database/sql (fake driver + real
   SQLite), plus a local reproduction of efectn/go-orm-benchmarks for the
   README. Honest methodology or no numbers.

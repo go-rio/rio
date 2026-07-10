@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
-	"time"
 )
 
 // InsertAll writes rows in multi-VALUES statements, auto-chunked to the
@@ -48,9 +47,10 @@ func InsertAll[T any](ctx context.Context, db Queryer, rows []T) error {
 	if chunk < 1 {
 		chunk = 1
 	}
+	bn := binder{d: d, now: now}
 	for start := 0; start < len(rows); start += chunk {
 		end := min(start+chunk, len(rows))
-		if err := insertChunk(ctx, db, p, cols, rows[start:end], backfill, now); err != nil {
+		if err := insertChunk(ctx, db, p, cols, rows[start:end], backfill, &bn, chunk); err != nil {
 			return err
 		}
 	}
@@ -90,10 +90,15 @@ func batchColumns[T any](p *plan, rows []T) (cols []*field, backfill bool, err e
 	return cols, backfill, nil
 }
 
-func insertChunk[T any](ctx context.Context, db Queryer, p *plan, cols []*field, rows []T, backfill bool, now time.Time) error {
+func insertChunk[T any](ctx context.Context, db Queryer, p *plan, cols []*field, rows []T, backfill bool, bn *binder, fullChunk int) error {
 	g := db.gram()
 	d := g.d
 	bits, cacheable := setBits(p, cols)
+	// Only full-sized chunks enter the SQL cache: tail sizes (total % chunk)
+	// vary freely with workload row counts, and every distinct tail length
+	// would pin a complete multi-VALUES statement in grammar.crud forever.
+	// Tails render directly — microseconds next to the round-trip they open.
+	cacheable = cacheable && len(rows) == fullChunk
 	returning := backfill && d.caps().returning
 	op := "insertall"
 	if returning {
@@ -129,7 +134,7 @@ func insertChunk[T any](ctx context.Context, db Queryer, p *plan, cols []*field,
 		rv := reflect.ValueOf(&rows[r]).Elem()
 		base := rv.Addr().UnsafePointer()
 		for _, f := range cols {
-			a, err := fieldValue(f, base, rv, d)
+			a, err := fieldValue(f, base, rv, bn)
 			if err != nil {
 				return err
 			}
@@ -224,67 +229,77 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 		chunk = 1
 	}
 	table := g.table(p)
+	bits, cacheable := setBits(p, cols)
+	bn := binder{d: d, now: now}
 	for start := 0; start < len(rows); start += chunk {
 		end := min(start+chunk, len(rows))
 		part := rows[start:end]
 
-		b := renderInsertHead(g, p, cols)
-		b = append(b, " VALUES "...)
+		// Cached per (shape, tuple count, conflict shape) like insertChunk,
+		// under the same full-chunks-only rule: tail sizes render directly.
+		sqlText, err := upsertSQL(g, p, "upsertall", bits, len(part), &spec, update,
+			cacheable && len(part) == chunk, func() []byte {
+				b := renderInsertHead(g, p, cols)
+				b = append(b, " VALUES "...)
+				for r := range part {
+					if r > 0 {
+						b = append(b, ", "...)
+					}
+					b = append(b, '(')
+					for i := range cols {
+						if i > 0 {
+							b = append(b, ", "...)
+						}
+						b = append(b, '?')
+					}
+					b = append(b, ')')
+				}
+				if d.caps().conflictTarget {
+					b = appendConflictClause(b, d, &spec)
+					if spec.doNothing {
+						b = append(b, "DO NOTHING"...)
+					} else {
+						b = append(b, "DO UPDATE SET "...)
+						b = appendConflictSets(b, d, table, p, update, &spec, "excluded")
+					}
+					return b
+				}
+				// The row alias is DoUpdate-only, as in Upsert: 8.0.19+ syntax
+				// that DoNothing's no-op assignment never needs.
+				if !spec.doNothing {
+					b = appendMySQLUpsertAlias(b)
+				}
+				b = append(b, " ON DUPLICATE KEY UPDATE "...)
+				if spec.doNothing {
+					col := p.fields[0].column
+					if len(p.pks) > 0 {
+						col = p.pks[0].column
+					}
+					b = d.quote(b, col)
+					b = append(b, " = "...)
+					b = d.quote(b, col)
+				} else {
+					b = appendConflictSets(b, d, table, p, update, &spec, mysqlUpsertAlias)
+				}
+				return b
+			})
+		if err != nil {
+			return err
+		}
+
 		args := make([]any, 0, len(part)*len(cols))
 		for r := range part {
-			if r > 0 {
-				b = append(b, ", "...)
-			}
-			b = append(b, '(')
 			rv := reflect.ValueOf(&part[r]).Elem()
 			base := rv.Addr().UnsafePointer()
-			for i, f := range cols {
-				if i > 0 {
-					b = append(b, ", "...)
-				}
-				b = append(b, '?')
-				a, err := fieldValue(f, base, rv, d)
+			for _, f := range cols {
+				a, err := fieldValue(f, base, rv, &bn)
 				if err != nil {
 					return err
 				}
 				args = append(args, a)
 			}
-			b = append(b, ')')
 		}
-
-		if d.caps().conflictTarget {
-			b = appendConflictClause(b, d, &spec)
-			if spec.doNothing {
-				b = append(b, "DO NOTHING"...)
-			} else {
-				b = append(b, "DO UPDATE SET "...)
-				b = appendConflictSets(b, d, table, p, update, &spec, "excluded")
-			}
-		} else {
-			// The row alias is DoUpdate-only, as in Upsert: 8.0.19+ syntax
-			// that DoNothing's no-op assignment never needs.
-			if !spec.doNothing {
-				b = appendMySQLUpsertAlias(b)
-			}
-			b = append(b, " ON DUPLICATE KEY UPDATE "...)
-			if spec.doNothing {
-				col := p.fields[0].column
-				if len(p.pks) > 0 {
-					col = p.pks[0].column
-				}
-				b = d.quote(b, col)
-				b = append(b, " = "...)
-				b = d.quote(b, col)
-			} else {
-				b = appendConflictSets(b, d, table, p, update, &spec, mysqlUpsertAlias)
-			}
-		}
-
-		sqlText, outArgs, err := finishSQL(d, b, args)
-		if err != nil {
-			return err
-		}
-		if _, err := run(ctx, db, "upsert", p.structName, sqlText, outArgs); err != nil {
+		if _, err := run(ctx, db, "upsert", p.structName, sqlText, args); err != nil {
 			return err
 		}
 	}
