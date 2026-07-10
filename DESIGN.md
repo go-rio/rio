@@ -280,14 +280,22 @@ ClickHouse-native way out. "If rio can't compile it, it returns an error"
 applies to semantics too: an API whose contract cannot hold does not get a
 lookalike that silently means something weaker.
 
+The server floor is **26.x**: that is where INSERT and comparisons natively
+parse rio's offset-carrying time text. Earlier servers reject it — 25.x
+comparisons raise TYPE_MISMATCH through the implicit String→DateTime64 cast
+no session setting reaches — and rather than carry a per-version binding
+strategy, rio requires the version that speaks its encoding (26 also covers
+the older WhereHas ≥ 25.8 correlated-EXISTS floor and fixes 25.x's mirrored
+parsing of pre-1970 fractional seconds).
+
 - **Reads are complete**: the whole query builder, all four relation
-  preloads, `WithCount`, window-function `RelLimit`, `WhereHas` (server ≥
-  25.8), soft-delete read filtering, `Raw`/`Exec`/compiled queries. Plus one
-  dialect-gated addition, `Query.Final()` — reads through the `FINAL` table
-  modifier, the read-side companion of ReplacingMergeTree deduplication.
-  It exists because the Upsert/Update rejection messages point at
-  ReplacingMergeTree: pointing there without a read-side closure would send
-  users straight back out to Raw.
+  preloads, `WithCount`, window-function `RelLimit`, `WhereHas`, soft-delete
+  read filtering, `Raw`/`Exec`/compiled queries. Plus one dialect-gated
+  addition, `Query.Final()` — reads through the `FINAL` table modifier, the
+  read-side companion of ReplacingMergeTree deduplication. It exists because
+  the Upsert/Update rejection messages point at ReplacingMergeTree: pointing
+  there without a read-side closure would send users straight back out to
+  Raw.
 - **Writes are Insert/InsertAll (+ `rio.Exec` mutations)**. The
   UPDATE/DELETE/Upsert families, transactions, `ForUpdate`, and the stmt
   cache are rejected at the render/execution layer — each on a double
@@ -298,18 +306,13 @@ lookalike that silently means something weaker.
   implemented, not merely "is awkward").
 - **Every argument is interpolated client-side** — the driver's
   `database/sql` path has no parameter binding. Two dialect rules follow:
-  times inline at execution as
-  `parseDateTime64BestEffort('2006-01-02 15:04:05.000000+00:00', 6, 'UTC')`
-  literals (the driver would silently truncate a `time.Time` to whole
-  seconds, and the implicit String→DateTime64 comparison cast rejects
-  offset-carrying text before 26.x regardless of session settings — the
-  explicit parse function is the one channel every supported server accepts
-  with microseconds intact; cached SQL stays parameterized, only the
-  executed text carries the literal, and the out-of-range values ClickHouse
-  would silently *clamp* are rejected client-side, zero `time.Time`
-  included), and `[]byte` binds as `String` (the driver renders it as an
-  `Array(UInt8)` literal otherwise — a String column then stores the
-  literal's text form, silently).
+  times bind as fixed-format text (`2006-01-02 15:04:05.000000+00:00` — the
+  driver would silently truncate a `time.Time` to whole seconds; the
+  explicit offset overrides column timezones, and the out-of-range values
+  ClickHouse would silently *clamp* are rejected client-side, zero
+  `time.Time` included), and `[]byte` binds as `String` (the driver renders
+  it as an `Array(UInt8)` literal otherwise — a String column then stores
+  the literal's text form, silently).
 - **The lexer is pinned to the server's Lexer.cpp** (heredocs with empty and
   digit-leading tags where unterminated ones do not lex, `//` comments, the
   `# ` space rule, backslash escapes in every quote flavor), and `??` emits
@@ -357,9 +360,7 @@ it is missing plan caches and sloppy string assembly.
   Update +2, Delete +1 — asserted with testing.AllocsPerRun
   (TestCRUDAllocBudget). Upsert adds its conflict-shape machinery on top:
   +5 (PostgreSQL) / +5 (MySQL), asserted at those budgets. ClickHouse rides
-  the same paths (Find +1; Insert +5 — the execution-time inline rewrite of
-  stamped time columns, measured against a hand-written equivalent that
-  interpolates the same literals); its capability checks are early-exit
+  the same paths (Find +1, Insert +1): its capability checks are early-exit
   branches, so the three older dialects' budgets did not move when it landed.
 - Benchmarks in-repo against hand-written database/sql (fake driver in
   perf_test.go isolates rio's own overhead; bench/ adds real SQLite and a

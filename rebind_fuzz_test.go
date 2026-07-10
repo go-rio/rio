@@ -154,19 +154,10 @@ func naiveRebind(p lexProfile, style bindStyle, query string, args []any) (strin
 						if k > 0 {
 							out = append(out, ',', ' ')
 						}
-						if tt, ok := e.(chTimeText); ok && style == bindQuestionEsc {
-							out = append(out, "parseDateTime64BestEffort('"+string(tt)+"', 6, 'UTC')"...)
-							continue
-						}
 						emitted++
 						out = naiveEmit(out, style, emitted)
 						flat = append(flat, e)
 					}
-				} else if tt, ok := arg.(chTimeText); ok && style == bindQuestionEsc {
-					// ClickHouse time arguments inline as explicit parse
-					// calls, consuming the argument.
-					expand = true
-					out = append(out, "parseDateTime64BestEffort('"+string(tt)+"', 6, 'UTC')"...)
 				} else {
 					emitted++
 					out = naiveEmit(out, style, emitted)
@@ -553,7 +544,7 @@ func FuzzRebind(f *testing.F) {
 
 		args := make([]any, int(nArgs)%8)
 		for i := range args {
-			switch i % 5 {
+			switch i % 4 {
 			case 0:
 				args[i] = i + 1
 			case 1:
@@ -562,18 +553,12 @@ func FuzzRebind(f *testing.F) {
 				args[i] = nil
 			case 3:
 				args[i] = 1.5
-			case 4:
-				// The ClickHouse inline-tagged time text: consumed and
-				// rewritten under bindQuestionEsc, an ordinary bind value
-				// under every other style.
-				args[i] = chTimeText("2024-01-02 03:04:05.123456+00:00")
 			}
 		}
 		// Bit i of sliceBits swaps args[i] for a slice-family shape, so the
 		// fuzzer explores every mix of scalars and IN (?) expansions. The
-		// shapes cover multi-element, single, mixed-type (a chTimeText element
-		// included — expanded elements inline too), empty (an error on both
-		// sides), array, and the []byte scalar that must never expand.
+		// shapes cover multi-element, single, mixed-type, empty (an error on
+		// both sides), array, and the []byte scalar that must never expand.
 		for i := range args {
 			if i >= 8 || sliceBits&(1<<i) == 0 {
 				continue
@@ -584,7 +569,7 @@ func FuzzRebind(f *testing.F) {
 			case 1:
 				args[i] = []string{"x"}
 			case 2:
-				args[i] = []any{nil, chTimeText("1950-01-02 03:04:05.123456+00:00"), 3}
+				args[i] = []any{nil, "y", 3}
 			case 3:
 				args[i] = []int{}
 			case 4:

@@ -279,7 +279,7 @@ func TestCRUDAllocBudget(t *testing.T) {
 		"find/clickhouse":   1, // same read path; caps checks are branch-only
 		"insert/sqlite":     0, // RETURNING path
 		"insert/mysql":      1, // exec + LastInsertId path
-		"insert/clickhouse": 5, // exec path + the execution-time inline pass (rebind rewrite buffer, its growth, rebuilt arg list)
+		"insert/clickhouse": 1, // exec path; chTimeFormat binds text like sqlite's
 		"update/pg":         2,
 		"delete/pg":         1,
 		"upsert/pg":         5, // conflict shape: spec, option appends, update set, cache key
@@ -388,13 +388,11 @@ func allocMeasurements(ctx context.Context) map[string]allocPair {
 	}
 
 	{ // Insert, ClickHouse exec path: explicit ID (nothing generates or
-		// backfills there), the stamped time columns inlined into the
-		// statement text at execution — the hand-written equivalent builds
-		// the same interpolated statement per call.
+		// backfills there), stamps bound as chTimeFormat text.
 		l := &loopDB{}
 		db, raw := l.open(ClickHouse), l.raw()
 		u := &perfUser{ID: 1, Email: "u@example.com", Age: 30}
-		const qHead = "INSERT INTO `perf_users` (`id`, `email`, `age`, `created_at`, `updated_at`) VALUES (?, ?, ?, "
+		const q = "INSERT INTO `perf_users` (`id`, `email`, `age`, `created_at`, `updated_at`) VALUES (?, ?, ?, ?, ?)"
 		pairs["insert/clickhouse"] = allocPair{
 			rio: func() {
 				u.CreatedAt, u.UpdatedAt = time.Time{}, time.Time{}
@@ -402,8 +400,8 @@ func allocMeasurements(ctx context.Context) map[string]allocPair {
 			},
 			std: func() {
 				now := time.Now().UTC().Truncate(time.Microsecond)
-				lit := "parseDateTime64BestEffort('" + now.Format(chTimeFormat) + "', 6, 'UTC')"
-				res, err := raw.ExecContext(ctx, qHead+lit+", "+lit+")", int64(1), "u@example.com", int64(30))
+				ts := now.Format(chTimeFormat)
+				res, err := raw.ExecContext(ctx, q, int64(1), "u@example.com", int64(30), ts, ts)
 				fatal(err)
 				_ = res
 			},

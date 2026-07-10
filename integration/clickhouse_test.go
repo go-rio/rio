@@ -32,9 +32,6 @@ func clickhouseDB(t *testing.T, opts ...rio.Option) *rio.DB {
 	if dsn == "" {
 		t.Skip("RIO_CLICKHOUSE_DSN not set")
 	}
-	// The DSN passes through untouched — rio inlines time arguments as
-	// explicit parseDateTime64BestEffort calls, so no input-format setting
-	// is needed on any server version.
 	raw, err := sql.Open("clickhouse", dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -47,6 +44,12 @@ func clickhouseDB(t *testing.T, opts ...rio.Option) *rio.DB {
 		t.Fatalf("ping clickhouse: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	// rio's version floor: 26.x is where INSERT and comparisons natively
+	// parse rio's offset-carrying time text — before that, comparisons
+	// TYPE_MISMATCH regardless of session settings.
+	if major, minor := chServerVersion(t, context.Background(), db); major < 26 {
+		t.Skipf("rio requires ClickHouse 26+, server is %d.%d", major, minor)
+	}
 	return db
 }
 
@@ -245,83 +248,42 @@ func TestClickHouseServerSemantics(t *testing.T) {
 		}
 	})
 
-	// T3: the time channels, by server version. The explicit
-	// parseDateTime64BestEffort call — the channel rio inlines — works on
-	// every supported version, instant-exact in both columns for INSERT and
-	// comparison alike. Bare offset text only works from 26.x: below that,
-	// the implicit String cast in comparisons rejects it (TYPE_MISMATCH,
-	// immune to session settings) and basic-format INSERT parsing rejects it
-	// too. Both sides pinned: if the old servers' rejection ever passes, the
-	// inlining may be simplifiable; if the function channel drifts, rio's
-	// time promise breaks loudly here first.
-	t.Run("T3 time channels by version", func(t *testing.T) {
-		const fn = "parseDateTime64BestEffort('2024-01-02 03:04:05.123456+00:00', 6, 'UTC')"
-		// ds takes offset-free text: the seconds column is text-writable on
-		// every version, function-writable on none (pinned below).
-		chExec(t, ctx, db, "INSERT INTO sem_tt VALUES (3, "+fn+", "+fn+", '2024-01-02 03:04:05')")
+	// T3: text with an explicit offset overrides the column timezone — both
+	// columns store the same instant, comparisons included; the negative
+	// epoch range (pre-1970) parses too. This is rio's chosen encoding.
+	t.Run("T3 offset text is timezone-proof", func(t *testing.T) {
+		chExec(t, ctx, db, "INSERT INTO sem_tt VALUES (3, '2024-01-02 03:04:05.123456+00:00', '2024-01-02 03:04:05.123456+00:00', '2024-01-02 03:04:05.000000+00:00')")
 		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 3 AND toUnixTimestamp64Micro(d) = 1704164645123456 AND toUnixTimestamp64Micro(dz) = 1704164645123456"); n != 1 {
-			t.Fatal("the function channel must land the same instant in both columns")
+			t.Fatal("offset text must land the same instant in both columns")
 		}
-		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 3 AND d = " + fn + " AND dz = " + fn); n != 1 {
-			t.Fatal("function-channel equality must match on both columns")
+		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 3 AND d = '2024-01-02 03:04:05.123456+00:00' AND dz = '2024-01-02 03:04:05.123456+00:00'"); n != 1 {
+			t.Fatal("equality against offset text must match on both columns")
 		}
-		major, _ := chServerVersion(t, ctx, db)
-		if major >= 26 {
-			if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 3 AND d = '2024-01-02 03:04:05.123456+00:00'"); n != 1 {
-				t.Fatal("offset-text comparison must match on 26.x")
-			}
-		} else {
-			if _, err := rio.Raw[uint64]("SELECT count(*) FROM sem_tt WHERE d = '2024-01-02 03:04:05.123456+00:00'").First(ctx, db); err == nil {
-				t.Fatal("offset-text comparison passed before 26.x — the function inlining may be simplifiable")
-			}
-			if _, err := rio.Exec(ctx, db, "INSERT INTO sem_tt VALUES (30, '2024-01-02 03:04:05.123456+00:00', '2024-01-02 03:04:05.123456+00:00', '2024-01-02 03:04:05')"); err == nil {
-				t.Fatal("offset-text INSERT parsed before 26.x — the function inlining may be simplifiable")
-			}
+		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 3 AND ds = '2024-01-02 03:04:05.000000+00:00'"); n != 1 {
+			t.Fatal("a seconds column must compare against zero-fraction offset text")
 		}
-		// Negative epoch (pre-1970) through the function channel: exact from
-		// 26.x. Before that, the server parser flips the fractional part's
-		// sign — second − fraction instead of second + fraction — so .123456
-		// lands as the previous second's .876544. Pinned so drift inside 25.x
-		// is caught; the clickhouse module README documents the defect, and
-		// rio does not compensate (a fixed server would then be wrong the
-		// other way).
-		chExec(t, ctx, db, "INSERT INTO sem_tt VALUES (31, parseDateTime64BestEffort('1950-01-02 03:04:05.123456+00:00', 6, 'UTC'), "+fn+", '1970-01-02 03:04:05')")
-		wantNeg := "1950-01-02 03:04:05.123456"
-		if major < 26 {
-			wantNeg = "1950-01-02 03:04:04.876544" // 05 − 0.123456: the flipped fraction
+		chExec(t, ctx, db, "INSERT INTO sem_tt VALUES (31, '1950-01-02 03:04:05.123456+00:00', '1950-01-02 03:04:05.123456+00:00', '1970-01-02 03:04:05.000000+00:00')")
+		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 31 AND d = '1950-01-02 03:04:05.123456+00:00'"); n != 1 {
+			t.Fatal("negative-epoch offset text must round-trip")
 		}
-		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 31 AND toString(d) = '" + wantNeg + "'"); n != 1 {
-			got, _ := rio.Raw[string]("SELECT toString(d) FROM sem_tt WHERE id = 31").First(ctx, db)
-			t.Fatalf("negative-epoch parsing changed: got %v, want %s", got, wantNeg)
-		}
-		// DateTime (seconds) columns and the function channel: the VALUES
-		// section refuses to narrow the DateTime64 expression (TYPE_MISMATCH,
-		// every version), while comparisons coerce numerically — rio time
-		// arguments therefore read DateTime columns but cannot write them
-		// (README: use DateTime64 for columns rio writes).
-		if _, err := rio.Exec(ctx, db, "INSERT INTO sem_tt VALUES (32, "+fn+", "+fn+", "+fn+")"); err == nil {
-			t.Fatal("function-channel INSERT into DateTime(seconds) should TYPE_MISMATCH — if it narrows now, the README's DateTime row is stale")
-		}
-		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 3 AND ds = parseDateTime64BestEffort('2024-01-02 03:04:05.000000+00:00', 6, 'UTC')"); n != 1 {
-			t.Fatal("function-channel comparison against DateTime(seconds) must coerce")
+		// Sub-second text against a seconds column truncates silently — the
+		// same schema-responsibility class as DateTime64(3) dropping
+		// microseconds (the design memo expected a loud TYPE_MISMATCH here;
+		// 26.6 truncates instead — pin what the server actually does).
+		chExec(t, ctx, db, "INSERT INTO sem_tt VALUES (32, '2024-01-02 03:04:05.123456+00:00', '2024-01-02 03:04:05.123456+00:00', '2024-01-02 03:04:05.123456+00:00')")
+		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 32 AND toUnixTimestamp(ds) = 1704164645"); n != 1 {
+			t.Fatal("DateTime(seconds) must truncate sub-second text, not reject or shift it")
 		}
 	})
 
-	// T2: fractional epoch strings are the channel that lost — their
-	// negative range is version-dependent (26.x rejects it outright, 25.x
-	// parses it), and the server's numeric-literal path runs through Float64,
-	// losing microseconds past 2^53 (late-2299 instants). Both halves pinned.
+	// T2: fractional epoch strings work on DateTime64 but cannot express
+	// pre-1970 and break on DateTime — why they lost to offset text.
 	t.Run("T2 epoch strings are partial", func(t *testing.T) {
 		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 3 AND d = '" + epoch + "'"); n != 1 {
 			t.Fatal("epoch decimal string must compare on DateTime64")
 		}
-		neg, err := rio.Raw[uint64]("SELECT count(*) FROM sem_tt WHERE d = '-631152000.5'").First(ctx, db)
-		if major, _ := chServerVersion(t, ctx, db); major >= 26 {
-			if err == nil {
-				t.Fatal("negative epoch string parsed on 26.x — the channel trade-offs moved")
-			}
-		} else if err != nil || *neg != 0 {
-			t.Fatalf("negative epoch string must parse (to no match) before 26.x: %v", err)
+		if _, err := rio.Raw[uint64]("SELECT count(*) FROM sem_tt WHERE d = '-631152000.5'").First(ctx, db); err == nil {
+			t.Fatal("negative epoch string must fail to parse")
 		}
 	})
 
@@ -342,8 +304,8 @@ func TestClickHouseServerSemantics(t *testing.T) {
 		if !strings.HasPrefix(*hi, "2299-12-31") {
 			t.Fatalf("high clamp moved: %s", *hi)
 		}
-		// Offset-free text: parses under the basic input format on every
-		// version (T3 owns the offset-text story).
+		// Offset-free text keeps T4 about clamping only (T3 owns the
+		// offset-text story).
 		chExec(t, ctx, db, "INSERT INTO sem_tt VALUES (4, '2999-01-01 00:00:00.000000', '2024-01-02 03:04:05.123456', '2024-01-02 03:04:05')")
 		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 4 AND toString(d) LIKE '2299-12-31%'"); n != 1 {
 			t.Fatal("INSERT must clamp too (still silent server-side)")
@@ -491,19 +453,8 @@ func TestClickHouseSuite(t *testing.T) {
 	if !got.At.Equal(at.Truncate(time.Microsecond)) {
 		t.Fatalf("time round-trip drifted: wrote %v, read %v", at, got.At)
 	}
-	wantMaybe := maybe.Truncate(time.Microsecond)
-	if major, _ := chServerVersion(t, ctx, db); major < 26 {
-		// Known server defect before 26.x, every input channel: the
-		// fractional part of pre-1970 times parses with its sign flipped —
-		// second − fraction instead of second + fraction (a .5 fraction lands
-		// exactly one second low; see the clickhouse module README). Pin the
-		// defect so drift inside 25.x is caught; rio does not compensate —
-		// a fixed server would then be wrong the other way.
-		sec := wantMaybe.Truncate(time.Second)
-		wantMaybe = sec.Add(-wantMaybe.Sub(sec))
-	}
-	if got.Maybe == nil || !got.Maybe.Equal(wantMaybe) {
-		t.Fatalf("nullable pre-1970 time round-trip: got %v, want %v", got.Maybe, wantMaybe)
+	if got.Maybe == nil || !got.Maybe.Equal(maybe.Truncate(time.Microsecond)) {
+		t.Fatalf("nullable pre-1970 time round-trip: %v", got.Maybe)
 	}
 	if !got.CreatedAt.Equal(r.CreatedAt) {
 		t.Fatalf("created_at round-trip: wrote %v, read %v", r.CreatedAt, got.CreatedAt)

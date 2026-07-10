@@ -15,12 +15,8 @@ import (
 // proof that no SQL was sent. The three older dialects' goldens live in their
 // existing tests and must never move because of anything here.
 
-// chTS is testNow under chTimeFormat; chTSLit is its executed form — every
-// ClickHouse time argument inlines as an explicit parse call at execution.
-const (
-	chTS    = "2026-07-09 12:00:00.000000+00:00"
-	chTSLit = "parseDateTime64BestEffort('" + chTS + "', 6, 'UTC')"
-)
+// chTS is testNow under chTimeFormat — what every stamped column binds.
+const chTS = "2026-07-09 12:00:00.000000+00:00"
 
 // --- supported surface: golden SQL ---
 
@@ -72,12 +68,8 @@ func TestClickHouseBareOffset(t *testing.T) {
 }
 
 // Insert on ClickHouse: every column binds (the explicit ID included), no
-// RETURNING, nothing backfills — the fake's LastInsertId of 1 must not leak
-// into the struct — and the stamped time columns inline as explicit parse
-// calls at execution: the cached template stays parameterized, the executed
-// text carries the literal (comparisons on servers before 26.x reject
-// offset text through the implicit String cast; the function channel works
-// everywhere).
+// RETURNING, and nothing backfills — the fake's LastInsertId of 1 must not
+// leak into the struct.
 func TestClickHouseInsertGolden(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -89,8 +81,7 @@ func TestClickHouseInsertGolden(t *testing.T) {
 		t.Fatalf("Insert: %v", err)
 	}
 	stmt := f.loggedContaining("INSERT")[0]
-	want := "INSERT INTO `users` (`id`, `email`, `age`, `bio`, `version`, `deleted_at`, `created_at`, `updated_at`) VALUES (?, ?, ?, ?, ?, ?, " +
-		chTSLit + ", " + chTSLit + ")"
+	want := "INSERT INTO `users` (`id`, `email`, `age`, `bio`, `version`, `deleted_at`, `created_at`, `updated_at`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
 	if stmt.sql != want {
 		t.Fatalf("sql:\n got: %s\nwant: %s", stmt.sql, want)
 	}
@@ -100,63 +91,9 @@ func TestClickHouseInsertGolden(t *testing.T) {
 	if u.Version != 1 || !u.CreatedAt.Equal(normalizeTime(testNow)) {
 		t.Fatalf("client-side stamps still apply: %+v", u)
 	}
-	// The inlined time arguments are consumed; the six survivors keep their
-	// positions.
-	if len(stmt.args) != 6 {
-		t.Fatalf("inlined time args must be consumed, got %d: %#v", len(stmt.args), stmt.args)
-	}
-	if stmt.args[0] != int64(7) || stmt.args[1] != "a@x" || stmt.args[4] != int64(1) || stmt.args[5] != nil {
-		t.Fatalf("surviving args must keep their order: %#v", stmt.args)
-	}
-}
-
-// The three comparison shapes that broke on 25.8 LTS under text binding:
-// scalar comparison, IN expansion, and time args mixed among ordinary ones.
-func TestClickHouseTimeArgsInlineInQueries(t *testing.T) {
-	ctx := context.Background()
-	at := time.Date(2024, 1, 2, 3, 4, 5, 123456789, time.UTC)
-	const lit = "parseDateTime64BestEffort('2024-01-02 03:04:05.123456+00:00', 6, 'UTC')"
-
-	f := newFakeDB()
-	db := f.open(ClickHouse)
-	f.queueRows(userCols)
-	if _, err := From[User]().Where("created_at > ?", at).All(ctx, db); err != nil {
-		t.Fatalf("All: %v", err)
-	}
-	stmt := f.loggedContaining("SELECT")[0]
-	want := "SELECT `users`.`id`, `users`.`email`, `users`.`age`, `users`.`bio`, `users`.`version`, `users`.`deleted_at`, `users`.`created_at`, `users`.`updated_at` FROM `users` WHERE (created_at > " + lit + ") AND `users`.`deleted_at` IS NULL"
-	if stmt.sql != want {
-		t.Fatalf("comparison sql:\n got: %s\nwant: %s", stmt.sql, want)
-	}
-	if len(stmt.args) != 0 {
-		t.Fatalf("the time argument must be consumed: %#v", stmt.args)
-	}
-
-	// IN (?) expansion: every expanded element inlines.
-	f.queueRows(userCols)
-	if _, err := From[User]().Where("created_at IN (?)", []time.Time{at, at.Add(time.Hour)}).All(ctx, db); err != nil {
-		t.Fatalf("IN: %v", err)
-	}
-	stmt = f.loggedContaining("SELECT")[1]
-	inWant := "(created_at IN (" + lit + ", parseDateTime64BestEffort('2024-01-02 04:04:05.123456+00:00', 6, 'UTC')))"
-	if !strings.Contains(stmt.sql, inWant) {
-		t.Fatalf("IN sql:\n got: %s\nwant fragment: %s", stmt.sql, inWant)
-	}
-	if len(stmt.args) != 0 {
-		t.Fatalf("expanded time elements must be consumed: %#v", stmt.args)
-	}
-
-	// Mixed args: the time vanishes, its neighbors keep binding in order.
-	f.queueRows(userCols)
-	if _, err := From[User]().Where("age > ? AND created_at < ? AND email <> ?", 18, at, "x@y").All(ctx, db); err != nil {
-		t.Fatalf("mixed: %v", err)
-	}
-	stmt = f.loggedContaining("SELECT")[2]
-	if !strings.Contains(stmt.sql, "(age > ? AND created_at < "+lit+" AND email <> ?)") {
-		t.Fatalf("mixed sql: %s", stmt.sql)
-	}
-	if len(stmt.args) != 2 || stmt.args[0] != int64(18) || stmt.args[1] != "x@y" {
-		t.Fatalf("surviving args must stay ordered: %#v", stmt.args)
+	// Time columns bind rio's fixed-format text, offset included.
+	if stmt.args[6] != chTS || stmt.args[7] != chTS {
+		t.Fatalf("time args must bind chTimeFormat text: %#v", stmt.args)
 	}
 }
 
@@ -197,13 +134,8 @@ func TestClickHouseInsertAllChunksAt8192(t *testing.T) {
 	if len(stmts) != 2 {
 		t.Fatalf("1025 rows × 8 cols must chunk into 2 statements, got %d", len(stmts))
 	}
-	// Chunking counts the template's 8 columns; the 2 stamped time columns
-	// per row then inline at execution, leaving 6 bound values per row.
-	if len(stmts[0].args) != 1024*6 || len(stmts[1].args) != 1*6 {
+	if len(stmts[0].args) != 1024*8 || len(stmts[1].args) != 1*8 {
 		t.Fatalf("chunk sizes: %d, %d", len(stmts[0].args), len(stmts[1].args))
-	}
-	if got := strings.Count(stmts[1].sql, chTSLit); got != 2 {
-		t.Fatalf("each row's stamps must inline, tail chunk has %d literals", got)
 	}
 }
 
@@ -755,13 +687,13 @@ func TestClickHouseQuoteEscapesBackticksAndBackslashes(t *testing.T) {
 
 func TestClickHouseTimeFormatRoundTrip(t *testing.T) {
 	at := time.Date(2024, 1, 2, 3, 4, 5, 123456789, time.UTC)
-	bound := ClickHouse.bindTime(normalizeTime(at)).(chTimeText) // the inline-tagged type
-	if string(bound) != "2024-01-02 03:04:05.123456+00:00" {
+	bound := ClickHouse.bindTime(normalizeTime(at)).(string)
+	if bound != "2024-01-02 03:04:05.123456+00:00" {
 		t.Fatalf("bindTime: %s", bound)
 	}
 	// The emitted text parses back to the same instant through rio's own
 	// scan formats — a full write/read round trip stays Equal.
-	parsed, err := parseTime(string(bound), &field{column: "at"})
+	parsed, err := parseTime(bound, &field{column: "at"})
 	if err != nil {
 		t.Fatalf("parse back: %v", err)
 	}
@@ -770,7 +702,7 @@ func TestClickHouseTimeFormatRoundTrip(t *testing.T) {
 	}
 	// Zoned inputs normalize to the same UTC text.
 	zoned := at.In(time.FixedZone("CST", 8*3600))
-	if got := ClickHouse.bindTime(normalizeTime(zoned)).(chTimeText); got != bound {
+	if got := ClickHouse.bindTime(normalizeTime(zoned)).(string); got != bound {
 		t.Fatalf("zoned input must bind identical text: %s", got)
 	}
 }

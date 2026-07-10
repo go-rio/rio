@@ -245,15 +245,10 @@ func (t *Tx) spExec(ctx context.Context, stmt string) error {
 }
 
 // run executes a non-row-returning statement through the shared pipeline:
-// ClickHouse time inlining, statement cache (DB only), hooks, error
-// translation. Without hooks the event is never materialized — the hot path
-// allocates nothing here.
+// statement cache (DB only), hooks, error translation. Without hooks the
+// event is never materialized — the hot path allocates nothing here.
 func run(ctx context.Context, q Queryer, op, model, sqlText string, args []any) (sql.Result, error) {
 	cfg := q.conf()
-	sqlText, args, err := inlineTimeArgs(q.gram().d, sqlText, args)
-	if err != nil {
-		return nil, err
-	}
 	if len(cfg.hooks) == 0 {
 		res, err := execute(ctx, q, sqlText, args)
 		return res, translateErr(err, cfg, q.gram().d)
@@ -281,17 +276,12 @@ func run(ctx context.Context, q Queryer, op, model, sqlText string, args []any) 
 	return res, err
 }
 
-// runQuery executes a row-returning statement through the shared pipeline;
-// see run for the stages. The returned finish callback (nil without hooks —
-// the hot path stays allocation-free) fires AfterQuery once the rows are
-// consumed, so hooks see scan errors and a duration that includes row
-// consumption.
+// runQuery executes a row-returning statement through the shared pipeline.
+// The returned finish callback (nil without hooks — the hot path stays
+// allocation-free) fires AfterQuery once the rows are consumed, so hooks see
+// scan errors and a duration that includes row consumption.
 func runQuery(ctx context.Context, q Queryer, op, model, sqlText string, args []any) (*sql.Rows, func(error), error) {
 	cfg := q.conf()
-	sqlText, args, err := inlineTimeArgs(q.gram().d, sqlText, args)
-	if err != nil {
-		return nil, nil, err
-	}
 	if len(cfg.hooks) == 0 {
 		rows, err := query(ctx, q, sqlText, args)
 		return rows, nil, translateErr(err, cfg, q.gram().d)
