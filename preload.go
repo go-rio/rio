@@ -362,7 +362,6 @@ func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, r
 		}
 	}
 
-	// Group buffered children by owner key.
 	byKey := make(map[any][]int, buf.Len())
 	if rel.kind == relManyToMany {
 		for i, k := range bufKeys {

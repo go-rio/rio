@@ -168,8 +168,7 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 	returning := d.caps().returning
 	// The whole statement — conflict clause and RETURNING included — is a
 	// pure function of the cache key (see upsertSQL), so it renders once per
-	// grammar and shape like every other entity-CRUD statement. Arguments
-	// come from insertColumns exactly as on the Insert path: the conflict
+	// grammar and shape. Arguments come from insertColumns: the conflict
 	// assignments bind nothing.
 	sqlText, err := upsertSQL(g, p, "upsert", bits, 0, &spec, update, cacheable, func() []byte {
 		b := renderInsertHead(g, p, cols)
@@ -199,11 +198,8 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 			}
 			return b
 		}
-		// MySQL: ON DUPLICATE KEY UPDATE. The VALUES() function for referring
-		// to the would-be inserted row is deprecated, so the DoUpdate branch
-		// names that row with an alias instead — 8.0.19+ syntax that MariaDB
-		// and older MySQL reject. DoNothing's no-op assignment never
-		// references the new row, so it renders alias-free and stays portable.
+		// The row alias is DoUpdate-only — 8.0.19+ syntax that MariaDB and
+		// older MySQL reject; DoNothing's no-op assignment renders alias-free.
 		if !spec.doNothing {
 			b = appendMySQLUpsertAlias(b)
 		}

@@ -102,8 +102,7 @@ func (r *loopNativeRows) Scan(dest ...any) error {
 func (r *loopNativeRows) Err() error { return nil }
 func (r *loopNativeRows) Close()     {}
 
-// perfUser is the entity-CRUD measurement model: five plain columns, the
-// shape of the audit's isolated fake-driver runs.
+// perfUser is the entity-CRUD measurement model: five plain columns.
 type perfUser struct {
 	ID        int64
 	Email     string
@@ -326,10 +325,8 @@ func TestAllocDiagnostics(t *testing.T) {
 // TestCRUDAllocBudget pins DESIGN.md's allocation contract: entity CRUD pays
 // at most 2 extra allocations per call over a hand-written database/sql
 // equivalent on the same driver, and Upsert at most its conflict-shape
-// machinery on top. Budgets are the values measured when this test was
-// written — a regression fails loudly; an improvement is the cue to tighten
-// them. Deltas, not absolute counts: database/sql's own allocations shift
-// across Go releases and cancel out of the difference.
+// machinery on top. Deltas, not absolute counts: database/sql's own
+// allocations shift across Go releases and cancel out of the difference.
 func TestCRUDAllocBudget(t *testing.T) {
 	budgets := map[string]float64{
 		"find/pg":           1,

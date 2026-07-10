@@ -67,8 +67,7 @@ func sinkDispatch(c *colScanner, v any) error {
 // TestNativeCellSinkEquivalence pins the SPI's core promise over the full
 // kind × value matrix: SetX(v) behaves exactly like Scan(v) — same stored
 // value (including pointer cells and NULL rules), same success/failure, same
-// error text. The two paths share their store helpers, so this is the test
-// that would catch anyone unsharing them.
+// error text — because both paths share their store helpers.
 func TestNativeCellSinkEquivalence(t *testing.T) {
 	p, err := planOf[sinkWide]()
 	if err != nil {
@@ -181,8 +180,7 @@ func TestNativeCellScanKinds(t *testing.T) {
 		"T": NativeKindTime, "Del": NativeKindTime,
 		"J": NativeKindJSON, "JP": NativeKindJSON,
 		"NS": NativeKindScanner,
-		// Pointer fields report their element's kind: the sinks own the cell
-		// allocation, so the adapter dispatches them like the plain kinds.
+		// Pointer fields report their element's kind (see the NativeCell godoc).
 		"PI8": NativeKindInt, "PU": NativeKindUint, "PF": NativeKindFloat, "PB": NativeKindBool,
 		"PS": NativeKindString, "PBs": NativeKindBytes, "PT": NativeKindTime,
 	}
@@ -198,8 +196,7 @@ func TestNativeCellScanKinds(t *testing.T) {
 	}
 }
 
-// The NULL rules through SetNull, spelled out (the matrix covers them too;
-// these name the contracts).
+// SetNull's per-kind NULL rules, each named as an explicit contract.
 func TestNativeCellSetNullRules(t *testing.T) {
 	p, err := planOf[sinkWide]()
 	if err != nil {

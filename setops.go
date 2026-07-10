@@ -44,8 +44,8 @@ func checkSetOpShape(op string, s *queryState) error {
 // UpdateAll updates every matching row in one statement, returning the
 // affected count. It refuses to run without conditions unless AllRows() was
 // called. UpdatedAt is maintained automatically (override by assigning it
-// yourself). Set-based writes bypass the version column — like every bulk
-// path, and documented as such: optimistic locking guards entity Update.
+// yourself). Set-based writes bypass the version column; optimistic locking
+// guards entity Update.
 func (q Query[T]) UpdateAll(ctx context.Context, db Queryer, set Set) (int64, error) {
 	if len(set) == 0 {
 		return 0, fmt.Errorf("rio: UpdateAll with an empty Set")
@@ -218,9 +218,8 @@ func (q Query[T]) forceDeleteAll(ctx context.Context, db Queryer, p *plan) (int6
 }
 
 // RestoreAll clears the deletion timestamp on every matching soft-deleted row
-// — the set-based peer of the entity-form Restore, named like UpdateAll and
-// DeleteAll. Conditions are required (or AllRows); combine with OnlyTrashed as
-// needed.
+// — the set-based peer of the entity-form Restore. Conditions are required
+// (or AllRows); combine with OnlyTrashed as needed.
 func (q Query[T]) RestoreAll(ctx context.Context, db Queryer) (int64, error) {
 	p, err := planOf[T]()
 	if err != nil {

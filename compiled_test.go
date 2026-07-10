@@ -135,11 +135,9 @@ func TestCompiledFirstAndCount(t *testing.T) {
 	}
 }
 
-// AUDIT M3 regression: Compile's placeholder accounting only looked at
-// Where/Having, so a ? in OrderBy/GroupBy/Join slipped the inline/exec
-// classification — MustCompile did not panic and every execution failed (or
-// the arity contract split between All and Count). Those clauses have no
-// argument channel, so a placeholder there is now a structural error.
+// AUDIT M3 regression: OrderBy/GroupBy/Join have no argument channel, so a ?
+// there is a structural error, not a silent split of the All/Count arity or
+// a failure deferred to execution.
 func TestCompileRejectsPlaceholdersInNoArgClauses(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -168,7 +166,6 @@ func TestCompileRejectsPlaceholdersInNoArgClauses(t *testing.T) {
 
 // Placeholder lookalikes in those clauses stay legal: a ? inside a string
 // literal and the ?? escape are not placeholders under any dialect's lexer.
-// With the holes closed, All and Count agree on the exec arity again.
 func TestCompileAllowsPlaceholderLookalikesInOrderBy(t *testing.T) {
 	ctx := context.Background()
 	q := MustCompile[User](

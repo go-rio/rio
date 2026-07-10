@@ -68,9 +68,7 @@ func WriteColumns(w io.Writer, pkgName string, models ...any) error {
 		if p.tableOverride != "" {
 			table = p.tableOverride
 		}
-		// Shadowing resolution keeps plan field names unique (same-depth
-		// duplicates are refused, deeper ones dropped), so this is defense
-		// in depth for the generated struct's compilability.
+		// Shadowing resolution already keeps field names unique; this re-checks for the generated struct's sake.
 		seen := make(map[string]string, len(p.fields))
 		for _, f := range p.fields {
 			if prev, dup := seen[f.name]; dup {

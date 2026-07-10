@@ -315,10 +315,9 @@ func (p *plan) addFields(t reflect.Type) error {
 		if !opts.noStamp && !opts.softDelete && !opts.version &&
 			(sf.Type == timeType || sf.Type == timePtrType) {
 			// The CreatedAt/UpdatedAt convention is name-based, so an explicit
-			// role tag wins: a field a user deliberately tagged softdelete is
-			// not also the updated_at stamp just because it is named UpdatedAt.
-			// *time.Time is accepted like softdelete — setTime/stampForInsert
-			// maintain the pointer form, so it must not silently go unstamped.
+			// role tag wins. *time.Time is accepted like softdelete —
+			// setTime/stampForInsert maintain the pointer form, so it must
+			// not silently go unstamped.
 			switch sf.Name {
 			case "CreatedAt":
 				f.isCreated = true
@@ -382,10 +381,9 @@ func (p *plan) classify() []error {
 				reflect.Uint, reflect.Uint32, reflect.Uint64:
 				// wide enough: version = version + 1 forever
 			case reflect.Int8, reflect.Int16, reflect.Uint8, reflect.Uint16:
-				// The database wraps the column (or errors) at 127/255/32767/…
-				// while the struct keeps counting — every later optimistic
-				// Update then misses and reports ErrStaleObject forever. A
-				// plan-time refusal beats that runtime dead end.
+				// The database wraps the column at 127/255/32767/… while the
+				// struct keeps counting, so every later optimistic Update
+				// misses and reports ErrStaleObject.
 				errs = append(errs, fmt.Errorf("version field %s is %s, too narrow to count updates (wraps at its maximum and then reports ErrStaleObject forever); use int64", f.name, f.typ))
 			default:
 				errs = append(errs, fmt.Errorf("version field %s must be an integer type, got %s", f.name, f.typ))

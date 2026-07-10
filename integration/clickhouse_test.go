@@ -469,7 +469,6 @@ func TestClickHouseSuite(t *testing.T) {
 		t.Fatalf("pre-1970 range through args: n=%d err=%v", n, err)
 	}
 
-	// InsertAll + reload-Equal.
 	batch := []Reading{
 		{ID: 2, At: at.Add(time.Hour)},
 		{ID: 3, At: at.Add(2 * time.Hour)},

@@ -151,14 +151,11 @@ type colScanner struct {
 
 	// scanPtr cell chunk: non-NULL *T cells come out of a shared per-column
 	// backing array (1, 4, 16, 64, then 128-cell chunks) instead of one
-	// reflect.New per cell — a single row still pays exactly one minimal
-	// allocation, a hundred rows pay five per column. Each cell remains an
-	// independent slot (rescans hand out a fresh one, writes never alias);
-	// the one observable consequence is lifetime: a surviving *T keeps its
-	// chunk — at most 128 cells, never the whole column — alive. chunk is an
-	// unsafe.Pointer field, so the GC sees the backing array while cells are
-	// being handed out; afterwards the published pointers themselves keep it
-	// alive.
+	// reflect.New per cell. Each cell stays an independent slot (rescans hand
+	// out a fresh one, writes never alias); a surviving *T keeps its chunk —
+	// at most 128 cells, never the whole column — alive. chunk is an
+	// unsafe.Pointer so the GC sees the backing array while cells are handed
+	// out; afterwards the published pointers keep it alive.
 	chunk unsafe.Pointer
 	used  int // cells handed out of the current chunk
 	csize int // current chunk capacity, in cells
@@ -189,12 +186,11 @@ func (s *colScanner) Scan(src any) error {
 	f := s.f
 	p := unsafe.Add(s.base, f.offset)
 
-	// publish is the scanPtr hand-off: the case below allocates the element
-	// cell, retargets p at it, swaps in the plan-time elem codec, and jumps
-	// back — one switch body serves fields and pointer elements without a
-	// per-cell function call on the plain path. The field slot is written
-	// only after the element scanned cleanly, so a conversion error leaves
-	// the struct untouched, exactly like every other kind.
+	// publish is the scanPtr hand-off: the scanPtr case allocates the element
+	// cell and re-dispatches on the plan-time elem codec through this one
+	// switch body, avoiding a per-cell function call on the plain path. The
+	// field slot is written only after the element scanned cleanly, so a
+	// conversion error leaves the struct untouched.
 	kind, bits := f.code.kind, f.code.bits
 	var publish unsafe.Pointer
 
@@ -271,11 +267,8 @@ scan:
 		return s.slowScanner(src)
 	case scanPtr:
 		// The element was classified at plan time (codecFor): take a fresh
-		// cell from the column's chunk — the allocation *T semantics
-		// requires, amortized — and re-dispatch on the elem codec, instead
-		// of rebuilding field/colScanner scaffolding and re-deriving the
-		// codec on every row. basicCodec never yields scanPtr, so this jump
-		// cannot recurse.
+		// cell from the column's chunk and re-dispatch on the elem codec.
+		// basicCodec never yields scanPtr, so this jump cannot recurse.
 		publish, p = p, s.nextCell()
 		kind, bits = f.code.elemKind, f.code.elemBits
 		goto scan
@@ -323,12 +316,12 @@ func (s *colScanner) scanNull() error {
 		f.column, f.name, f.typ)
 }
 
-// The store helpers below write one decoded value into a field slot, with
-// the width and overflow rules attached. Scan (fed by the src converters)
-// and the NativeCell typed sinks both run these same functions, so the two
-// channels' storage semantics are equal by construction, not by test alone.
-// Error construction lives in out-of-line funcs to keep the helpers within
-// the inlining budget — the hot path stays call-free, as before the split.
+// The store helpers below write one decoded value into a field slot with the
+// width and overflow rules attached. Scan (via the src converters) and the
+// NativeCell typed sinks run these same functions, so the two channels'
+// storage semantics cannot drift. Error construction lives in out-of-line
+// funcs to keep the helpers within the inlining budget — the hot path stays
+// call-free.
 
 func storeInt(f *field, p unsafe.Pointer, bits int, n int64) error {
 	if bits == 64 { // int64 and int, the dominant widths: stays inlined
@@ -464,20 +457,18 @@ func convErr(f *field, src any) error {
 
 // --- NativeCell: the typed sinks of the native channel ---
 //
-// Each Set method is its Scan(any) equivalent with the interface boxing
-// removed: SetInt64(v) ≡ Scan(int64(v)), SetNull() ≡ Scan(nil) — the same
-// conversion rules through the same store helpers, so equivalence holds by
-// construction. Only the arms a native driver actually routes (matching kind,
-// or the text forms of the numeric kinds) are boxing-free; mismatched kinds
-// and Scanner fields fall back through boxed slow paths, exactly the calls
-// that are slow or failing on the stdlib channel too.
+// The typed Set methods mirror Scan without the interface boxing (see the
+// NativeCell godoc in native.go). Only the arms a native driver actually
+// routes — matching kind, or the text forms of the numeric kinds — are
+// boxing-free; mismatched kinds and Scanner fields fall back through the
+// boxed slow paths.
 
 var _ NativeCell = (*colScanner)(nil)
 
-// ScanKind reports the cell's plan-time scan strategy so a NativeRows
-// implementation can pick its typed decode path per column. Pointer fields
-// report the element's kind: the sinks allocate and publish the *T cell
-// internally, and SetNull stores nil — pointer-ness never crosses the SPI.
+// ScanKind reports the cell's plan-time scan strategy (see NativeCell).
+// Pointer fields report the element's kind: the sinks allocate and publish
+// the *T cell internally and SetNull stores nil, so pointer-ness never
+// crosses the SPI.
 func (s *colScanner) ScanKind() NativeScanKind {
 	k := s.f.code.kind
 	if k == scanPtr {
@@ -687,10 +678,9 @@ func (s *colScanner) SetTime(v time.Time) error {
 func (s *colScanner) SetNull() error { return s.scanNull() }
 
 // The src* converters accept, beyond database/sql's canonical driver values,
-// the natively typed values clickhouse-go delivers (it bypasses the canonical
+// the natively typed values clickhouse-go delivers: it bypasses the canonical
 // set via its NamedValueChecker, so UInt64 columns arrive as uint64, Int32 as
-// int32, Float32 as float32, and so on). Pure additions: the canonical arms
-// are untouched, so the other drivers' behavior cannot move.
+// int32, Float32 as float32, and so on.
 
 func srcInt(src any, f *field) (int64, error) {
 	switch v := src.(type) {
@@ -1254,10 +1244,9 @@ func bindArg(f *field, v reflect.Value, b *binder) (any, error) {
 		v = v.Elem()
 	}
 	// Mirror normalizeArgs: left to the driver's Valuer path, the inner time
-	// would skip microsecond truncation and rio's SQLite text encoding —
-	// the same field would then store differently under Insert and Upsert.
-	// As on the fast path, a changed normalization is written back so the
-	// struct holds exactly what the database stores.
+	// would skip microsecond truncation and rio's SQLite text encoding, so the
+	// same field would store differently under Insert and Upsert. The
+	// normalized form is written back, as on the fast path.
 	if v.Type() == nullTimeType {
 		if nv := v.Interface().(sql.NullTime); nv.Valid {
 			nt := normalizeTime(nv.Time)
@@ -1304,7 +1293,7 @@ func bindArg(f *field, v reflect.Value, b *binder) (any, error) {
 		}
 	}
 	if b.d.name() == "clickhouse" && v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-		// Byte payloads bind as strings on ClickHouse, as on the fast path.
+		// Byte payloads bind as strings on ClickHouse.
 		return string(v.Bytes()), nil
 	}
 	return v.Interface(), nil

@@ -13,9 +13,8 @@ import (
 // implements these small, std-types-only interfaces around its native client
 // (pgxpool) and hands them to NewNative; every rio semantic above the engine
 // seam — rendering, hooks, error translation, scanning rules, savepoints —
-// stays the channel-independent core. Application code never touches this
-// surface: construct through the driver module (postgres.OpenNative) and keep
-// writing the same rio calls.
+// stays the channel-independent core. Application code constructs through the
+// driver module (postgres.OpenNative), never this surface.
 
 // NativeDB is a driver-native execution channel: what rio needs from a driver
 // pool. Driver-module SPI, not application API.
@@ -100,10 +99,10 @@ const (
 // Every Set method is exactly Scan with the interface boxing removed:
 // SetInt64(v) behaves like Scan(int64(v)), SetNull like Scan(nil), and so on
 // — same conversion rules, same overflow and NULL handling, same error
-// shapes. The equivalence holds by construction: both paths run the same
-// store helpers (scan.go). SetBytes never retains v — driver memory is
-// copied where it is stored. SetString stores its argument as-is, so hand
-// over an owned string, never an unsafe view of driver memory.
+// shapes, because both paths run the same store helpers (scan.go). SetBytes
+// never retains v — driver memory is copied where it is stored. SetString
+// stores its argument as-is, so hand over an owned string, never an unsafe
+// view of driver memory.
 //
 // ScanKind reports the cell's strategy. Pointer fields report their
 // element's kind: the sinks allocate and publish the *T cell internally and
@@ -161,9 +160,7 @@ func NewNative(nc NativeConfig, dialect Dialect, opts ...Option) *DB {
 		opt(cfg)
 	}
 	if cfg.stmtCache {
-		// Construction-time misuse, as in New: there is no configuration
-		// under which a native channel serves database/sql prepared
-		// statements — the driver owns statement caching there.
+		// Construction-time misuse, as in New. (rest duplicates the panic string below)
 		panic("rio: WithStmtCache is not supported on the native channel (no database/sql prepared statements exist here); statement caching belongs to the driver — with pgx, tune the DSN parameter default_query_exec_mode (cache_statement is already its default)")
 	}
 	return &DB{
@@ -190,7 +187,7 @@ func (e *nativeEngine) exec(ctx context.Context, sqlText string, args []any) (sq
 	// driver.RowsAffected is the exact result pgx's database/sql adapter
 	// returns for an Exec: RowsAffected reports the command tag's count and
 	// never fails, LastInsertId returns the stdlib's own "not supported"
-	// error — the stdlib channel's behavior, verbatim by construction.
+	// error.
 	return driver.RowsAffected(n), nil
 }
 
@@ -225,8 +222,7 @@ func (e *nativeEngine) close() error {
 
 // nativeTxEngine executes on one NativeTx. Rollback passes the context it is
 // given straight through: rio's cleanup callers (finishTx, spExec) already
-// decouple cancellation — the caller-owned WithoutCancel discipline the
-// engine seam documents.
+// decouple cancellation with WithoutCancel.
 type nativeTxEngine struct {
 	nt NativeTx
 }

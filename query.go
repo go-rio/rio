@@ -807,14 +807,13 @@ func renderExists(b []byte, args []any, g *grammar, owner *plan, ownerRef string
 	return append(b, ')'), args, nil
 }
 
-// finishSQL runs the rebind pipeline: IN expansion first, placeholder
-// renumbering second, in one lexer pass — then checks the dialect's bind
-// budget and normalizes arguments.
+// finishSQL runs the rebind pipeline (IN expansion then placeholder
+// renumbering in one lexer pass), then checks the dialect's bind budget and
+// normalizes arguments.
 //
 // finishSQL takes ownership of b: the returned SQL may alias its memory
 // (rebind returns its input unchanged when nothing rewrites), so the caller
-// must not read or append to b afterwards. Every call site builds b locally
-// and drops it at this call — keep it that way.
+// must not read or append to b afterwards.
 func finishSQL(d Dialect, b []byte, args []any) (string, []any, error) {
 	return finishSQLText(d, byteString(b), args)
 }

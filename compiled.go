@@ -86,7 +86,7 @@ func Compile[T any](q Query[T]) (*Compiled[T], error) {
 	c := &Compiled[T]{q: q}
 	switch {
 	case inlineArgs == 0 && holes == 0:
-		c.inline = true // constant query
+		c.inline = true
 	case inlineArgs == 0:
 		if hasArgsInHasConds(&q.s) {
 			return nil, fmt.Errorf("rio: Compile[%s]: WhereHas arguments are inline and cannot mix with exec-time parameters",

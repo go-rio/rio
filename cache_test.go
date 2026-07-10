@@ -24,7 +24,7 @@ func mkChunkRows(n int) []chunkRow {
 }
 
 // batchCrudEntries counts grammar.crud entries keyed with a VALUES tuple
-// count — the dimension that used to grow with every distinct tail length.
+// count — the axis the cache key must bound.
 func batchCrudEntries(g *grammar) int {
 	n := 0
 	g.crud.Range(func(k, _ any) bool {

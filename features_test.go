@@ -174,7 +174,6 @@ func TestStmtCacheEvictionClosesStatement(t *testing.T) {
 		t.Fatalf("evicting must close exactly the LRU statement, closed: %v", closed)
 	}
 
-	// Resident statements keep serving without re-preparing…
 	f.queueRows(userCols)
 	if _, err := From[User]().Where("b = ?", 1).All(ctx, db); err != nil {
 		t.Fatal(err)
@@ -182,7 +181,6 @@ func TestStmtCacheEvictionClosesStatement(t *testing.T) {
 	if len(f.prepped) != 3 {
 		t.Fatalf("cache hit must not re-prepare: %v", f.prepped)
 	}
-	// …and re-requesting the evicted shape prepares anew, evicting the new LRU.
 	f.queueRows(userCols)
 	if _, err := From[User]().Where("a = ?", 1).All(ctx, db); err != nil {
 		t.Fatal(err)
@@ -952,7 +950,7 @@ func TestCompiledRejectsParamedWhereHas(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "WhereHas") {
 		t.Fatalf("exec-mode compile with paramed WhereHas must be refused: %v", err)
 	}
-	// Fully inline compiles fine.
+	// Fully inline WhereHas compiles.
 	if _, err := Compile[User](From[User]().Where("age > ?", 1).WhereHas("Posts", RelWhere("title = ?", "x"))); err != nil {
 		t.Fatalf("inline compile: %v", err)
 	}
@@ -1198,8 +1196,7 @@ func TestWriteColumns(t *testing.T) {
 
 // Sync converges by reading the existing join rows and diffing in memory
 // (AUDIT M14: a NOT IN over the full id set breaks at the bind limit, and
-// chunking a NOT IN would delete every other chunk's ids). Existing {1,2,3}
-// against target {2,3,4} must delete exactly 1 and insert exactly 4.
+// chunking a NOT IN would delete every other chunk's ids).
 func TestSyncRelation(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1334,10 +1331,8 @@ func TestSyncRelationLocksOwner(t *testing.T) {
 	}
 }
 
-// Codex v0.3 review: flattened embedded structs with same-named fields would
-// generate uncompilable column structs. The check has since moved down into
-// the plan itself (same-depth embedded names are ambiguous in Go and refused
-// for every caller, not just codegen); WriteColumns surfaces that error.
+// Same-depth embedded fields with the same name are ambiguous in Go and
+// refused for every caller; WriteColumns surfaces that plan error.
 func TestWriteColumnsRefusesDuplicateFieldNames(t *testing.T) {
 	type Meta struct {
 		ID int64 `rio:"meta_id,pk,noautoincr"`
@@ -1914,10 +1909,8 @@ func TestEmbeddedUnexportedTypeFlattens(t *testing.T) {
 	}
 }
 
-// The whitelist-order fix must hold under concurrency: the map-iteration
-// order that originally triggered the miswrite is nondeterministic, so hammer
-// one handle with randomized column orders and assert every statement binds
-// its values into the right columns.
+// Map-iteration order is nondeterministic, so concurrent whitelisted Updates
+// with differing column orders must still bind each value to its own column.
 func TestConcurrentUpdateWhitelistOrder(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -2038,10 +2031,8 @@ func TestPointerTimestampsStamped(t *testing.T) {
 	}
 }
 
-// An outer CreatedAt and an embedded, renamed CreatedAt used to race for the
-// stamp role. Under Go shadowing semantics the outer field wins and the
-// embedded one does not map at all — exactly what a Go selector (and
-// encoding/json) resolves to; only same-depth duplicates are refused.
+// Under Go shadowing the outer CreatedAt wins the stamp role and the embedded,
+// renamed one does not map at all; only same-depth duplicates are refused.
 type DupCreatedInner struct {
 	CreatedAt time.Time `rio:"made_at"`
 }
@@ -2352,11 +2343,9 @@ func TestBigUintDialectBinding(t *testing.T) {
 
 // --- pre-release audit (fable multi-lens) plan-domain regressions ---
 
-// The ID primary-key convention must survive role-neutral tags: a rename,
+// The ID primary-key convention survives role-neutral tags: a rename,
 // omitzero, or noautoincr does not change what the field is. Only a tag that
-// assigns an incompatible role, or an explicit pk elsewhere, opts out. The
-// old rule ("any tag cancels the convention") silently produced no-PK models
-// and wrote literal 0 into renamed PK columns.
+// assigns an incompatible role, or an explicit pk elsewhere, opts out.
 type RenamedID struct {
 	ID   int64 `rio:"gid"`
 	Name string
@@ -2543,10 +2532,9 @@ func TestUpdateWhitelistRefusesSoftDeleteColumn(t *testing.T) {
 	}
 }
 
-// Flattening must honor Go's shadowing semantics: the shallowest of two
-// same-named fields wins, even when it is excluded with rio:"-" or renamed.
-// The old plan silently mapped the original column to the shadowed embedded
-// field — a field d.Notes can never reach — splitting reads and writes.
+// Flattening honors Go's shadowing semantics: the shallowest of two same-named
+// fields wins even when excluded with rio:"-" or renamed; the shadowed
+// embedded field must not map.
 type NoteBase struct {
 	Notes string
 }
@@ -2646,11 +2634,9 @@ func TestUnexportedEmbeddedColumnRefusedAtPlanTime(t *testing.T) {
 
 // --- pre-release audit (fable multi-lens) write-domain regressions ---
 
-// Audit: a zero omitzero column is absent from the INSERT column list, yet
-// the default conflict update set still rendered `note = excluded.note`; a
-// column missing from the INSERT list makes excluded.note the column's DB
-// DEFAULT (NULL without one), so upserting onto an existing row silently
-// reset its data.
+// A zero omitzero column is skipped from the INSERT list, so excluded."note"
+// would resolve to the column's DB DEFAULT (NULL without one) and silently
+// reset an existing row's data on conflict — it stays out of the update set.
 type Contact struct {
 	ID    int64
 	Email string
@@ -2734,10 +2720,9 @@ func TestUpsertAllBindsZeroOmitzeroColumns(t *testing.T) {
 	}
 }
 
-// Audit: the conflict branch renders updated_at = excluded.updated_at, but
-// stampForInsert fills stamps only when zero — a loaded entity carried its
-// old UpdatedAt through the upsert and the surviving row kept a stale stamp,
-// while entity Update stamps unconditionally.
+// The conflict branch must refresh updated_at to this call's clock: a loaded
+// entity's stale UpdatedAt must not survive the upsert, matching how entity
+// Update stamps unconditionally.
 func TestUpsertConflictPathRefreshesUpdatedAt(t *testing.T) {
 	ctx := context.Background()
 	stale := testNow.Add(-24 * time.Hour)
@@ -2829,7 +2814,6 @@ func TestWritesNormalizeTimeFieldsInPlace(t *testing.T) {
 		t.Fatalf("struct and bound value must agree: %v vs %v", m.StartAt, bound)
 	}
 
-	// Update binds through the same path.
 	m.StartAt = start
 	f.queueExec(0, 1)
 	if err := Update(ctx, db, m, "start_at"); err != nil {
@@ -3031,10 +3015,9 @@ type encValVal string
 func (encValVal) Scan(any) error                 { return nil }
 func (e encValVal) Value() (driver.Value, error) { return "ENC:" + string(e), nil }
 
-// #5, shape 3: value-receiver Scanner + pointer-receiver Valuer — the shape
-// whose Value() the old codec never ran (the Scanner branch returned before
-// Valuer detection, and binding the bare value leaves Value() out of the
-// method set database/sql consults).
+// #5, shape 3: value-receiver Scanner + pointer-receiver Valuer — binding the
+// bare value leaves Value() out of the method set database/sql consults, so
+// the pointer must be bound for Value() to run.
 type encValPtr string
 
 func (encValPtr) Scan(any) error                  { return nil }

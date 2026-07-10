@@ -7,10 +7,9 @@ import (
 
 // engine is the execution channel behind a Queryer. Everything above this
 // seam — rendering, hooks, error translation, scanning — is
-// channel-independent; an engine only receives fully rendered, dialect-form
-// SQL and returns results. database/sql is the one implementation today;
-// the seam exists so a driver-native channel can slot in without moving a
-// single semantic.
+// channel-independent: an engine only receives fully rendered, dialect-form
+// SQL and returns results, so the database/sql and driver-native channels
+// share every semantic above the seam.
 type engine interface {
 	exec(ctx context.Context, sqlText string, args []any) (sql.Result, error)
 	query(ctx context.Context, sqlText string, args []any) (rows, error)

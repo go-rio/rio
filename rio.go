@@ -49,9 +49,7 @@ func New(db *sql.DB, dialect Dialect, opts ...Option) *DB {
 		opt(cfg)
 	}
 	if cfg.stmtCache && !dialect.caps().stmtPrepare {
-		// Construction-time misuse, like a nil db: clickhouse-go implements
-		// Prepare only for INSERT batching, so every cached SELECT would fail
-		// on first use — there is no configuration under which this works.
+		// Construction-time misuse, like a nil db: no configuration makes this work, so panic.
 		panic("rio: WithStmtCache is not supported on " + dialect.name() +
 			" (clickhouse-go implements Prepare only for INSERT batching; a prepared SELECT fails on first use)")
 	}
@@ -150,9 +148,8 @@ func (d *DB) finishTx(ctx context.Context, te txEngine, cause error) error {
 }
 
 // observe wraps transaction-control statements with hooks and error
-// translation; without hooks it is a plain call plus translation. COMMIT in
-// particular must translate: deferred constraints surface their violations
-// at commit time.
+// translation. COMMIT in particular must translate: deferred constraints
+// surface their violations at commit time.
 func observe(ctx context.Context, cfg *config, d Dialect, op, sqlText string, fn func() error) error {
 	if len(cfg.hooks) == 0 {
 		return translateErr(fn(), cfg, d)
@@ -180,9 +177,8 @@ type Tx struct {
 }
 
 // Unwrap returns the underlying *sql.Tx — and nil on the native channel,
-// which has no *sql.Tx to give (the one Unwrap the native channel cannot
-// keep). Use the driver module's typed accessor there: postgres.TxOf returns
-// the pgx.Tx this transaction runs on.
+// which has no *sql.Tx to give. Use the driver module's typed accessor
+// there: postgres.TxOf returns the pgx.Tx this transaction runs on.
 func (t *Tx) Unwrap() *sql.Tx { return t.tx }
 
 // NativeTx returns the NativeTx value the native channel runs this
@@ -269,11 +265,9 @@ func run(ctx context.Context, q Queryer, op, model, sqlText string, args []any) 
 		if n, aerr := res.RowsAffected(); aerr == nil {
 			rows = n
 		} else {
-			// The write-path callers all consult RowsAffected themselves and
-			// will surface this same failure; the hook must not record the
-			// statement as a success the caller then reports as an error.
-			// run's own return stays (res, nil): which errors abort the call
-			// is the caller's contract, not the observer's.
+			// Record the failure for the hook so it never logs a success, but
+			// run still returns (res, nil): the write-path callers re-check
+			// RowsAffected and decide which errors abort.
 			hookErr = aerr
 		}
 	}

@@ -572,7 +572,7 @@ func runHardening(t *testing.T, db *rio.DB, dialect string) {
 
 	// A relation keyed by a binary column ([]byte PK/FK) must preload: the
 	// key binds as the original bytes, not a stringified map key that would
-	// miss a BLOB/BYTEA column (round-2 audit found this silently empty).
+	// miss a BLOB/BYTEA column.
 	for _, ddl := range binKeyDDL[dialect] {
 		if _, err := rio.Exec(ctx, db, ddl); err != nil {
 			t.Fatalf("bin-key ddl %q: %v", ddl, err)
@@ -593,10 +593,10 @@ func runHardening(t *testing.T, db *rio.DB, dialect string) {
 		t.Fatalf("[]byte-keyed preload lost children: %+v", bps)
 	}
 
-	// Codex audit #1: a savepoint whose inner context died must still roll
-	// back — its ROLLBACK TO runs on a cancellation-decoupled context, so the
-	// inner insert cannot silently survive into the outer commit when the
-	// caller swallows the inner error.
+	// A savepoint whose inner context died must still roll back — its ROLLBACK
+	// TO runs on a cancellation-decoupled context, so the inner insert cannot
+	// silently survive into the outer commit when the caller swallows the inner
+	// error.
 	spRow := AllDefault{Note: "sp-leak"}
 	err = db.Tx(ctx, func(tx *rio.Tx) error {
 		inner, cancel := context.WithCancel(ctx)
