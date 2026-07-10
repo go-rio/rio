@@ -6,15 +6,18 @@
 [![Test](https://github.com/go-rio/rio/actions/workflows/test.yml/badge.svg)](https://github.com/go-rio/rio/actions/workflows/test.yml)
 [![License](https://img.shields.io/github/license/go-rio/rio)](https://opensource.org/license/MIT)
 
-**The zero-surprise ORM for Go.** Generic, connection-free query values;
-writes that do exactly what they say; relations that fail loudly instead of
-lazily; and the speed to have nothing to hide — faster than GORM everywhere,
-within arm's reach of hand-written `database/sql`.
+Generic ORM for Go. Query values carry no connection; writes are explicit;
+relations are typed and never lazy-load. Faster than GORM; close to
+hand-written `database/sql`.
 
 rio's core has **zero dependencies**. Drivers are separate modules:
-[go-rio/postgres](https://github.com/go-rio/postgres) (pgx),
-[go-rio/mysql](https://github.com/go-rio/mysql) (go-sql-driver),
-[go-rio/sqlite](https://github.com/go-rio/sqlite) (modernc, pure Go).
+
+| Module | Driver |
+|---|---|
+| [go-rio/postgres](https://github.com/go-rio/postgres) | pgx |
+| [go-rio/mysql](https://github.com/go-rio/mysql) | go-sql-driver |
+| [go-rio/sqlite](https://github.com/go-rio/sqlite) | modernc, pure Go |
+| [go-rio/clickhouse](https://github.com/go-rio/clickhouse) | clickhouse-go v2 |
 
 ```go
 db, _ := postgres.Open(dsn)
@@ -28,38 +31,20 @@ users, err := rio.From[User]().
 
 ## Why rio
 
-Twenty years of ORM evolution — Rails, Laravel, Django, Hibernate, SQLAlchemy,
-EF Core, Ecto, Prisma — converged on one lesson: **implicit magic loses to
-explicit declaration**. rio starts where they ended up:
-
-- **Queries are immutable values.** Builders carry no connection and no
-  state; deriving from a shared base — concurrently, at package level — can
-  never cross-contaminate (the foot-gun GORM documents as "condition
-  pollution" is structurally impossible).
-- **Zero values are real values.** `Update` writes what you give it,
-  including `0`, `false`, and `""` — never silently skipping fields (GORM
-  issue #6860 is a design decision here, not a trap). Partial updates are an
-  explicit column whitelist; DB defaults are an explicit `omitzero` tag.
-- **No hidden queries, ever.** Relations are typed containers
-  (`rio.HasMany[Post]`) that know whether they were loaded. Accessing an
-  unloaded relation panics with instructions instead of returning silently
-  empty data — and lazy loading, the one source of invisible N+1, does not
-  exist.
-- **Errors behave like Go.** `ErrNotFound` wraps `sql.ErrNoRows` (both
-  `errors.Is` checks work), unique violations translate to
-  `rio.ErrDuplicateKey` with the driver error intact in the chain, and
-  nothing is ever logged for you.
-- **Set-based writes refuse to run without a WHERE** unless you call
-  `AllRows()` — on every dialect.
-- **SQL you can predict.** One builder call, one SQL fragment; `?`
-  placeholders everywhere (with `IN (?)` slice expansion); the escape hatch
-  `rio.Raw[T]` shares the same scanner, hooks, and transactions.
+| Guarantee | Detail |
+|---|---|
+| Immutable query values | Builders carry no connection or state; concurrent, package-level derivation from a shared base cannot cross-contaminate (GORM's "condition pollution"). |
+| Zero values are real | `Update` writes what you give it, including `0`, `false`, and `""`; it never silently skips fields (GORM issue #6860). Partial updates are an explicit column whitelist; DB defaults are an explicit `omitzero` tag. |
+| No hidden queries | Typed containers (`rio.HasMany[Post]`) know whether they loaded; accessing an unloaded relation panics with instructions. No lazy loading, no invisible N+1. |
+| Go-style errors | `ErrNotFound` wraps `sql.ErrNoRows` (both `errors.Is` checks pass); unique violations translate to `rio.ErrDuplicateKey` with the driver error intact in the chain. Nothing is logged for you. |
+| Guarded set-based writes | `UpdateAll`/`DeleteAll` refuse to run without a WHERE unless you call `AllRows()`, on every dialect. |
+| Predictable SQL | One builder call, one SQL fragment; `?` placeholders everywhere, with `IN (?)` slice expansion. The escape hatch `rio.Raw[T]` shares the scanner, hooks, and transactions. |
 
 ## Install
 
 ```bash
 go get github.com/go-rio/rio
-go get github.com/go-rio/postgres   # or go-rio/mysql, go-rio/sqlite
+go get github.com/go-rio/postgres   # or go-rio/mysql, go-rio/sqlite, go-rio/clickhouse
 ```
 
 ## Quickstart
@@ -79,11 +64,11 @@ type User struct {
     ID        int64
     Email     string
     Age       int
-    Bio       *string    // pointer = nullable
-    Version   int64      `rio:",version"`    // opt-in optimistic locking
-    DeletedAt *time.Time `rio:",softdelete"` // opt-in soft delete
-    CreatedAt time.Time  // maintained automatically
-    UpdatedAt time.Time  // maintained on every write path
+    Bio       *string    // nullable
+    Version   int64      `rio:",version"`
+    DeletedAt *time.Time `rio:",softdelete"`
+    CreatedAt time.Time
+    UpdatedAt time.Time
 
     Posts rio.HasMany[Post]
 }
@@ -107,21 +92,17 @@ func main() {
     _ = rio.Update(ctx, db, u)            // full row, version-checked
     _ = rio.Update(ctx, db, u, "age")     // just age (+updated_at)
 
-    user, _ := rio.Find[User](ctx, db, u.ID)
-    users, _ := rio.From[User]().
-        Where("age BETWEEN ? AND ?", 18, 65).
-        With("Posts").
-        All(ctx, db)
+    user, _ := rio.Find[User](ctx, db, u.ID) // by primary key
 
     _ = db.Tx(ctx, func(tx *rio.Tx) error { // nested Tx = savepoints
         return rio.Insert(ctx, tx, &Post{UserID: u.ID, Title: "hello"})
     })
 
-    _, _ = user, users
+    _ = user
 }
 ```
 
-Schema migrations are deliberately out of scope — rio pairs with
+Schema migrations are out of scope. rio pairs with
 [go-rio/migrate](https://github.com/go-rio/migrate), where migrations are Go
 code compiled into your binary.
 
@@ -142,17 +123,15 @@ code compiled into your binary.
 | `CreatedAt`, `UpdatedAt` | maintained automatically when present (`rio:",nostamp"` opts out) |
 | `TableName() string` | override the pluralized table name (`User` → `users`, `Person` → `people`) |
 
-Relations: `rio.HasMany[T]`, `rio.HasOne[T]`, `rio.BelongsTo[T]`,
-`rio.ManyToMany[T]` — with `fk:`, `ref:`, and `join:` tag overrides.
-`With` takes the Go **field name** (`With("Posts")`), while every column API
-(`Update` whitelists, `rio.Set`, `OnConflict`, `DoUpdate`) takes **database
-column names** — relations are Go-side concepts, columns are SQL-side.
-Preloading always uses per-relation `WHERE … IN` split queries (the strategy
-ActiveRecord, Eloquent, Ecto, and SQLAlchemy converged on): no cartesian
-explosion, pagination stays correct, identical behavior on all three
-dialects. Paths nest: `With("Posts.Comments")`.
+Relation types: `rio.HasMany[T]`, `rio.HasOne[T]`, `rio.BelongsTo[T]`,
+`rio.ManyToMany[T]`, with `fk:`, `ref:`, and `join:` tag overrides. `With`
+takes the Go field name (`With("Posts")`); column APIs (`Update` whitelists,
+`rio.Set`, `OnConflict`, `DoUpdate`) take database column names. Preloading
+always uses per-relation `WHERE … IN` split queries: no cartesian explosion,
+pagination stays correct, identical behavior on all dialects. Paths nest:
+`With("Posts.Comments")`.
 
-## Semantics that refuse to surprise
+## Semantics
 
 | Operation | Behavior |
 |---|---|
@@ -163,28 +142,28 @@ dialects. Paths nest: `With("Posts.Comments")`.
 | `Update/Delete` matching no row (no version column) | `rio.ErrNotFound` |
 | `UpdateAll/DeleteAll` without WHERE | `rio.ErrMissingWhere` |
 | unique / FK violation | `rio.ErrDuplicateKey` / `rio.ErrForeignKeyViolated` |
-| NULL into a non-pointer field | error naming the column — not a silent zero |
-| MySQL `Insert` | fills the auto-increment ID; rio never issues a hidden second SELECT |
-| `Upsert` onto a soft-deleted row | DoUpdate revives it — a successful DoUpdate upsert is never invisible (`rio.KeepTrashed()` opts out); DoNothing never revives |
-| times | stored UTC, microsecond precision — insert-then-reload compares `Equal` |
+| NULL into a non-pointer field | error naming the column, not a silent zero |
+| MySQL `Insert` | fills the auto-increment ID; no hidden second SELECT |
+| `Upsert` onto a soft-deleted row | DoUpdate revives it (`rio.KeepTrashed()` opts out); DoNothing never revives |
+| times | stored UTC, microsecond precision; insert-then-reload compares `Equal` |
 
-`Upsert` ships complete: conflict target, update whitelist, RETURNING
-backfill, timestamp maintenance:
+`Upsert` supports conflict target, update whitelist, RETURNING backfill, and
+timestamp maintenance:
 
 ```go
 err := rio.Upsert(ctx, db, &user, rio.OnConflict("email"), rio.DoUpdate("name"))
 ```
 
-On MySQL the DoUpdate branch uses the 8.0.19+ row-alias syntax (`VALUES()`
-is deprecated); MySQL before 8.0.19 and MariaDB support `DoNothing` only.
+On MySQL the DoUpdate branch uses the 8.0.19+ row-alias syntax (`VALUES()` is
+deprecated); MySQL before 8.0.19 and MariaDB support `DoNothing` only.
 
 Batch writes chunk automatically to each dialect's bind limit; backfill
-promises only what dialects can keep (documented per dialect on `InsertAll`).
+promises only what dialects can keep (per-dialect notes on `InsertAll`).
 
 ## Compiled queries
 
-Most application SQL is fixed in shape. Entity CRUD is cached invisibly;
-hand-built queries compile once, `regexp.MustCompile` style:
+Entity CRUD is cached automatically; hand-built queries compile once,
+`regexp.MustCompile` style:
 
 ```go
 var adults = rio.MustCompile[User](
@@ -195,15 +174,15 @@ users, err := adults.All(ctx, db, 18) // binds parameters only
 ```
 
 Structural problems panic at startup; SQL renders lazily per dialect and is
-cached. `rio.WithStmtCache()` additionally caches prepared statements
-(off by default — PgBouncer transaction pooling breaks server-side prepared
-statements; enable it only when talking to the database directly).
+cached. `rio.WithStmtCache()` also caches prepared statements (off by default:
+PgBouncer transaction pooling breaks server-side prepared statements; enable
+only when talking to the database directly).
 
-## Column constants, without a tool chain
+## Column constants
 
-`rio.WriteColumns` generates typo-proof column references from rio's own
-mapping plans — no source parsing, no binary to install, and the output can
-never drift from runtime behavior:
+`rio.WriteColumns` generates column references from rio's own mapping plans:
+no source parsing, no binary to install, output cannot drift from runtime
+behavior:
 
 ```go
 //go:generate sh -c "go run ./internal/gencols > cols_gen.go"
@@ -212,10 +191,10 @@ never drift from runtime behavior:
 users, err := rio.From[User]().Where(UserCols.Email+" = ?", e).All(ctx, db)
 ```
 
-## Pagination that scales
+## Pagination
 
-Offset pagination degrades linearly; keyset pagination is a WHERE clause,
-and rio deliberately ships the pattern instead of an API:
+Offset pagination degrades linearly. Keyset pagination is a WHERE clause; rio
+provides the pattern, not an API:
 
 ```go
 // Page 1: rio.From[Post]().OrderBy("created_at DESC, id DESC").Limit(20)
@@ -226,8 +205,8 @@ next, err := rio.From[Post]().
     All(ctx, db)
 ```
 
-Row-value comparison works on PostgreSQL, MySQL, and SQLite 3.15+. For
-result sets too large to page at all, stream with `Rows`.
+Row-value comparison works on PostgreSQL, MySQL, and SQLite 3.15+. For result
+sets too large to page, stream with `Rows`.
 
 ## Observability
 
@@ -236,9 +215,8 @@ db, _ := postgres.Open(dsn, rio.WithQueryHook(myHook))
 ```
 
 `QueryHook` sees every statement — op, model, SQL, args (redactable with
-`rio.WithoutArgs()`), duration, rows affected — and cannot alter any of them.
-There are no model hooks: side effects belong in visible application code,
-invariants in database constraints.
+`rio.WithoutArgs()`), duration, rows affected — and cannot alter them. There
+are no model hooks.
 
 ## Performance
 
@@ -255,20 +233,27 @@ SQLite driver (Apple M4; `rio/bench`, reproducible with
 | update | 6.7 µs | 6.2 µs | 15.5 µs |
 | insert 100 (batch) | 262 µs | — | 294 µs |
 
-Reads beat GORM by ~25% and land within ~12% of hand-written scanning
-(scanning 100 rows is a dead heat); inserts are ~45% faster than GORM,
-updates ~57% faster and within 7% of hand-written SQL. Batch inserts are
-driver-dominated — both sides send one multi-VALUES statement — so the ~11%
-edge there is mostly allocation discipline. The techniques: per-type mapping plans,
-per-grammar SQL caches, offset-based scanning with a reflect fallback, and
-`[]byte`-appended rendering — no code generation anywhere.
+- Reads: ~25% faster than GORM, within ~12% of hand-written scanning; the
+  100-row scan is a dead heat.
+- Inserts: ~45% faster than GORM. Updates: ~57% faster than GORM, within 7%
+  of hand-written SQL.
+- Batch inserts are driver-dominated (both sides send one multi-VALUES
+  statement), so the ~11% edge is mostly allocation discipline.
+- Techniques: per-type mapping plans, per-grammar SQL caches, offset-based
+  scanning with a reflect fallback, `[]byte`-appended rendering. No code
+  generation.
 
-## What rio deliberately does not have
+## What rio does not have
 
-No model hooks. No implicit lazy loading. No dirty tracking, unit of work, or
-identity map. No AutoMigrate. No second-level cache. No association
-auto-writes. No client-side evaluation. Each refusal is a researched decision
-with the receipts in [DESIGN.md](DESIGN.md).
+- No model hooks
+- No implicit lazy loading
+- No dirty tracking, unit of work, or identity map
+- No AutoMigrate
+- No second-level cache
+- No association auto-writes
+- No client-side evaluation
+
+Rationale for each is in [DESIGN.md](DESIGN.md).
 
 ## License
 
