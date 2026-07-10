@@ -154,3 +154,40 @@ func TestScanPtrOverflowAndConversionErrors(t *testing.T) {
 		})
 	}
 }
+
+// entityFields is the last line of defense against schema drift between
+// render and execution: an entity result set that does not match the plan's
+// column count and order must error by name, never misassign silently.
+func TestEntityColumnMismatchErrors(t *testing.T) {
+	ctx := context.Background()
+	run := func(cols []string) error {
+		f := newFakeDB()
+		db := f.open(SQLite)
+		f.queueRows(cols)
+		_, err := From[User]().All(ctx, db)
+		return err
+	}
+
+	t.Run("missing column", func(t *testing.T) {
+		err := run(userCols[:len(userCols)-1])
+		if err == nil || !strings.Contains(err.Error(), "rio: User: expected 8 columns, result has 7") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("extra column", func(t *testing.T) {
+		err := run(append(append([]string(nil), userCols...), "extra"))
+		if err == nil || !strings.Contains(err.Error(), "rio: User: expected 8 columns, result has 9") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("duplicated column", func(t *testing.T) {
+		cols := append([]string(nil), userCols...)
+		cols[1] = "id" // right count, duplicate name: caught by position
+		err := run(cols)
+		if err == nil || !strings.Contains(err.Error(), `rio: User: column 1 is "id", expected "email"`) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}

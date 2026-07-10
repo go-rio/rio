@@ -226,9 +226,11 @@ func (q Query[T]) WhereHasNot(path string, opts ...RelOption) Query[T] {
 	return q
 }
 
-// WithCount fills the relation's count target field — declared as
-// `PostsCount int64 \`rio:",countof:Posts"\“ — with one GROUP BY query per
-// relation, the aggregate sibling of With. HasMany and ManyToMany only.
+// WithCount fills the relation's count target field with one GROUP BY query
+// per relation — the aggregate sibling of With. HasMany and ManyToMany only.
+// The target is an int64 field tagged countof:
+//
+//	PostsCount int64 `rio:",countof:Posts"`
 func (q Query[T]) WithCount(relation string) Query[T] {
 	q.s.counts = appendOne(q.s.counts, relation)
 	return q

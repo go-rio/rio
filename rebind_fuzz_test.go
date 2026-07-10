@@ -415,13 +415,35 @@ func FuzzRebind(f *testing.F) {
 		for prof := uint8(0); prof < 3; prof++ {
 			for style := uint8(0); style < 2; style++ {
 				for _, n := range []uint8{0, 1, 2, 3} {
-					f.Add(q, n, prof, style)
+					f.Add(q, n, prof, style, uint8(0))
+				}
+			}
+		}
+	}
+	// Slice-argument seeds drive IN (?) through the expand-first /
+	// renumber-second path, including multi-slice, trailing-scalar, empty,
+	// and never-expanding []byte shapes.
+	sliceSeeds := []string{
+		"SELECT * FROM t WHERE id IN (?)",
+		"SELECT * FROM t WHERE id IN (?) AND b = ?",
+		"UPDATE t SET a = ? WHERE id IN (?)",
+		"SELECT * FROM t WHERE a IN (?) OR b IN (?) -- ?",
+		"SELECT '?' , ? , ?",
+		"? ? ? ? ?",
+	}
+	for _, q := range sliceSeeds {
+		for prof := uint8(0); prof < 3; prof++ {
+			for style := uint8(0); style < 2; style++ {
+				for _, n := range []uint8{1, 2, 3, 5} {
+					for _, sb := range []uint8{1, 2, 3, 0b101, 0b1000, 0xff} {
+						f.Add(q, n, prof, style, sb)
+					}
 				}
 			}
 		}
 	}
 
-	f.Fuzz(func(t *testing.T, query string, nArgs, profileIdx, styleIdx uint8) {
+	f.Fuzz(func(t *testing.T, query string, nArgs, profileIdx, styleIdx, sliceBits uint8) {
 		profiles := [...]lexProfile{pgLex, mysqlLex, sqliteLex}
 		styles := [...]bindStyle{bindQuestion, bindDollar}
 		p := profiles[int(profileIdx)%len(profiles)]
@@ -438,6 +460,29 @@ func FuzzRebind(f *testing.F) {
 				args[i] = nil
 			case 3:
 				args[i] = 1.5
+			}
+		}
+		// Bit i of sliceBits swaps args[i] for a slice-family shape, so the
+		// fuzzer explores every mix of scalars and IN (?) expansions. The
+		// shapes cover multi-element, single, mixed-type, empty (an error on
+		// both sides), array, and the []byte scalar that must never expand.
+		for i := range args {
+			if i >= 8 || sliceBits&(1<<i) == 0 {
+				continue
+			}
+			switch i % 6 {
+			case 0:
+				args[i] = []int{10 * i, 10*i + 1}
+			case 1:
+				args[i] = []string{"x"}
+			case 2:
+				args[i] = []any{nil, "y", 3}
+			case 3:
+				args[i] = []int{}
+			case 4:
+				args[i] = [2]int64{7, 8}
+			case 5:
+				args[i] = []byte("b?")
 			}
 		}
 

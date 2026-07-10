@@ -549,6 +549,107 @@ func TestNestedTxUsesSavepoints(t *testing.T) {
 	}
 }
 
+// DESIGN.md, savepoint failure paths: ROLLBACK TO SAVEPOINT can itself fail,
+// and its error must be joined to the cause, never allowed to mask it.
+func TestSavepointRollbackFailureJoinsErrors(t *testing.T) {
+	ctx := context.Background()
+
+	// PostgreSQL flavor: the failed statement aborts the transaction; if the
+	// ROLLBACK TO then fails too (dead connection, missing savepoint), rio
+	// reports both errors and skips the RELEASE that could only fail as well.
+	t.Run("postgres aborted state", func(t *testing.T) {
+		f := newFakeDB()
+		db := f.open(Postgres)
+		insertErr := errors.New(`pq: duplicate key value violates unique constraint "posts_pkey"`)
+		rbErr := errors.New("pq: current transaction is aborted, commands ignored until end of transaction block")
+		f.failContaining("INSERT", insertErr)
+		f.failContaining("ROLLBACK TO", rbErr)
+
+		err := db.Tx(ctx, func(tx *Tx) error {
+			return tx.Tx(ctx, func(tx2 *Tx) error {
+				return Insert(ctx, tx2, &Post{Title: "x", UserID: 1})
+			})
+		})
+		if !errors.Is(err, insertErr) {
+			t.Fatalf("the original cause must survive the failed rollback: %v", err)
+		}
+		if !errors.Is(err, rbErr) {
+			t.Fatalf("the ROLLBACK TO failure must be joined, not swallowed: %v", err)
+		}
+		logs := strings.Join(f.logged(), " | ")
+		if strings.Contains(logs, "RELEASE") {
+			t.Fatalf("no RELEASE after a failed ROLLBACK TO: %s", logs)
+		}
+		if !strings.Contains(logs, "ROLLBACK TO SAVEPOINT rio_sp_1") {
+			t.Fatalf("rollback must be attempted before giving up: %s", logs)
+		}
+		// The outer transaction saw the inner error and rolled back whole.
+		if f.logged()[len(f.logged())-1] != "ROLLBACK" {
+			t.Fatalf("outer transaction must roll back: %s", logs)
+		}
+	})
+
+	// MySQL flavor: a deadlock (1213) rolls back the entire transaction and
+	// destroys every savepoint, so the ROLLBACK TO fails with 1305. Both
+	// errors must reach the caller — the deadlock is the one worth retrying.
+	t.Run("mysql 1213 kills savepoints", func(t *testing.T) {
+		f := newFakeDB()
+		db := f.open(MySQL)
+		deadlock := errors.New("Error 1213 (40001): Deadlock found when trying to get lock; try restarting transaction")
+		spGone := errors.New("Error 1305 (42000): SAVEPOINT rio_sp_1 does not exist")
+		f.failContaining("INSERT", deadlock)
+		f.failContaining("ROLLBACK TO", spGone)
+
+		err := db.Tx(ctx, func(tx *Tx) error {
+			return tx.Tx(ctx, func(tx2 *Tx) error {
+				return Insert(ctx, tx2, &Post{Title: "x", UserID: 1})
+			})
+		})
+		if !errors.Is(err, deadlock) {
+			t.Fatalf("the deadlock must stay visible for retry logic: %v", err)
+		}
+		if !errors.Is(err, spGone) {
+			t.Fatalf("the ROLLBACK TO failure must be joined: %v", err)
+		}
+		if logs := strings.Join(f.logged(), " | "); strings.Contains(logs, "RELEASE") {
+			t.Fatalf("no RELEASE after a failed ROLLBACK TO: %s", logs)
+		}
+	})
+}
+
+func TestTxBeginHookPanicRollsBack(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	hook := hookFunc(func(_ context.Context, e *QueryEvent) {
+		if e.Op == "begin" {
+			panic("telemetry exploded")
+		}
+	})
+	db := f.openWith(SQLite, WithQueryHook(hook))
+
+	ran := false
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_ = db.Tx(ctx, func(tx *Tx) error {
+			ran = true
+			return nil
+		})
+	}()
+	if recovered != "telemetry exploded" {
+		t.Fatalf("the hook panic must propagate unchanged, got %v", recovered)
+	}
+	if ran {
+		t.Fatal("fn must not run when the BEGIN hook panics")
+	}
+	// The transaction was already open when AfterQuery fired; the connection
+	// must go back to the pool via ROLLBACK, not leak.
+	joined := strings.Join(f.logged(), " | ")
+	if !strings.Contains(joined, "BEGIN") || !strings.Contains(joined, "ROLLBACK") {
+		t.Fatalf("BEGIN hook panic must roll back the open transaction: %s", joined)
+	}
+}
+
 func TestErrorTranslatorMapsDuplicate(t *testing.T) {
 	f := newFakeDB()
 	dup := errors.New("driver: unique violation")

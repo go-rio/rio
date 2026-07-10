@@ -22,7 +22,8 @@ type QueryEvent struct {
 	Args []any
 	// Err is the translated execution error, nil on success. After only.
 	Err error
-	// Duration is the execution wall time. After only.
+	// Duration is the execution wall time; for row-returning queries it runs
+	// through row consumption. After only.
 	Duration time.Duration
 	// RowsAffected is the driver-reported count for writes, -1 when unknown
 	// (row-returning queries). After only.
@@ -34,9 +35,11 @@ type QueryEvent struct {
 // past the call and cannot modify the statement — rio has no mutating
 // middleware by design.
 //
-// The event covers statement execution: for row-returning queries, Err and
-// Duration describe sending the query, not consuming the rows — scan and
-// iteration failures surface only through the call's returned error.
+// For row-returning queries AfterQuery fires once the rows are consumed:
+// Err includes scan and iteration failures, and Duration spans execution
+// through row consumption. One exception: a First/Find/Sole miss reports
+// Err = nil — ErrNotFound is a successfully executed query, and telemetry
+// would otherwise count every miss as an error.
 type QueryHook interface {
 	BeforeQuery(ctx context.Context, e *QueryEvent) context.Context
 	AfterQuery(ctx context.Context, e *QueryEvent)

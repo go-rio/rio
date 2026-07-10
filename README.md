@@ -136,6 +136,7 @@ code compiled into your binary.
 | `rio:",version"` | optimistic locking: `UPDATE … SET version = version+1 WHERE … AND version = ?`; a lost race returns `ErrStaleObject` |
 | `rio:",softdelete"` | on `time.Time`/`*time.Time`: `Delete` becomes an UPDATE, default queries filter, `WithTrashed`/`OnlyTrashed`/`ForceDelete` opt out |
 | `rio:",json"` | (de)serialize the field as JSON |
+| `rio:",countof:Posts"` | `int64` target that `WithCount("Posts")` fills with the related row count (HasMany/ManyToMany) |
 | `rio:",omitzero"` | skip the column when zero so DB defaults apply (and RETURNING fills it back); a single-row `Upsert` conflict then leaves the existing value untouched |
 | `rio:"-"` | not a column |
 | `CreatedAt`, `UpdatedAt` | maintained automatically when present (`rio:",nostamp"` opts out) |

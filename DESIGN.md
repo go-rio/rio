@@ -259,7 +259,7 @@ returns a clear error in v1.
 | Upsert `updated_at` | reset to the clock on every non-DoNothing upsert, even when nonzero — the conflict branch applies the would-be inserted row's stamp, so it must be this call's now (entity Update's unconditional rule) |
 | Zero `omitzero` column in `Upsert` | skipped from the INSERT list **and** the default conflict update set — a conflict preserves the existing value instead of resetting it to the DB DEFAULT; naming it in `DoUpdate` errors; `UpsertAll` binds every column and writes zeros on conflict |
 | MySQL Upsert version floor | the DoUpdate branch names the new row with the 8.0.19+ row alias (`VALUES()` is deprecated); MySQL <8.0.19 and MariaDB reject that syntax — `DoNothing` renders alias-free and runs everywhere |
-| `First` ordering | no implicit ORDER BY — LIMIT 1 over whatever order the DB returns; add OrderBy for determinism (SQL correspondence) |
+| `First` ordering | no implicit ORDER BY — LIMIT 1 (unless the caller set an explicit Limit, which is respected) over whatever order the DB returns; add OrderBy for determinism (SQL correspondence) |
 | Placeholders | always `?`, rebound per dialect with a per-dialect lexer; `??` escapes a literal `?` (PostgreSQL JSONB operators); `IN (?)` expands slices — sqlx/Bun's established conventions |
 | Scan priority | `rio:"-"` → `json` tag (beats Scanner, documented) → `sql.Scanner` (NULL handed to Scan(nil), no second-guessing) → pointer fields (NULL→nil) → `[]byte` (NULL→nil) → basic conversions (overflow-checked; MySQL unsigned BIGINT > MaxInt64 arrives as bytes and is parsed) → NULL into anything else errors with the column name |
 | Times | written as UTC, monotonic-stripped, truncated to microseconds (PG/MySQL precision — otherwise reload-and-Equal never holds), and the normalized value is written back to the struct as it binds, so the struct holds exactly what the database stores; trigger-rewritten columns are not read back; SQLite text format is rio's own, not the driver's |
@@ -279,9 +279,10 @@ it is missing plan caches and sloppy string assembly.
 - **Unsafe fast path**: plans record field offsets; fixed-layout kinds
   (ints/uints/floats/bool/string/[]byte/time.Time) are written via
   `unsafe.Add` directly, skipping reflect.Value.Set (Bun/sonic-class
-  technique). Discipline: no uintptr variables; embedded *pointer* structs
-  take the slow path; []byte is always cloned; fast and slow paths are
-  fuzz-compared for equality and the whole matrix runs under -race/checkptr.
+  technique). Discipline: no uintptr variables; pointer embedding is rejected
+  at plan time (offset-based scanning cannot hop a nil); []byte is always
+  cloned; the per-kind scan test matrix — fast stores and the reflect slow
+  paths alike — runs under -race, which enables checkptr.
   Entity SELECTs render columns in plan order and verify the result set
   matches once per query; Raw always matches by column name.
 - Entity CRUD ≤4 extra allocs per call over hand-written database/sql on the
@@ -289,9 +290,10 @@ it is missing plan caches and sloppy string assembly.
   Update +2, Delete +1 — asserted with testing.AllocsPerRun
   (TestCRUDAllocBudget). Upsert adds its conflict-shape machinery on top:
   +8 (PostgreSQL) / +6 (MySQL), asserted at those budgets.
-- Benchmarks in-repo against hand-written database/sql (fake driver + real
-  SQLite), plus a local reproduction of efectn/go-orm-benchmarks for the
-  README. Honest methodology or no numbers.
+- Benchmarks in-repo against hand-written database/sql (fake driver in
+  perf_test.go isolates rio's own overhead; bench/ adds real SQLite and a
+  GORM comparison, the source of the README numbers). Honest methodology or
+  no numbers.
 
 ## What rio deliberately does not have
 
@@ -324,13 +326,14 @@ Each of these is a decision, not a gap:
   Caching belongs to the application.
 - **No association auto-writes.** GORM's `Association.Replace` upserting rows
   behind your back (#3462) is the anti-pattern. Writing relations means
-  visible inserts/deletes; helpers may come later, and they will be explicit.
+  visible inserts/deletes; the shipped helpers — Attach, Detach, SyncRelation
+  — are exactly that: explicit join-table writes, never entity upserts.
 - **No client-side evaluation, ever.** If rio can't compile it to SQL, it
   returns an error (EF Core 3.0's most expensive lesson: fail, don't degrade).
 - **No expression-tree query language.** Go can't introspect closures; any
-  simulation leaks. Type safety lives in generics (result types) and, later,
-  an optional column-constant generator — never required for full ergonomics
-  (jOOQ's cliff is the counterexample).
+  simulation leaks. Type safety lives in generics (result types) and the
+  optional column-constant generator (WriteColumns) — never required for full
+  ergonomics (jOOQ's cliff is the counterexample).
 - **No `.Select()` column pruning on entity queries.** Partial columns never
   produce entity values (Doctrine deleted partial objects for a reason, and
   Go's zero values make it worse); projections go through `Raw[T]` with any
@@ -342,7 +345,8 @@ Each of these is a decision, not a gap:
   transaction boundaries (the go-rio/migrate pattern) + golden SQL tests per
   dialect. Inflector goldens freeze before model.go exists.
 - Differential fuzz on the rebind lexer (fast vs naive-correct, three dialect
-  profiles), fast/slow scan-path comparison fuzz, concurrent query derivation
+  profiles, scalar and slice-expansion arguments), a per-kind scan-path test
+  matrix (fast stores and the reflect slow paths), concurrent query derivation
   under -race, savepoint failure paths (PG aborted state; MySQL 1213 kills
   all savepoints — tolerate ROLLBACK TO failing via errors.Join).
 - `integration/` sub-module drives real databases through the core only
@@ -353,18 +357,19 @@ Each of these is a decision, not a gap:
   functional options, CI matrix (oldstable/stable × linux/macos/windows),
   never move a published tag.
 
-## Phase 1 scope (v0.1.0)
+## Shipped scope
 
 Core + three drivers: full mapping/tags, From/Find/First/Sole/Count/Exists,
 immutable connection-free builder (Where/OrderBy/Limit/Offset/GroupBy/Having/
 Join-for-filtering/ForUpdate), Insert/InsertAll/Update/Delete/Upsert/UpsertAll,
 set-based UpdateAll/DeleteAll with rio.Expr, FirstOrCreate/CreateOrFirst
 (race-honest, documented), four relation kinds with nested preloading,
-optimistic locking, soft delete, timestamps, Raw[T]/Exec, MustCompile/Compile,
-opt-in stmt cache, transactions with savepoints, QueryHook, error translation,
-composite PKs.
+per-parent preload limits (RelLimit, window functions), WithCount aggregate
+preloads, explicit relation write helpers (Attach/Detach/SyncRelation),
+optimistic locking, soft delete, timestamps, Raw[T]/Exec with strict
+column-completeness checks for Raw-into-entity, MustCompile/Compile,
+column-constant generation (WriteColumns), opt-in stmt cache, transactions
+with savepoints, QueryHook, error translation, composite PKs.
 
-Later phases (not v0.1): per-parent preload limits (window functions),
-WithCount aggregate preloads, cursor pagination, explicit relation write
-helpers (Attach/Detach), optional column-constant codegen, schema-drift lint,
-strict column-completeness checks for Raw-into-entity.
+Not shipped yet: cursor pagination (the README documents the keyset WHERE
+pattern instead of an API), schema-drift lint.

@@ -96,7 +96,18 @@ func (d *DB) Tx(ctx context.Context, fn func(tx *Tx) error) error {
 // TxWith runs fn in a transaction with the given options (isolation level,
 // read-only).
 func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) error) (err error) {
+	// Armed before BEGIN: its AfterQuery hook can panic with the transaction
+	// already open, and the connection must be rolled back before the panic
+	// continues. tx is nil until BeginTx succeeds — nothing to clean up then.
 	var tx *sql.Tx
+	defer func() {
+		if p := recover(); p != nil {
+			if tx != nil {
+				_ = d.finishTx(ctx, tx, errors.New("panic"))
+			}
+			panic(p)
+		}
+	}()
 	err = observe(ctx, d.cfg, d.g.d, "begin", "BEGIN", func() error {
 		var berr error
 		tx, berr = d.db.BeginTx(ctx, opts)
@@ -107,12 +118,6 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 	}
 
 	rtx := &Tx{tx: tx, g: d.g, cfg: d.cfg, spSeq: new(int)}
-	defer func() {
-		if p := recover(); p != nil {
-			_ = d.finishTx(ctx, tx, errors.New("panic"))
-			panic(p)
-		}
-	}()
 	if err = fn(rtx); err != nil {
 		if rbErr := d.finishTx(ctx, tx, err); rbErr != nil {
 			return errors.Join(err, rbErr)

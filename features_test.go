@@ -156,6 +156,174 @@ func TestStmtCache(t *testing.T) {
 	}
 }
 
+func TestStmtCacheEvictionClosesStatement(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.openWith(SQLite, WithStmtCache(2))
+
+	for _, cond := range []string{"a = ?", "b = ?", "c = ?"} {
+		f.queueRows(userCols)
+		if _, err := From[User]().Where(cond, 1).All(ctx, db); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// cap 2: the third shape evicts the least recently used first one, and
+	// the evicted server-side statement must be closed, not leaked.
+	closed := f.closedStmts()
+	if len(closed) != 1 || !strings.Contains(closed[0], "a = ?") {
+		t.Fatalf("evicting must close exactly the LRU statement, closed: %v", closed)
+	}
+
+	// Resident statements keep serving without re-preparing…
+	f.queueRows(userCols)
+	if _, err := From[User]().Where("b = ?", 1).All(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.prepped) != 3 {
+		t.Fatalf("cache hit must not re-prepare: %v", f.prepped)
+	}
+	// …and re-requesting the evicted shape prepares anew, evicting the new LRU.
+	f.queueRows(userCols)
+	if _, err := From[User]().Where("a = ?", 1).All(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.prepped) != 4 {
+		t.Fatalf("evicted shape must re-prepare: %v", f.prepped)
+	}
+	if closed := f.closedStmts(); len(closed) != 2 || !strings.Contains(closed[1], "c = ?") {
+		t.Fatalf("the demoted LRU must be closed on eviction, closed: %v", closed)
+	}
+}
+
+func TestDBCloseClosesCachedStatements(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.openWith(SQLite, WithStmtCache(8))
+
+	for _, cond := range []string{"a = ?", "b = ?"} {
+		f.queueRows(userCols)
+		if _, err := From[User]().Where(cond, 1).All(ctx, db); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	closed := f.closedStmts()
+	if len(closed) != 2 {
+		t.Fatalf("DB.Close must close every cached statement, closed: %v", closed)
+	}
+	for i, sub := range []string{"a = ?", "b = ?"} {
+		if !strings.Contains(strings.Join(closed, " | "), sub) {
+			t.Fatalf("statement %d (%q) not closed: %v", i, sub, closed)
+		}
+	}
+}
+
+// schemaChangeErr mimics pgx/lib/pq errors carrying SQLSTATE 0A000 ("cached
+// plan must not change result type"), raised when DDL invalidates a prepared
+// statement.
+type schemaChangeErr struct{}
+
+func (schemaChangeErr) Error() string    { return "pq: cached plan must not change result type" }
+func (schemaChangeErr) SQLState() string { return "0A000" }
+
+func TestStmtCacheSchemaChangeEvictsAndPropagates(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.openWith(Postgres, WithStmtCache(4))
+
+	q := From[User]().Where("age > ?", 1)
+	f.queueRows(userCols)
+	if _, err := q.All(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.prepped) != 1 {
+		t.Fatalf("expected one prepared statement: %v", f.prepped)
+	}
+
+	f.failContaining("SELECT", schemaChangeErr{})
+	_, err := q.All(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "cached plan must not change result type") {
+		t.Fatalf("the schema-change error must propagate unchanged: %v", err)
+	}
+	// The invalidated statement is evicted (closed), and rio never retried:
+	// the statement hit the driver exactly twice — first success, one failure.
+	if closed := f.closedStmts(); len(closed) != 1 || !strings.Contains(closed[0], "SELECT") {
+		t.Fatalf("0A000 must evict and close the cached statement, closed: %v", closed)
+	}
+	if n := len(f.loggedContaining("SELECT")); n != 2 {
+		t.Fatalf("0A000 must never auto-retry, got %d executions", n)
+	}
+
+	// The next execution prepares fresh instead of reusing the stale plan.
+	f.unfail("SELECT")
+	f.queueRows(userCols)
+	if _, err := q.All(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.prepped) != 2 {
+		t.Fatalf("post-eviction execution must re-prepare: %v", f.prepped)
+	}
+}
+
+func TestStmtCachePrepareFailurePropagates(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.openWith(SQLite, WithStmtCache(2))
+
+	prepErr := errors.New("prepare: too many prepared statements")
+	f.failPreparing("SELECT", prepErr)
+	_, err := From[User]().Where("age > ?", 1).All(ctx, db)
+	if !errors.Is(err, prepErr) {
+		t.Fatalf("a prepare failure must surface loudly, got %v", err)
+	}
+	// No silent fallback: the statement never executed and nothing was cached.
+	if logged := f.loggedContaining("SELECT"); len(logged) != 0 {
+		t.Fatalf("failed prepare must not execute the statement: %v", logged)
+	}
+	if len(f.prepped) != 0 {
+		t.Fatalf("failed prepare must cache nothing: %v", f.prepped)
+	}
+}
+
+func TestStmtCacheClosedStatementFallsBackToDirectExecution(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.openWith(SQLite, WithStmtCache(2))
+
+	q := From[User]().Where("age > ?", 1)
+	f.queueRows(userCols)
+	if _, err := q.All(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the documented race: a concurrent eviction closes the handle
+	// between the cache get and the query. database/sql then fails with
+	// "sql: statement is closed" before reaching the driver, and rio must
+	// fall back to direct execution — the statement never ran, so it is safe.
+	db.stmts.mu.Lock()
+	for _, el := range db.stmts.bySQL {
+		st := el.Value.(*stmtEntry).stmt
+		db.stmts.mu.Unlock()
+		_ = st.Close()
+		db.stmts.mu.Lock()
+	}
+	db.stmts.mu.Unlock()
+
+	f.queueRows(userCols, userRow(1, "a@x"))
+	users, err := q.All(ctx, db)
+	if err != nil {
+		t.Fatalf("closed statement must fall back to direct execution: %v", err)
+	}
+	if len(users) != 1 {
+		t.Fatalf("fallback must return the queued row, got %d", len(users))
+	}
+	if len(f.prepped) != 1 {
+		t.Fatalf("the fallback executes directly, never re-prepares: %v", f.prepped)
+	}
+}
+
 type recordingHook struct {
 	events []string
 	rows   []int64

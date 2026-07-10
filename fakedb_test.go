@@ -15,12 +15,14 @@ import (
 // statement and serves scripted results, so tests assert exact SQL
 // sequences, arguments, and transaction boundaries without a database.
 type fakeDB struct {
-	mu      sync.Mutex
-	log     []fakeStmt
-	results []fakeRows
-	execs   []fakeResult
-	failOn  map[string]error
-	prepped []string
+	mu          sync.Mutex
+	log         []fakeStmt
+	results     []fakeRows
+	execs       []fakeResult
+	failOn      map[string]error
+	failPrepare map[string]error
+	prepped     []string
+	closed      []string // SQL of prepared statements whose Close ran
 }
 
 type fakeStmt struct {
@@ -38,7 +40,7 @@ type fakeResult struct {
 }
 
 func newFakeDB() *fakeDB {
-	return &fakeDB{failOn: map[string]error{}}
+	return &fakeDB{failOn: map[string]error{}, failPrepare: map[string]error{}}
 }
 
 func (f *fakeDB) open(d ...Dialect) *DB {
@@ -73,6 +75,27 @@ func (f *fakeDB) failContaining(sub string, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failOn[sub] = err
+}
+
+// unfail removes a failContaining rule.
+func (f *fakeDB) unfail(sub string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.failOn, sub)
+}
+
+// failPreparing makes Prepare of any statement containing sub fail with err.
+func (f *fakeDB) failPreparing(sub string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failPrepare[sub] = err
+}
+
+// closedStmts lists the SQL of prepared statements that have been closed.
+func (f *fakeDB) closedStmts() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.closed...)
 }
 
 func (f *fakeDB) logged() []string {
@@ -148,8 +171,13 @@ type fakeConn struct{ f *fakeDB }
 
 func (c *fakeConn) Prepare(query string) (driver.Stmt, error) {
 	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	for sub, err := range c.f.failPrepare {
+		if strings.Contains(query, sub) {
+			return nil, err
+		}
+	}
 	c.f.prepped = append(c.f.prepped, query)
-	c.f.mu.Unlock()
 	return &fakePrepared{f: c.f, sql: query}, nil
 }
 
@@ -197,7 +225,13 @@ type fakePrepared struct {
 	sql string
 }
 
-func (s *fakePrepared) Close() error  { return nil }
+func (s *fakePrepared) Close() error {
+	s.f.mu.Lock()
+	defer s.f.mu.Unlock()
+	s.f.closed = append(s.f.closed, s.sql)
+	return nil
+}
+
 func (s *fakePrepared) NumInput() int { return -1 }
 
 func (s *fakePrepared) Exec(args []driver.Value) (driver.Result, error) {
