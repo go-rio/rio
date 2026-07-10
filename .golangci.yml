@@ -15,8 +15,10 @@ linters:
     errcheck:
       exclude-functions:
         # Closing an already-consumed result set is idiomatic best-effort;
-        # scan paths surface rows.Err() explicitly instead.
-        - (*database/sql.Rows).Close
+        # scan paths surface rows.Err() explicitly instead. rows is rio's
+        # internal result-set seam; the database/sql engine passes *sql.Rows
+        # through it unchanged.
+        - (github.com/go-rio/rio.rows).Close
         # The rollback inside the panic-recovery path is best-effort by
         # design: the panic is re-raised immediately and must not be masked.
         - (*github.com/go-rio/rio.DB).finishTx

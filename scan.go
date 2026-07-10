@@ -571,7 +571,7 @@ func newRowScanner(fields []*field, extras []any) *rowScanner {
 // — bounded at one chunk per column of the released query.
 func (rs *rowScanner) release() { rsPool.Put(rs) }
 
-func (rs *rowScanner) scan(rows *sql.Rows, base unsafe.Pointer) error {
+func (rs *rowScanner) scan(rows rows, base unsafe.Pointer) error {
 	for i := range rs.cells {
 		rs.cells[i].base = base
 	}
@@ -580,7 +580,7 @@ func (rs *rowScanner) scan(rows *sql.Rows, base unsafe.Pointer) error {
 
 // entityFields verifies the result set matches the plan's column order — the
 // last line of defense against schema drift between render and execution.
-func entityFields(rows *sql.Rows, p *plan, extras int) ([]*field, error) {
+func entityFields(rows rows, p *plan, extras int) ([]*field, error) {
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, err
@@ -601,7 +601,7 @@ func entityFields(rows *sql.Rows, p *plan, extras int) ([]*field, error) {
 // hides — and so are missing ones: a partially scanned entity handed to
 // Update would overwrite the unselected columns with zero values. Partial
 // projections belong in DTO types, whose plan the result then covers fully.
-func namedFields(rows *sql.Rows, p *plan) ([]*field, error) {
+func namedFields(rows rows, p *plan) ([]*field, error) {
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, err
@@ -641,7 +641,7 @@ func namedFields(rows *sql.Rows, p *plan) ([]*field, error) {
 // as success. err points at the caller's named return; on a fully drained
 // result Close is a no-op (database/sql already auto-closed at EOF) and
 // nothing changes.
-func mergeClose(rows *sql.Rows, err *error) {
+func mergeClose(rows rows, err *error) {
 	if cerr := rows.Close(); cerr != nil && *err == nil {
 		*err = cerr
 	}
@@ -649,7 +649,7 @@ func mergeClose(rows *sql.Rows, err *error) {
 
 // scanAll drains rows into a []T. byName selects Raw-style column matching;
 // entity queries use plan order.
-func scanAll[T any](rows *sql.Rows, p *plan, byName bool) (out []T, err error) {
+func scanAll[T any](rows rows, p *plan, byName bool) (out []T, err error) {
 	defer mergeClose(rows, &err)
 	var fields []*field
 	if byName {
@@ -677,7 +677,7 @@ func scanAll[T any](rows *sql.Rows, p *plan, byName bool) (out []T, err error) {
 
 // scanScalars drains a single-column result into basic values. The codec is
 // classified once for the whole result, not per row.
-func scanScalars[T any](rows *sql.Rows) (out []T, err error) {
+func scanScalars[T any](rows rows) (out []T, err error) {
 	defer mergeClose(rows, &err)
 	t := reflect.TypeFor[T]()
 	f := &field{name: t.String(), column: "<scalar>", typ: t}
@@ -686,12 +686,21 @@ func scanScalars[T any](rows *sql.Rows) (out []T, err error) {
 		return nil, err
 	}
 	f.code = codec
-	cs := colScanner{f: f}
+	// The cell and its dest slot share one escaping box: the cell's address
+	// reaches the heap through the dest interface anyway, and a variadic
+	// slice built fresh at the interface call would heap-allocate per row
+	// (rows is an interface, so the callee is opaque to escape analysis).
+	var box struct {
+		cell colScanner
+		dest [1]any
+	}
+	box.cell = colScanner{f: f}
+	box.dest[0] = &box.cell
 	out = []T{}
 	for rows.Next() {
 		out = append(out, *new(T))
-		cs.base = unsafe.Pointer(&out[len(out)-1])
-		if err := rows.Scan(&cs); err != nil {
+		box.cell.base = unsafe.Pointer(&out[len(out)-1])
+		if err := rows.Scan(box.dest[:]...); err != nil {
 			return nil, err
 		}
 	}
@@ -883,7 +892,7 @@ func fieldIsZero(f *field, base unsafe.Pointer, rv reflect.Value) bool {
 }
 
 // scanOne scans exactly one row into a fresh T, the Find fast path.
-func scanOne[T any](rows *sql.Rows, p *plan) (out *T, err error) {
+func scanOne[T any](rows rows, p *plan) (out *T, err error) {
 	defer mergeClose(rows, &err)
 	fields, err := entityFields(rows, p, 0)
 	if err != nil {

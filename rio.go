@@ -9,12 +9,6 @@ import (
 	"time"
 )
 
-// executor is the subset of database/sql shared by *sql.DB and *sql.Tx.
-type executor interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-}
-
 // Queryer is what every execution point accepts: a *DB or a *Tx. Data-access
 // code written against Queryer runs unchanged inside and outside
 // transactions. Tx opens a transaction on a DB and a savepoint on a Tx, so
@@ -25,19 +19,18 @@ type Queryer interface {
 	// error or panics.
 	Tx(ctx context.Context, fn func(tx *Tx) error) error
 
-	exec() executor
+	eng() engine
 	gram() *grammar
 	conf() *config
-	stmt(ctx context.Context, query string) (*sql.Stmt, bool, error)
 }
 
 // DB wraps a *sql.DB with a dialect. rio never replaces or tunes the
 // connection pool — configure pooling on the *sql.DB you pass in.
 type DB struct {
-	db    *sql.DB
-	g     *grammar
-	cfg   *config
-	stmts *stmtCache
+	db  *sql.DB
+	e   dbEngine
+	g   *grammar
+	cfg *config
 }
 
 // New wraps an existing *sql.DB. Driver modules (go-rio/postgres, go-rio/mysql,
@@ -61,11 +54,11 @@ func New(db *sql.DB, dialect Dialect, opts ...Option) *DB {
 		panic("rio: WithStmtCache is not supported on " + dialect.name() +
 			" (clickhouse-go implements Prepare only for INSERT batching; a prepared SELECT fails on first use)")
 	}
-	d := &DB{db: db, g: newGrammar(dialect, cfg), cfg: cfg}
+	e := &sqlEngine{db: db}
 	if cfg.stmtCache {
-		d.stmts = newStmtCache(db, cfg.stmtCap)
+		e.stmts = newStmtCache(db, cfg.stmtCap)
 	}
-	return d
+	return &DB{db: db, e: e, g: newGrammar(dialect, cfg), cfg: cfg}
 }
 
 // Unwrap returns the underlying *sql.DB for anything rio does not cover.
@@ -73,27 +66,11 @@ func (d *DB) Unwrap() *sql.DB { return d.db }
 
 // Close closes the prepared-statement cache (if enabled) and the underlying
 // *sql.DB.
-func (d *DB) Close() error {
-	if d.stmts != nil {
-		d.stmts.close()
-	}
-	return d.db.Close()
-}
+func (d *DB) Close() error { return d.e.close() }
 
-func (d *DB) exec() executor { return d.db }
+func (d *DB) eng() engine    { return d.e }
 func (d *DB) gram() *grammar { return d.g }
 func (d *DB) conf() *config  { return d.cfg }
-
-func (d *DB) stmt(ctx context.Context, query string) (*sql.Stmt, bool, error) {
-	if d.stmts == nil {
-		return nil, false, nil
-	}
-	st, err := d.stmts.get(ctx, query)
-	if err != nil {
-		return nil, false, err
-	}
-	return st, true, nil
-}
 
 // Tx runs fn in a transaction with default options.
 func (d *DB) Tx(ctx context.Context, fn func(tx *Tx) error) error {
@@ -111,33 +88,36 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 	}
 	// Armed before BEGIN: its AfterQuery hook can panic with the transaction
 	// already open, and the connection must be rolled back before the panic
-	// continues. tx is nil until BeginTx succeeds — nothing to clean up then.
-	var tx *sql.Tx
+	// continues. te is nil until begin succeeds — nothing to clean up then.
+	var te txEngine
 	defer func() {
 		if p := recover(); p != nil {
-			if tx != nil {
-				_ = d.finishTx(ctx, tx, errors.New("panic"))
+			if te != nil {
+				_ = d.finishTx(ctx, te, errors.New("panic"))
 			}
 			panic(p)
 		}
 	}()
 	err = observe(ctx, d.cfg, d.g.d, "begin", "BEGIN", func() error {
 		var berr error
-		tx, berr = d.db.BeginTx(ctx, opts)
+		te, berr = d.e.begin(ctx, opts)
 		return berr
 	})
 	if err != nil {
 		return err
 	}
 
-	rtx := &Tx{tx: tx, g: d.g, cfg: d.cfg, spSeq: new(int)}
+	rtx := &Tx{e: te, g: d.g, cfg: d.cfg, spSeq: new(int)}
+	if se, ok := te.(sqlTxEngine); ok {
+		rtx.tx = se.tx // Unwrap's view; engines without a *sql.Tx leave it nil
+	}
 	if err = fn(rtx); err != nil {
-		if rbErr := d.finishTx(ctx, tx, err); rbErr != nil {
+		if rbErr := d.finishTx(ctx, te, err); rbErr != nil {
 			return errors.Join(err, rbErr)
 		}
 		return err
 	}
-	return observe(ctx, d.cfg, d.g.d, "commit", "COMMIT", tx.Commit)
+	return observe(ctx, d.cfg, d.g.d, "commit", "COMMIT", func() error { return te.commit(ctx) })
 }
 
 // finishTx rolls the transaction back. Unlike the savepoint statements below,
@@ -145,8 +125,8 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 // takes no context and always reaches the driver, and BeginTx's own watcher
 // already rolls back automatically when the begin context dies (Rollback then
 // reports ErrTxDone, tolerated here).
-func (d *DB) finishTx(ctx context.Context, tx *sql.Tx, cause error) error {
-	err := observe(ctx, d.cfg, d.g.d, "rollback", "ROLLBACK", tx.Rollback)
+func (d *DB) finishTx(ctx context.Context, te txEngine, cause error) error {
+	err := observe(ctx, d.cfg, d.g.d, "rollback", "ROLLBACK", func() error { return te.rollback(ctx) })
 	if err != nil && !errors.Is(err, sql.ErrTxDone) {
 		return fmt.Errorf("rio: rollback after %q failed: %w", cause, err)
 	}
@@ -173,7 +153,8 @@ func observe(ctx context.Context, cfg *config, d Dialect, op, sqlText string, fn
 // accepts it in place of a *DB. Like *sql.Tx it is bound to one connection
 // and must not be used concurrently.
 type Tx struct {
-	tx  *sql.Tx
+	tx  *sql.Tx // Unwrap's view of the engine's transaction
+	e   txEngine
 	g   *grammar
 	cfg *config
 	// spSeq is shared across every Tx wrapper of the same root transaction
@@ -185,15 +166,9 @@ type Tx struct {
 // Unwrap returns the underlying *sql.Tx.
 func (t *Tx) Unwrap() *sql.Tx { return t.tx }
 
-func (t *Tx) exec() executor { return t.tx }
+func (t *Tx) eng() engine    { return t.e }
 func (t *Tx) gram() *grammar { return t.g }
 func (t *Tx) conf() *config  { return t.cfg }
-
-func (t *Tx) stmt(context.Context, string) (*sql.Stmt, bool, error) {
-	// The statement cache lives on the DB; re-preparing per transaction
-	// costs more than it saves, so transactions always execute directly.
-	return nil, false, nil
-}
 
 // Tx runs fn inside a savepoint, giving nested transactional code partial
 // rollback. Savepoints commit ("RELEASE") when fn returns nil; on error the
@@ -215,7 +190,7 @@ func (t *Tx) Tx(ctx context.Context, fn func(tx *Tx) error) (err error) {
 	// keeps the caller's ctx: refusing to *open* work under a canceled
 	// context is the correct half of cancellation.
 	cleanup := context.WithoutCancel(ctx)
-	inner := &Tx{tx: t.tx, g: t.g, cfg: t.cfg, spSeq: t.spSeq}
+	inner := &Tx{tx: t.tx, e: t.e, g: t.g, cfg: t.cfg, spSeq: t.spSeq}
 	defer func() {
 		if p := recover(); p != nil {
 			_ = t.spExec(cleanup, "ROLLBACK TO SAVEPOINT "+name)
@@ -239,7 +214,7 @@ func (t *Tx) Tx(ctx context.Context, fn func(tx *Tx) error) (err error) {
 
 func (t *Tx) spExec(ctx context.Context, stmt string) error {
 	return observe(ctx, t.cfg, t.g.d, "savepoint", stmt, func() error {
-		_, err := t.tx.ExecContext(ctx, stmt)
+		_, err := t.e.exec(ctx, stmt, nil)
 		return err
 	})
 }
@@ -250,13 +225,13 @@ func (t *Tx) spExec(ctx context.Context, stmt string) error {
 func run(ctx context.Context, q Queryer, op, model, sqlText string, args []any) (sql.Result, error) {
 	cfg := q.conf()
 	if len(cfg.hooks) == 0 {
-		res, err := execute(ctx, q, sqlText, args)
+		res, err := q.eng().exec(ctx, sqlText, args)
 		return res, translateErr(err, cfg, q.gram().d)
 	}
 	ev := &QueryEvent{Op: op, Model: model, Query: sqlText, Args: args}
 	hctx := cfg.beforeQuery(ctx, ev)
 	start := time.Now()
-	res, err := execute(ctx, q, sqlText, args)
+	res, err := q.eng().exec(ctx, sqlText, args)
 	err = translateErr(err, cfg, q.gram().d)
 	var rows int64 = -1
 	hookErr := err
@@ -280,16 +255,16 @@ func run(ctx context.Context, q Queryer, op, model, sqlText string, args []any) 
 // The returned finish callback (nil without hooks — the hot path stays
 // allocation-free) fires AfterQuery once the rows are consumed, so hooks see
 // scan errors and a duration that includes row consumption.
-func runQuery(ctx context.Context, q Queryer, op, model, sqlText string, args []any) (*sql.Rows, func(error), error) {
+func runQuery(ctx context.Context, q Queryer, op, model, sqlText string, args []any) (rows, func(error), error) {
 	cfg := q.conf()
 	if len(cfg.hooks) == 0 {
-		rows, err := query(ctx, q, sqlText, args)
-		return rows, nil, translateErr(err, cfg, q.gram().d)
+		rs, err := q.eng().query(ctx, sqlText, args)
+		return rs, nil, translateErr(err, cfg, q.gram().d)
 	}
 	ev := &QueryEvent{Op: op, Model: model, Query: sqlText, Args: args}
 	hctx := cfg.beforeQuery(ctx, ev)
 	start := time.Now()
-	rows, err := query(ctx, q, sqlText, args)
+	rs, err := q.eng().query(ctx, sqlText, args)
 	err = translateErr(err, cfg, q.gram().d)
 	if err != nil {
 		cfg.afterQuery(hctx, ev, start, err, -1)
@@ -298,7 +273,7 @@ func runQuery(ctx context.Context, q Queryer, op, model, sqlText string, args []
 	finish := func(scanErr error) {
 		cfg.afterQuery(hctx, ev, start, scanErr, -1)
 	}
-	return rows, finish, nil
+	return rs, finish, nil
 }
 
 // finishQuery fires a runQuery finish callback, tolerating the no-hook nil.
@@ -312,52 +287,4 @@ func finishQuery(finish func(error), err error) {
 		err = nil
 	}
 	finish(err)
-}
-
-func execute(ctx context.Context, q Queryer, sqlText string, args []any) (sql.Result, error) {
-	if st, ok, err := q.stmt(ctx, sqlText); err != nil {
-		return nil, err
-	} else if ok {
-		res, err := st.ExecContext(ctx, args...)
-		if isStmtClosed(err) {
-			// A concurrent eviction closed the handle between get and use;
-			// the statement never ran, so direct execution is safe.
-			return q.exec().ExecContext(ctx, sqlText, args...)
-		}
-		return res, evictOnSchemaChange(q, sqlText, err)
-	}
-	return q.exec().ExecContext(ctx, sqlText, args...)
-}
-
-// isStmtClosed matches database/sql's unexported "statement is closed"
-// condition — stable text since Go 1.0, and the only signal available.
-func isStmtClosed(err error) bool {
-	return err != nil && err.Error() == "sql: statement is closed"
-}
-
-func query(ctx context.Context, q Queryer, sqlText string, args []any) (*sql.Rows, error) {
-	if st, ok, err := q.stmt(ctx, sqlText); err != nil {
-		return nil, err
-	} else if ok {
-		rows, err := st.QueryContext(ctx, args...)
-		if isStmtClosed(err) {
-			return q.exec().QueryContext(ctx, sqlText, args...)
-		}
-		return rows, evictOnSchemaChange(q, sqlText, err)
-	}
-	return q.exec().QueryContext(ctx, sqlText, args...)
-}
-
-// evictOnSchemaChange drops a cached statement invalidated by DDL (Postgres:
-// "cached plan must not change result type", SQLSTATE 0A000) and returns the
-// error unchanged. rio never retries on its own — retrying writes risks
-// double execution.
-func evictOnSchemaChange(q Queryer, sqlText string, err error) error {
-	if err == nil {
-		return nil
-	}
-	if db, ok := q.(*DB); ok && db.stmts != nil && sqlState(err) == "0A000" {
-		db.stmts.evict(sqlText)
-	}
-	return err
 }

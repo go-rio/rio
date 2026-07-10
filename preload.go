@@ -2,7 +2,6 @@ package rio
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"math"
 	"reflect"
@@ -504,7 +503,7 @@ func renderRelSelect(g *grammar, res *resolvedRel, kind relKind, keys []any, rq 
 
 // scanRel appends scanned rows to buf, returning the grown slice and, when
 // keyed, one owner key per appended row.
-func scanRel(rows *sql.Rows, p *plan, buf reflect.Value, keyed bool, res *resolvedRel) (out reflect.Value, keys []any, err error) {
+func scanRel(rows rows, p *plan, buf reflect.Value, keyed bool, res *resolvedRel) (out reflect.Value, keys []any, err error) {
 	defer mergeClose(rows, &err)
 	extra := 0
 	if keyed {
@@ -744,7 +743,7 @@ func countRelation(ctx context.Context, db Queryer, owner *plan, name string, ro
 }
 
 // scanCounts drains (key, count) pairs into the grouping map.
-func scanCounts(rows *sql.Rows, keyType reflect.Type, byKey map[any]int64) (err error) {
+func scanCounts(rows rows, keyType reflect.Type, byKey map[any]int64) (err error) {
 	defer mergeClose(rows, &err)
 	keyBuf := reflect.New(keyType)
 	kf := &field{name: "count key", column: "<key>", typ: keyType}
@@ -753,13 +752,21 @@ func scanCounts(rows *sql.Rows, keyType reflect.Type, byKey map[any]int64) (err 
 		return err
 	}
 	kf.code = codec
-	cell := colScanner{f: kf, base: keyBuf.UnsafePointer()}
+	// One escaping box carries the cell, the count slot, and their dest
+	// slice: a fresh variadic slice at the interface call would otherwise
+	// heap-allocate per row (see scanScalars).
+	var box struct {
+		cell colScanner
+		n    int64
+		dest [2]any
+	}
+	box.cell = colScanner{f: kf, base: keyBuf.UnsafePointer()}
+	box.dest[0], box.dest[1] = &box.cell, &box.n
 	for rows.Next() {
-		var n int64
-		if err := rows.Scan(&cell, &n); err != nil {
+		if err := rows.Scan(box.dest[:]...); err != nil {
 			return err
 		}
-		byKey[canonKey(keyBuf.Elem())] = n
+		byKey[canonKey(keyBuf.Elem())] = box.n
 	}
 	return rows.Err()
 }

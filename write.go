@@ -2,7 +2,6 @@ package rio
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"reflect"
@@ -628,7 +627,7 @@ func appendReturning(b []byte, d Dialect, table string, p *plan) []byte {
 
 // scanBackCols fills the database-generated columns from a single-row
 // RETURNING result.
-func scanBackCols(rows *sql.Rows, back []*field, base unsafe.Pointer) error {
+func scanBackCols(rows rows, back []*field, base unsafe.Pointer) error {
 	scanned, err := scanBackColsIfRow(rows, back, base)
 	if err == nil && !scanned {
 		return errors.New("rio: RETURNING produced no row")
@@ -644,7 +643,7 @@ func scanBackCols(rows *sql.Rows, back []*field, base unsafe.Pointer) error {
 // mergeClose, not a bare deferred Close: the single row leaves the result
 // undrained, so Close is where the driver reports whether the write actually
 // completed — dropped, a failed INSERT would return nil with a stale ID.
-func scanBackColsIfRow(rows *sql.Rows, back []*field, base unsafe.Pointer) (scanned bool, err error) {
+func scanBackColsIfRow(rows rows, back []*field, base unsafe.Pointer) (scanned bool, err error) {
 	defer mergeClose(rows, &err)
 	if !rows.Next() {
 		return false, rows.Err()
@@ -659,7 +658,7 @@ func scanBackColsIfRow(rows *sql.Rows, back []*field, base unsafe.Pointer) (scan
 
 // scanBackRow fills the whole row from a single-row RETURNING result
 // (upserts: the surviving row's values are computed database-side).
-func scanBackRow(rows *sql.Rows, p *plan, base unsafe.Pointer) (err error) {
+func scanBackRow(rows rows, p *plan, base unsafe.Pointer) (err error) {
 	defer mergeClose(rows, &err)
 	fields, err := entityFields(rows, p, 0)
 	if err != nil {

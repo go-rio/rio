@@ -2,7 +2,6 @@ package rio
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"reflect"
 )
@@ -287,7 +286,7 @@ func selectJoinRefs(ctx context.Context, tx *Tx, p *plan, res *resolvedRel, owne
 	return keys, vals, set, nil
 }
 
-func scanJoinRefs(rows *sql.Rows, res *resolvedRel) (keys []any, vals []any, set map[any]struct{}, err error) {
+func scanJoinRefs(rows rows, res *resolvedRel) (keys []any, vals []any, set map[any]struct{}, err error) {
 	defer mergeClose(rows, &err)
 	// res.fk is the target's PK — the type the join column's values are.
 	kf := &field{name: "join key", column: res.joinRef, typ: res.fk.typ}
@@ -296,13 +295,18 @@ func scanJoinRefs(rows *sql.Rows, res *resolvedRel) (keys []any, vals []any, set
 		return nil, nil, nil, err
 	}
 	kf.code = codec
-	var cell colScanner
-	cell.f = kf
+	// The cell and its dest slot share one escaping box (see scanScalars).
+	var box struct {
+		cell colScanner
+		dest [1]any
+	}
+	box.cell.f = kf
+	box.dest[0] = &box.cell
 	set = make(map[any]struct{})
 	for rows.Next() {
 		keyBuf := reflect.New(res.fk.typ) // fresh cell: values outlive the scan
-		cell.base = keyBuf.UnsafePointer()
-		if err := rows.Scan(&cell); err != nil {
+		box.cell.base = keyBuf.UnsafePointer()
+		if err := rows.Scan(box.dest[:]...); err != nil {
 			return nil, nil, nil, err
 		}
 		k := canonKey(keyBuf.Elem())

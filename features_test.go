@@ -302,14 +302,15 @@ func TestStmtCacheClosedStatementFallsBackToDirectExecution(t *testing.T) {
 	// between the cache get and the query. database/sql then fails with
 	// "sql: statement is closed" before reaching the driver, and rio must
 	// fall back to direct execution — the statement never ran, so it is safe.
-	db.stmts.mu.Lock()
-	for _, el := range db.stmts.bySQL {
+	stmts := db.e.(*sqlEngine).stmts
+	stmts.mu.Lock()
+	for _, el := range stmts.bySQL {
 		st := el.Value.(*stmtEntry).stmt
-		db.stmts.mu.Unlock()
+		stmts.mu.Unlock()
 		_ = st.Close()
-		db.stmts.mu.Lock()
+		stmts.mu.Lock()
 	}
-	db.stmts.mu.Unlock()
+	stmts.mu.Unlock()
 
 	f.queueRows(userCols, userRow(1, "a@x"))
 	users, err := q.All(ctx, db)
