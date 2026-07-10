@@ -285,6 +285,22 @@ func TestStmtCachePrepareFailurePropagates(t *testing.T) {
 	}
 }
 
+// closeCachedStmts closes every *sql.Stmt the cache holds without evicting its
+// entries, reproducing the documented race where a concurrent eviction closes
+// a handle between the cache get and its use. Close runs off the lock — it can
+// do a network round-trip and the mutex guards only the maps.
+func closeCachedStmts(db *DB) {
+	stmts := db.e.(*sqlEngine).stmts
+	stmts.mu.Lock()
+	for _, el := range stmts.bySQL {
+		st := el.Value.(*stmtEntry).stmt
+		stmts.mu.Unlock()
+		_ = st.Close()
+		stmts.mu.Lock()
+	}
+	stmts.mu.Unlock()
+}
+
 func TestStmtCacheClosedStatementFallsBackToDirectExecution(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -300,15 +316,7 @@ func TestStmtCacheClosedStatementFallsBackToDirectExecution(t *testing.T) {
 	// between the cache get and the query. database/sql then fails with
 	// "sql: statement is closed" before reaching the driver, and rio must
 	// fall back to direct execution — the statement never ran, so it is safe.
-	stmts := db.e.(*sqlEngine).stmts
-	stmts.mu.Lock()
-	for _, el := range stmts.bySQL {
-		st := el.Value.(*stmtEntry).stmt
-		stmts.mu.Unlock()
-		_ = st.Close()
-		stmts.mu.Lock()
-	}
-	stmts.mu.Unlock()
+	closeCachedStmts(db)
 
 	f.queueRows(userCols, userRow(1, "a@x"))
 	users, err := q.All(ctx, db)
@@ -320,6 +328,115 @@ func TestStmtCacheClosedStatementFallsBackToDirectExecution(t *testing.T) {
 	}
 	if len(f.prepped) != 1 {
 		t.Fatalf("the fallback executes directly, never re-prepares: %v", f.prepped)
+	}
+}
+
+func TestStmtCacheExecClosedStatementFallsBackToDirectExecution(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.openWith(SQLite, WithStmtCache(2))
+
+	const stmt = "UPDATE users SET age = ? WHERE id = ?"
+	if _, err := Exec(ctx, db, stmt, 30, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// The exec path carries the same race as the query path: a concurrent
+	// eviction closes the handle between the cache get and the exec, so
+	// database/sql reports "sql: statement is closed" before the driver runs
+	// it. rio re-executes directly — the write never happened, so it is safe.
+	closeCachedStmts(db)
+
+	f.queueExec(0, 7)
+	res, err := Exec(ctx, db, stmt, 31, 1)
+	if err != nil {
+		t.Fatalf("closed statement must fall back to direct execution: %v", err)
+	}
+	if n, _ := res.RowsAffected(); n != 7 {
+		t.Fatalf("fallback must return the direct-execution result, got %d rows affected", n)
+	}
+	if len(f.prepped) != 1 {
+		t.Fatalf("the fallback executes directly, never re-prepares: %v", f.prepped)
+	}
+}
+
+func TestStmtCacheExecSchemaChangeEvictsAndPropagates(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.openWith(Postgres, WithStmtCache(4))
+
+	const stmt = "UPDATE users SET age = ? WHERE id = ?"
+	if _, err := Exec(ctx, db, stmt, 30, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.prepped) != 1 {
+		t.Fatalf("expected one prepared statement: %v", f.prepped)
+	}
+
+	f.failContaining("UPDATE", schemaChangeErr{})
+	_, err := Exec(ctx, db, stmt, 31, 1)
+	if err == nil || !strings.Contains(err.Error(), "cached plan must not change result type") {
+		t.Fatalf("the schema-change error must propagate unchanged: %v", err)
+	}
+	// The invalidated statement is evicted (closed) and never auto-retried: a
+	// write retried on its own could double-execute. It hit the driver exactly
+	// twice — one success, one failure.
+	if closed := f.closedStmts(); len(closed) != 1 || !strings.Contains(closed[0], "UPDATE") {
+		t.Fatalf("0A000 must evict and close the cached statement, closed: %v", closed)
+	}
+	if n := len(f.loggedContaining("UPDATE")); n != 2 {
+		t.Fatalf("0A000 must never auto-retry, got %d executions", n)
+	}
+
+	// The next write prepares fresh instead of reusing the stale plan.
+	f.unfail("UPDATE")
+	if _, err := Exec(ctx, db, stmt, 32, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.prepped) != 2 {
+		t.Fatalf("post-eviction execution must re-prepare: %v", f.prepped)
+	}
+}
+
+// TestStmtCacheConcurrentEvictionRaceClean hammers a cap-bound cache with more
+// shapes than it holds, so gets, evictions, and same-shape prepare races
+// overlap continuously. Its point is the -race gate: the cache's locking must
+// hold with no data race, no lost error, and no double-close.
+func TestStmtCacheConcurrentEvictionRaceClean(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.openWith(SQLite, WithStmtCache(4))
+
+	var shapes []string
+	for _, c := range "abcdefgh" { // 8 shapes > cap 4: every worker churns the LRU
+		shapes = append(shapes, "UPDATE t SET "+string(c)+" = ? WHERE id = ?")
+	}
+	const workers = 32
+	const iters = 300
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			<-start // release together to widen the concurrent-prepare window
+			for i := 0; i < iters; i++ {
+				if _, err := Exec(ctx, db, shapes[(w+i)%len(shapes)], i, w); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}(w)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent exec through the evicting cache failed: %v", err)
+	}
+	if len(f.closedStmts()) == 0 {
+		t.Fatal("expected the small-cap cache to evict under load")
 	}
 }
 
@@ -1290,6 +1407,149 @@ func TestCompiledRows(t *testing.T) {
 	}
 }
 
+// rawStreamRow is a DTO target for the RawQuery.Rows tests; "id"/"name" fully
+// cover it, so namedFields accepts the result.
+type rawStreamRow struct {
+	ID   int64
+	Name string
+}
+
+func TestRawQueryRowsStreams(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id", "name"},
+		[]driver.Value{int64(1), "a"},
+		[]driver.Value{int64(2), "b"},
+		[]driver.Value{int64(3), "c"})
+
+	var got []int64
+	for r, err := range Raw[rawStreamRow]("SELECT id, name FROM t WHERE id > ?", 0).Rows(ctx, db) {
+		if err != nil {
+			t.Fatalf("iter: %v", err)
+		}
+		got = append(got, r.ID)
+	}
+	if len(got) != 3 || got[0] != 1 || got[2] != 3 {
+		t.Fatalf("streamed: %v", got)
+	}
+	// The raw pipeline still rebinds ? to the dialect form.
+	if sql := f.logged()[0]; sql != "SELECT id, name FROM t WHERE id > $1" {
+		t.Fatalf("rebind: %s", sql)
+	}
+}
+
+// Scalars stream through Rows too, matching Raw[int64](...).All.
+func TestRawQueryRowsScalars(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"n"}, []driver.Value{int64(10)}, []driver.Value{int64(20)})
+
+	var sum int64
+	for n, err := range Raw[int64]("SELECT n FROM t").Rows(ctx, db) {
+		if err != nil {
+			t.Fatalf("iter: %v", err)
+		}
+		sum += n
+	}
+	if sum != 30 {
+		t.Fatalf("sum: %d", sum)
+	}
+}
+
+// Early break must close the driver rows even though the result is undrained.
+func TestRawQueryRowsEarlyBreakCloses(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id", "name"},
+		[]driver.Value{int64(1), "a"},
+		[]driver.Value{int64(2), "b"},
+		[]driver.Value{int64(3), "c"})
+
+	before := f.rowsCloseCount()
+	var got []int64
+	for r, err := range Raw[rawStreamRow]("SELECT id, name FROM t").Rows(ctx, db) {
+		if err != nil {
+			t.Fatalf("iter: %v", err)
+		}
+		got = append(got, r.ID)
+		break // stop after the first row
+	}
+	if len(got) != 1 || got[0] != 1 {
+		t.Fatalf("streamed: %v", got)
+	}
+	if f.rowsCloseCount() == before {
+		t.Fatal("early break must close the rows")
+	}
+}
+
+// A scan failure mid-stream surfaces on that element; the driver Close error
+// rides underneath it (mergeClose keeps the scan error).
+func TestRawQueryRowsScanErrorSurfaces(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRowsCloseErr(errors.New("deferred close"), []string{"id", "name"},
+		[]driver.Value{int64(1), "a"},
+		[]driver.Value{nil, "b"}) // NULL into int64 ID fails on the second row
+
+	var got []int64
+	var iterErr error
+	for r, err := range Raw[rawStreamRow]("SELECT id, name FROM t").Rows(ctx, db) {
+		if err != nil {
+			iterErr = err
+			break
+		}
+		got = append(got, r.ID)
+	}
+	if len(got) != 1 || got[0] != 1 {
+		t.Fatalf("first row should stream before the error: %v", got)
+	}
+	if iterErr == nil || !strings.Contains(iterErr.Error(), "NULL") {
+		t.Fatalf("scan error must surface, got: %v", iterErr)
+	}
+}
+
+// A result missing a mapped column is refused before any row streams — the
+// same guard All applies against zeroed-out partial scans.
+func TestRawQueryRowsFullCoverageEnforced(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)}) // "name" missing
+
+	var iterErr error
+	for _, err := range Raw[rawStreamRow]("SELECT id FROM t").Rows(ctx, db) {
+		iterErr = err
+		break
+	}
+	if iterErr == nil || !strings.Contains(iterErr.Error(), "DTO") {
+		t.Fatalf("partial coverage must error with guidance: %v", iterErr)
+	}
+}
+
+// A fully drained stream surfaces the deferred driver Close error on the final
+// yield — the mergeClose discipline shared with All.
+func TestRawQueryRowsSurfacesCloseError(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	closeErr := errors.New("driver: connection reset while closing rows")
+	f.queueRowsCloseErr(closeErr, []string{"id", "name"}, []driver.Value{int64(1), "a"})
+
+	var iterErr error
+	for _, err := range Raw[rawStreamRow]("SELECT id, name FROM t").Rows(ctx, db) {
+		if err != nil {
+			iterErr = err
+		}
+	}
+	if !errors.Is(iterErr, closeErr) {
+		t.Fatalf("Rows must surface the deferred close error, got: %v", iterErr)
+	}
+}
+
 // Codex v0.3 review: concurrent SyncRelation must serialize on the owner row.
 func TestSyncRelationLocksOwner(t *testing.T) {
 	ctx := context.Background()
@@ -1391,6 +1651,109 @@ func TestSetOpsRefuseLimitOffsetGroupBy(t *testing.T) {
 	}
 	if _, err := From[User]().Where("age > ?", 1).Limit(3).RestoreAll(ctx, db); err == nil || !strings.Contains(err.Error(), "RestoreAll cannot honor Limit/Offset") {
 		t.Fatalf("Restore with Limit: %v", err)
+	}
+}
+
+// forceDeleteAll is the shared hard-delete render behind both DeleteAll (on a
+// model without a softdelete column) and ForceDeleteAll. On a plain model
+// DeleteAll takes the hard path: a real DELETE that honors Where and returns
+// the driver's affected count.
+func TestDeleteAllHardDeletesModelWithoutSoftColumn(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueExec(0, 7)
+
+	n, err := From[Post]().Where("user_id = ?", 5).DeleteAll(ctx, db)
+	if err != nil {
+		t.Fatalf("DeleteAll: %v", err)
+	}
+	if n != 7 {
+		t.Fatalf("DeleteAll must return the driver's affected count, got %d", n)
+	}
+	got := f.logged()[0]
+	want := `DELETE FROM "posts" WHERE (user_id = $1)`
+	if got != want {
+		t.Fatalf("sql:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// ForceDeleteAll hard-deletes on a softdelete model. WithTrashed drops the
+// deleted_at filter so trashed rows are deleted too, the Where is honored, and
+// the version column never enters a set-based write (no optimistic-lock
+// predicate, no version bind). The contrast is DeleteAll on the same model,
+// which stays a soft UPDATE stamping deleted_at behind the live-row filter.
+func TestForceDeleteAllHardDeletesSoftModel(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueExec(0, 3)
+
+	n, err := From[User]().WithTrashed().Where("age > ?", 1).ForceDeleteAll(ctx, db)
+	if err != nil {
+		t.Fatalf("ForceDeleteAll: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("ForceDeleteAll must return the driver's affected count, got %d", n)
+	}
+	got := f.logged()[0]
+	want := `DELETE FROM "users" WHERE (age > $1)`
+	if got != want {
+		t.Fatalf("sql:\n got: %s\nwant: %s", got, want)
+	}
+	if strings.Contains(got, "version") {
+		t.Fatalf("set-based hard delete must not touch the version column: %s", got)
+	}
+	if args := f.loggedContaining("DELETE")[0].args; len(args) != 1 {
+		t.Fatalf("hard delete binds only the Where arg (no version), got %#v", args)
+	}
+
+	// Contrast: DeleteAll on the same softdelete model stays a soft UPDATE.
+	f = newFakeDB()
+	db = f.open()
+	f.queueExec(0, 4)
+	if _, err := From[User]().Where("age > ?", 1).DeleteAll(ctx, db); err != nil {
+		t.Fatalf("DeleteAll: %v", err)
+	}
+	got = f.logged()[0]
+	want = `UPDATE "users" SET "deleted_at" = $1, "updated_at" = $2 WHERE (age > $3) AND "users"."deleted_at" IS NULL`
+	if got != want {
+		t.Fatalf("soft DeleteAll sql:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// Both hard-delete paths refuse a whole-table write without conditions and run
+// once AllRows opts in: OnlyTrashed().AllRows().ForceDeleteAll empties the
+// recycle bin (deleted_at IS NOT NULL), AllRows().DeleteAll clears a plain
+// table.
+func TestHardDeleteRequiresWhere(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+
+	if _, err := From[Post]().DeleteAll(ctx, db); !errors.Is(err, ErrMissingWhere) {
+		t.Fatalf("DeleteAll without conditions: want ErrMissingWhere, got %v", err)
+	}
+	if _, err := From[User]().ForceDeleteAll(ctx, db); !errors.Is(err, ErrMissingWhere) {
+		t.Fatalf("ForceDeleteAll without conditions: want ErrMissingWhere, got %v", err)
+	}
+
+	f.queueExec(0, 2)
+	if _, err := From[Post]().AllRows().DeleteAll(ctx, db); err != nil {
+		t.Fatalf("DeleteAll AllRows: %v", err)
+	}
+	if got, want := f.logged()[0], `DELETE FROM "posts"`; got != want {
+		t.Fatalf("sql:\n got: %s\nwant: %s", got, want)
+	}
+
+	f2 := newFakeDB()
+	db2 := f2.open()
+	f2.queueExec(0, 5)
+	if _, err := From[User]().OnlyTrashed().AllRows().ForceDeleteAll(ctx, db2); err != nil {
+		t.Fatalf("ForceDeleteAll OnlyTrashed AllRows: %v", err)
+	}
+	if got, want := f2.logged()[0], `DELETE FROM "users" WHERE "users"."deleted_at" IS NOT NULL`; got != want {
+		t.Fatalf("recycle-bin empty sql:\n got: %s\nwant: %s", got, want)
 	}
 }
 
@@ -2939,6 +3302,54 @@ func TestSoleRespectsCallerLimit(t *testing.T) {
 	}
 	if got := f.logged()[1]; !strings.Contains(got, "LIMIT 2") {
 		t.Fatalf("Sole without a caller Limit still probes with LIMIT 2: %s", got)
+	}
+}
+
+// RawQuery.Sole: a miss yields ErrNotFound (wrapping sql.ErrNoRows), two rows
+// yield ErrMultipleRows, exactly one returns it.
+func TestRawQuerySoleContract(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+
+	f.queueRows([]string{"id", "name"})
+	if _, err := Raw[rawStreamRow]("SELECT id, name FROM t WHERE id = ?", 99).Sole(ctx, db); !errors.Is(err, ErrNotFound) || !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("miss must be ErrNotFound wrapping sql.ErrNoRows, got: %v", err)
+	}
+
+	f.queueRows([]string{"id", "name"}, []driver.Value{int64(1), "a"})
+	got, err := Raw[rawStreamRow]("SELECT id, name FROM t WHERE id = ?", 1).Sole(ctx, db)
+	if err != nil || got == nil || got.ID != 1 {
+		t.Fatalf("single row: %v %+v", err, got)
+	}
+
+	f.queueRows([]string{"id", "name"}, []driver.Value{int64(1), "a"}, []driver.Value{int64(2), "b"})
+	if _, err := Raw[rawStreamRow]("SELECT id, name FROM t").Sole(ctx, db); !errors.Is(err, ErrMultipleRows) {
+		t.Fatalf("two rows must be ErrMultipleRows, got: %v", err)
+	}
+}
+
+// Compiled.Sole: same contract, running the compiled SQL as-is.
+func TestCompiledSoleContract(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	q := MustCompile[User](From[User]().Where("id = ?").Limit(2))
+
+	f.queueRows(userCols)
+	if _, err := q.Sole(ctx, db, 99); !errors.Is(err, ErrNotFound) || !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("miss must be ErrNotFound wrapping sql.ErrNoRows, got: %v", err)
+	}
+
+	f.queueRows(userCols, userRow(1, "a@x"))
+	got, err := q.Sole(ctx, db, 1)
+	if err != nil || got == nil || got.ID != 1 {
+		t.Fatalf("single row: %v %+v", err, got)
+	}
+
+	f.queueRows(userCols, userRow(1, "a@x"), userRow(2, "b@x"))
+	if _, err := q.Sole(ctx, db, 0); !errors.Is(err, ErrMultipleRows) {
+		t.Fatalf("two rows must be ErrMultipleRows, got: %v", err)
 	}
 }
 

@@ -39,6 +39,26 @@
 // rewrite them); sentinel errors (ErrNotFound, ErrDuplicateKey, …) answer
 // errors.Is with the driver's error kept in the chain.
 //
+// Struct tags map fields and assign column roles (rio:"col,opt,…"):
+//
+//   - "col_name": rename the column (default snake_case, UserID → user_id).
+//   - ",pk": primary key; tag several fields for a composite key.
+//   - ",noautoincr": a single integer primary key rio must not auto-increment.
+//   - ",version": optimistic-lock counter (integer, int64 recommended); a lost race returns ErrStaleObject.
+//   - ",softdelete": on time.Time/*time.Time, Delete becomes a timestamp UPDATE and default reads filter the row out.
+//   - ",json": store the field as JSON.
+//   - ",countof:Rel": int64 target that WithCount("Rel") fills with a HasMany/ManyToMany row count.
+//   - ",omitzero": skip the column while the field is zero so the database default applies.
+//   - ",nostamp": opt a time field out of CreatedAt/UpdatedAt maintenance.
+//   - ",fk:col" / ",ref:col" / ",join:table": relation-container overrides — foreign key, referenced key, join table.
+//   - "-": not a column.
+//
+// Conventions need no tag: an ID field is the primary key and, as a single
+// integer, auto-increments — a rename/omitzero/noautoincr keeps that, an
+// explicit pk anywhere in the model opts out; CreatedAt and UpdatedAt
+// (time.Time or *time.Time) are stamped on write; a TableName() string method
+// overrides the pluralized table name (User → users, Person → people).
+//
 // The full design rationale — including the list of features rio refuses to
 // have — lives in DESIGN.md; schema migrations live in go-rio/migrate.
 package rio

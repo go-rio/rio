@@ -3,7 +3,9 @@ package rio
 import (
 	"context"
 	"database/sql"
+	"iter"
 	"reflect"
+	"unsafe"
 )
 
 // RawQuery is the escape hatch: hand-written SQL through the same rebind
@@ -19,6 +21,8 @@ type RawQuery[T any] struct {
 // errors on result columns with no matching field: silently dropped data is
 // how schema drift hides. Scanning half an entity and then calling Update
 // writes zero values to the columns you did not select — project into DTOs.
+// The SQL text is used verbatim; never build it from untrusted input — dynamic
+// identifiers belong in column whitelists or rio.WriteColumns constants.
 func Raw[T any](sqlText string, args ...any) RawQuery[T] {
 	return RawQuery[T]{sql: sqlText, args: copyArgs(args)}
 }
@@ -77,6 +81,75 @@ func (r RawQuery[T]) Sole(ctx context.Context, db Queryer) (*T, error) {
 		return &rows[0], nil
 	}
 	return nil, ErrMultipleRows
+}
+
+// Rows streams the raw query's rows without materializing them, for result
+// sets too large to hold: for v, err := range Raw[T](...).Rows(ctx, db).
+// Iteration stops on the first error (yielded with a zero T) and the rows
+// close automatically, including on early break. Like All it scans scalars,
+// DTOs, or entities and holds the result to the same full-column-coverage rule
+// — a struct target missing a mapped column is an error, not a silent partial
+// scan.
+func (r RawQuery[T]) Rows(ctx context.Context, db Queryer) iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		var zero T
+		d := db.gram().d
+		sqlText, args, err := finishSQLText(d, r.sql, r.args)
+		if err != nil {
+			yield(zero, err)
+			return
+		}
+		rows, finish, err := runQuery(ctx, db, "raw", "", sqlText, args)
+		if err != nil {
+			yield(zero, err)
+			return
+		}
+		defer rows.Close() // early-break and panic close; mergeClose folds the error on the normal paths
+
+		// fields is the per-column scan plan: a synthetic single column for
+		// scalars, else the entity's columns matched by name with full coverage
+		// enforced (namedFields) — the same shapes All scans.
+		tt := reflect.TypeFor[T]()
+		var fields []*field
+		if isScalarType(tt) {
+			f := &field{name: tt.String(), column: "<scalar>", typ: tt}
+			if f.code, err = codecFor(f); err == nil {
+				fields = []*field{f}
+			}
+		} else {
+			var p *plan
+			if p, err = planOf[T](); err == nil {
+				fields, err = namedFields(rows, p)
+			}
+		}
+		if err != nil {
+			mergeClose(rows, &err)
+			finishQuery(finish, err)
+			yield(zero, err)
+			return
+		}
+		rs := newRowScanner(fields, nil)
+		defer rs.release()
+		for rows.Next() {
+			var row T
+			if err := rs.scan(rows, unsafe.Pointer(&row)); err != nil {
+				mergeClose(rows, &err)
+				finishQuery(finish, err)
+				yield(zero, err)
+				return
+			}
+			if !yield(row, nil) {
+				finishQuery(finish, nil)
+				return
+			}
+		}
+		err = rows.Err()
+		mergeClose(rows, &err)
+		finishQuery(finish, err)
+		if err != nil {
+			yield(zero, err)
+		}
+	}
 }
 
 // Exec runs a hand-written statement through the shared pipeline and returns

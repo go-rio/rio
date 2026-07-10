@@ -34,16 +34,23 @@ type QueryEvent struct {
 	RowsAffected int64
 }
 
-// QueryHook observes statement execution. BeforeQuery may derive a context
-// (tracing spans); AfterQuery completes it. Hooks must not retain the event
-// past the call and cannot modify the statement — rio has no mutating
-// middleware by design.
+// QueryHook observes statement execution. The context BeforeQuery returns is
+// the execution context: rio runs the statement — and, for row-returning
+// queries, the row consumption its context governs — under it, so a tracing
+// span or deadline the hook installs flows into the driver, and AfterQuery
+// receives that same context. Returning nil leaves the incoming context in
+// force. Hooks must not retain the event past the call and cannot alter the
+// statement (Op, Query, Args) — rio has no mutating middleware by design.
 //
 // For row-returning queries AfterQuery fires once the rows are consumed:
 // Err includes scan and iteration failures, and Duration spans execution
 // through row consumption. One exception: a First/Find/Sole miss reports
 // Err = nil — ErrNotFound is a successfully executed query, and telemetry
 // would otherwise count every miss as an error.
+//
+// The method set is fixed: later hook capabilities arrive as optional
+// interfaces a hook may also satisfy, discovered by type assertion, never as
+// methods added here — so existing hooks keep compiling.
 type QueryHook interface {
 	BeforeQuery(ctx context.Context, e *QueryEvent) context.Context
 	AfterQuery(ctx context.Context, e *QueryEvent)
@@ -56,7 +63,11 @@ func (c *config) beforeQuery(ctx context.Context, e *QueryEvent) context.Context
 		e.Args = cloneEventArgs(e.Args)
 	}
 	for _, h := range c.hooks {
-		ctx = h.BeforeQuery(ctx, e)
+		// nil from a hook keeps the context in force rather than nil-ing the
+		// chain: the execution context this returns is never nil.
+		if next := h.BeforeQuery(ctx, e); next != nil {
+			ctx = next
+		}
 	}
 	return ctx
 }

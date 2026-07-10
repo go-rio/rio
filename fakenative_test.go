@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -30,6 +31,11 @@ type fakeNative struct {
 	beginErr    error
 	rollbackErr error // forced Rollback result (sql.ErrTxDone injection)
 	lastTxOpts  *sql.TxOptions
+	// probe, when non-nil, receives every statement's SQL and the context it
+	// executes under — begin/commit/rollback included, since all of them flow
+	// through record — so context-propagation tests read the executing context
+	// at the driver.
+	probe func(sqlText string, ctx context.Context)
 }
 
 type fakeNativeStmt struct {
@@ -121,6 +127,9 @@ func (f *fakeNative) loggedContaining(sub string) []fakeNativeStmt {
 func (f *fakeNative) record(ctx context.Context, sqlText string, args []any, inTx bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if f.probe != nil {
+		f.probe(sqlText, ctx)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -321,6 +330,8 @@ func assignNativeDest(dest, v any) error {
 		return cell.SetNull()
 	case int64:
 		return cell.SetInt64(tv)
+	case uint64:
+		return cell.SetUint64(tv)
 	case float64:
 		return cell.SetFloat64(tv)
 	case bool:
@@ -909,5 +920,55 @@ func TestNativeWithCountScansPlainDest(t *testing.T) {
 	}
 	if len(users) != 2 || users[0].PostsCount != 4 || users[1].PostsCount != 0 {
 		t.Fatalf("counts misrouted: %+v", users)
+	}
+}
+
+// nativeUintRow exercises the uint64 sink over the SPI: a plain uint64 column,
+// a *uint64 for the NULL rule, and a uint32 the fake keeps no typed sink for,
+// so its value reaches the cell only through the boxed Scan path.
+type nativeUintRow struct {
+	ID    int64
+	Big   uint64
+	Opt   *uint64
+	Boxed uint32
+}
+
+var nativeUintCols = []string{"id", "big", "opt", "boxed"}
+
+// The native channel delivers unsigned values verbatim — no database/sql bind
+// coercion sits in between — so a UInt64 above math.MaxInt64 routes through
+// SetUint64 intact, a NULL reaches the *uint64 through SetNull, and a value the
+// fake carries only in driver-canonical form (uint32) still lands via the
+// cell's own Scan.
+func TestNativeUint64SinkRoundTrip(t *testing.T) {
+	nf := newFakeNative()
+	db := nf.open()
+	const big = uint64(math.MaxInt64) + 1 // high bit set: database/sql refuses this as a bind
+	nf.queueRows(nativeUintCols,
+		[]any{int64(1), big, big, uint32(7)},
+		[]any{int64(2), uint64(0), nil, uint32(0)},
+	)
+
+	got, err := From[nativeUintRow]().All(context.Background(), db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("rows = %d, want 2", len(got))
+	}
+	if got[0].Big != big {
+		t.Fatalf("Big = %d, want %d — a uint64 above MaxInt64 must survive SetUint64", got[0].Big, big)
+	}
+	if got[0].Opt == nil || *got[0].Opt != big {
+		t.Fatalf("Opt = %v, want *%d through the pointer cell", got[0].Opt, big)
+	}
+	if got[0].Boxed != 7 {
+		t.Fatalf("Boxed = %d, want 7 — the boxed Scan path must carry the uint32", got[0].Boxed)
+	}
+	if got[1].Opt != nil {
+		t.Fatalf("Opt = %v, want nil — NULL into a *uint64 is SetNull", got[1].Opt)
+	}
+	if got[1].Big != 0 {
+		t.Fatalf("Big = %d, want 0", got[1].Big)
 	}
 }

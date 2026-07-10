@@ -189,13 +189,17 @@ type relQuery struct {
 
 // RelWhere restricts the preloaded rows. The condition runs inside the
 // preload's own query, so it can only reference the related table's columns.
+// The expression is included verbatim; never build it from untrusted input —
+// dynamic identifiers belong in column whitelists or rio.WriteColumns constants.
 func RelWhere(expr string, args ...any) RelOption {
 	return func(rq *relQuery) {
 		rq.wheres = append(rq.wheres, cond{expr: expr, args: copyArgs(args)})
 	}
 }
 
-// RelOrder orders the preloaded rows before they are grouped per parent.
+// RelOrder orders the preloaded rows before they are grouped per parent. The
+// term is included verbatim; never build it from untrusted input — dynamic
+// identifiers belong in column whitelists or rio.WriteColumns constants.
 func RelOrder(expr string) RelOption {
 	return func(rq *relQuery) { rq.orders = append(rq.orders, expr) }
 }

@@ -272,7 +272,7 @@ func checkUpsertWrite(d Dialect, op string) error {
 	if d.caps().uniqueKeys {
 		return nil
 	}
-	return fmt.Errorf("rio: %s is not supported on %s (no unique constraints, no conflict clause); insert a new row version into a ReplacingMergeTree table and read with Final() — background merges keep the latest version per sorting key", op, d.name())
+	return unsupportedf("rio: %s is not supported on %s (no unique constraints, no conflict clause); insert a new row version into a ReplacingMergeTree table and read with Final() — background merges keep the latest version per sorting key", op, d.name())
 }
 
 // checkRacedCreate rejects FirstOrCreate/CreateOrFirst where no unique
@@ -282,7 +282,7 @@ func checkRacedCreate(d Dialect, op string) error {
 	if d.caps().uniqueKeys {
 		return nil
 	}
-	return fmt.Errorf("rio: %s is not supported on %s (no unique constraint to arbitrate the race — concurrent callers would both insert); use ReplacingMergeTree semantics or coordinate in the application", op, d.name())
+	return unsupportedf("rio: %s is not supported on %s (no unique constraint to arbitrate the race — concurrent callers would both insert); use ReplacingMergeTree semantics or coordinate in the application", op, d.name())
 }
 
 // upsertSQL is crudSQLKeyed for the upsert family: the key additionally

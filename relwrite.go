@@ -13,6 +13,8 @@ import (
 // hand-writing the join-table INSERT. Typed id slices spread directly:
 // Attach(ctx, db, &u, "Tags", tagIDs...). Attaching zero ids is a no-op
 // (spell the id type as Attach[User, int64] when nothing infers it).
+// SyncRelation is the declarative sibling — it converges the relation on an
+// exact id set instead of adding to it.
 //
 // Large id sets are chunked to the dialect's bind-parameter ceiling, like
 // InsertAll. Outside a transaction each chunk commits independently — a
@@ -30,7 +32,7 @@ func Attach[T any, K any](ctx context.Context, db Queryer, row *T, relation stri
 		// The rendered INSERT leans on ON CONFLICT DO NOTHING (a no-op
 		// assignment on MySQL) over the join table's composite unique key for
 		// its idempotency promise; without unique keys, reruns duplicate.
-		return fmt.Errorf("rio: Attach is not supported on %s (idempotency needs a unique key over the join table); insert join rows with rio.Exec or InsertAll on a ReplacingMergeTree join table", d.name())
+		return unsupportedf("rio: Attach is not supported on %s (idempotency needs a unique key over the join table); insert join rows with rio.Exec or InsertAll on a ReplacingMergeTree join table", d.name())
 	}
 	return insertJoinRows(ctx, db, p, res, ownerKey, anySlice(ids))
 }
@@ -87,6 +89,8 @@ func insertJoinRows(ctx context.Context, db Queryer, p *plan, res *resolvedRel, 
 // rows. The ids are required — detaching "everything" must be written as an
 // explicit set-based delete on the join table, never implied by an empty
 // call. Typed id slices spread directly: Detach(ctx, db, &u, "Tags", ids...).
+// SyncRelation is the declarative sibling — it converges the relation on an
+// exact id set instead of removing named links.
 //
 // Large id sets are chunked to the dialect's bind-parameter ceiling. Outside
 // a transaction each chunk commits independently; deleting is naturally
@@ -100,7 +104,7 @@ func Detach[T any, K any](ctx context.Context, db Queryer, row *T, relation stri
 		return err
 	}
 	if d := db.gram().d; !d.caps().mutations {
-		return fmt.Errorf("rio: Detach is not supported on %s (join-table DELETE is an asynchronous mutation); use rio.Exec", d.name())
+		return unsupportedf("rio: Detach is not supported on %s (join-table DELETE is an asynchronous mutation); use rio.Exec", d.name())
 	}
 	// Pass the ids as []any, not []K: a byte-kind id type would make []K a
 	// []byte that IN (?) expansion treats as one BLOB (rebind.sliceElems),
@@ -155,7 +159,9 @@ func anySlice[K any](ids []K) []any {
 // transaction (or savepoint, when db already is one): links not in ids are
 // removed, missing ones are added idempotently. An empty ids slice
 // explicitly empties the relation — unlike Detach, where "no ids" is a
-// refused footgun, Sync's whole meaning is "converge on this set".
+// refused footgun, Sync's whole meaning is "converge on this set". Attach and
+// Detach are the imperative siblings — add or remove specific links without
+// reading the current set.
 //
 // Sync reads the existing join rows and computes the difference in memory:
 // removals and additions are then chunked to the dialect's bind limit — a
@@ -179,7 +185,7 @@ func SyncRelation[T any, K any](ctx context.Context, db Queryer, row *T, relatio
 		// The transactions door is the first of three this convergence needs
 		// (transaction, owner row lock, join-table DELETE); one honest error
 		// beats reporting them piecemeal.
-		return fmt.Errorf("rio: SyncRelation is not supported on %s (needs a transaction and row locks)", d.name())
+		return unsupportedf("rio: SyncRelation is not supported on %s (needs a transaction and row locks)", d.name())
 	}
 	return db.Tx(ctx, func(tx *Tx) error {
 		d := tx.gram().d

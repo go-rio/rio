@@ -23,6 +23,11 @@ type fakeDB struct {
 	failPrepare map[string]error
 	prepped     []string
 	closed      []string // SQL of prepared statements whose Close ran
+	rowsClosed  int      // count of driver result-set Close calls
+	// probe, when non-nil, receives the context of every ExecContext and
+	// QueryContext call, so context-propagation tests read the context the
+	// statement executes under at the driver.
+	probe func(context.Context)
 }
 
 type fakeStmt struct {
@@ -118,6 +123,14 @@ func (f *fakeDB) closedStmts() []string {
 	return append([]string(nil), f.closed...)
 }
 
+// rowsCloseCount reports how many driver result sets have been closed — the
+// signal streaming tests use to prove Rows closes on early break.
+func (f *fakeDB) rowsCloseCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rowsClosed
+}
+
 func (f *fakeDB) logged() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -208,14 +221,20 @@ func (c *fakeConn) Begin() (driver.Tx, error) {
 	return fakeTx{f: c.f}, nil
 }
 
-func (c *fakeConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+func (c *fakeConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if c.f.probe != nil {
+		c.f.probe(ctx)
+	}
 	if err := c.f.record(query, values(args)); err != nil {
 		return nil, err
 	}
-	return newFakeRowsIter(c.f.nextRows()), nil
+	return newFakeRowsIter(c.f, c.f.nextRows()), nil
 }
 
-func (c *fakeConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+func (c *fakeConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if c.f.probe != nil {
+		c.f.probe(ctx)
+	}
 	if err := c.f.record(query, values(args)); err != nil {
 		return nil, err
 	}
@@ -265,18 +284,27 @@ func (s *fakePrepared) Query(args []driver.Value) (driver.Rows, error) {
 	if err := s.f.record(s.sql, args); err != nil {
 		return nil, err
 	}
-	return newFakeRowsIter(s.f.nextRows()), nil
+	return newFakeRowsIter(s.f, s.f.nextRows()), nil
 }
 
 type fakeRowsIter struct {
+	f    *fakeDB
 	data fakeRows
 	pos  int
 }
 
-func newFakeRowsIter(data fakeRows) *fakeRowsIter { return &fakeRowsIter{data: data} }
+func newFakeRowsIter(f *fakeDB, data fakeRows) *fakeRowsIter { return &fakeRowsIter{f: f, data: data} }
 
 func (r *fakeRowsIter) Columns() []string { return r.data.cols }
-func (r *fakeRowsIter) Close() error      { return r.data.closeErr }
+
+func (r *fakeRowsIter) Close() error {
+	if r.f != nil { // nil for the lock-free loopDB alloc driver
+		r.f.mu.Lock()
+		r.f.rowsClosed++
+		r.f.mu.Unlock()
+	}
+	return r.data.closeErr
+}
 
 func (r *fakeRowsIter) Next(dest []driver.Value) error {
 	if r.pos >= len(r.data.rows) {

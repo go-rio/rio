@@ -50,6 +50,8 @@ func sinkDispatch(c *colScanner, v any) error {
 		return c.SetNull()
 	case int64:
 		return c.SetInt64(tv)
+	case uint64:
+		return c.SetUint64(tv)
 	case float64:
 		return c.SetFloat64(tv)
 	case bool:
@@ -76,6 +78,7 @@ func TestNativeCellSinkEquivalence(t *testing.T) {
 	values := []any{
 		nil,
 		int64(42), int64(-7), int64(300), int64(70000), int64(1) << 40, int64(1) << 33,
+		uint64(42), uint64(300), uint64(70000), uint64(1) << 63, // last is above MaxInt64
 		float64(2.5), float64(-2.5), float64(3.4e39), float64(1e300),
 		true, false,
 		"hello", "42", "-7", "2.5", "300", "70000", "true", "0", "not-a-number",

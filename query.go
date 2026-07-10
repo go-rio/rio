@@ -93,14 +93,18 @@ func appendOne[E any](s []E, e E) []E {
 }
 
 // Where adds an AND-ed condition written in SQL with ? placeholders.
-// Slice arguments expand inside IN (?).
+// Slice arguments expand inside IN (?). The expression is included verbatim;
+// never build it from untrusted input — dynamic identifiers belong in column
+// whitelists or rio.WriteColumns constants.
 func (q Query[T]) Where(expr string, args ...any) Query[T] {
 	q.s.wheres = appendOne(q.s.wheres, cond{expr: expr, args: copyArgs(args)})
 	q.s.noteCondArity("Where", expr, len(args))
 	return q
 }
 
-// OrderBy appends an ORDER BY term, verbatim SQL ("created_at DESC").
+// OrderBy appends an ORDER BY term, verbatim SQL ("created_at DESC"). Never
+// build the term from untrusted input — dynamic identifiers belong in column
+// whitelists or rio.WriteColumns constants.
 func (q Query[T]) OrderBy(expr string) Query[T] {
 	q.s.orders = appendOne(q.s.orders, expr)
 	return q
@@ -108,12 +112,16 @@ func (q Query[T]) OrderBy(expr string) Query[T] {
 
 // GroupBy appends a GROUP BY term. Entity queries with GROUP BY are almost
 // always projections — prefer Raw — but filtering EXISTS-style uses remain.
+// The term is included verbatim; never build it from untrusted input — dynamic
+// identifiers belong in column whitelists or rio.WriteColumns constants.
 func (q Query[T]) GroupBy(expr string) Query[T] {
 	q.s.groups = appendOne(q.s.groups, expr)
 	return q
 }
 
-// Having adds an AND-ed HAVING condition.
+// Having adds an AND-ed HAVING condition. The expression is included verbatim;
+// never build it from untrusted input — dynamic identifiers belong in column
+// whitelists or rio.WriteColumns constants.
 func (q Query[T]) Having(expr string, args ...any) Query[T] {
 	q.s.havings = appendOne(q.s.havings, cond{expr: expr, args: copyArgs(args)})
 	q.s.noteCondArity("Having", expr, len(args))
@@ -157,6 +165,8 @@ func (s *queryState) noteCondArity(clause, expr string, argc int) {
 // Join appends a verbatim JOIN clause, for filtering through other tables:
 // Join("INNER JOIN orgs ON orgs.id = users.org_id"). Projections across
 // joins go through Raw — entity queries always select exactly T's columns.
+// Never build the clause from untrusted input — dynamic identifiers belong in
+// column whitelists or rio.WriteColumns constants.
 func (q Query[T]) Join(clause string) Query[T] {
 	q.s.joins = appendOne(q.s.joins, clause)
 	return q
@@ -623,7 +633,7 @@ func appendForUpdate(b []byte, d Dialect) ([]byte, error) {
 	case forUpdateRender:
 		return append(b, " FOR UPDATE"...), nil
 	case forUpdateReject:
-		return nil, fmt.Errorf("rio: ForUpdate is not supported on %s (no row locks); remove it — reads there are lock-free snapshots", d.name())
+		return nil, unsupportedf("rio: ForUpdate is not supported on %s (no row locks); remove it — reads there are lock-free snapshots", d.name())
 	}
 	return b, nil // forUpdateElide
 }
@@ -631,7 +641,7 @@ func appendForUpdate(b []byte, d Dialect) ([]byte, error) {
 // checkFinal rejects Final() on dialects without the FINAL table modifier.
 func checkFinal(d Dialect, s *queryState) error {
 	if s.final && !d.caps().finalTable {
-		return fmt.Errorf("rio: Final() requires a dialect with the FINAL table modifier (clickhouse); remove it on %s", d.name())
+		return unsupportedf("rio: Final() requires a dialect with the FINAL table modifier (clickhouse); remove it on %s", d.name())
 	}
 	return nil
 }

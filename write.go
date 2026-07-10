@@ -339,7 +339,7 @@ func checkUpdateWrite(d Dialect, op, table string) error {
 	if d.caps().mutations {
 		return nil
 	}
-	return fmt.Errorf("rio: %s is not supported on %s (no synchronous UPDATE with an affected-row count); ClickHouse updates are asynchronous mutations — issue one explicitly with rio.Exec(ctx, db, %q) or model updates as inserts into a ReplacingMergeTree table",
+	return unsupportedf("rio: %s is not supported on %s (no synchronous UPDATE with an affected-row count); ClickHouse updates are asynchronous mutations — issue one explicitly with rio.Exec(ctx, db, %q) or model updates as inserts into a ReplacingMergeTree table",
 		op, d.name(), "ALTER TABLE "+table+" UPDATE ... WHERE ...")
 }
 
@@ -347,7 +347,7 @@ func checkDeleteWrite(d Dialect, op, table string) error {
 	if d.caps().mutations {
 		return nil
 	}
-	return fmt.Errorf("rio: %s is not supported on %s; use rio.Exec with a lightweight DELETE (%q, ClickHouse 23.3+) or ALTER TABLE ... DELETE, both asynchronous mutations",
+	return unsupportedf("rio: %s is not supported on %s; use rio.Exec with a lightweight DELETE (%q, ClickHouse 23.3+) or ALTER TABLE ... DELETE, both asynchronous mutations",
 		op, d.name(), "DELETE FROM "+table+" WHERE ...")
 }
 
@@ -355,7 +355,7 @@ func checkRestoreWrite(d Dialect, op string) error {
 	if d.caps().mutations {
 		return nil
 	}
-	return fmt.Errorf("rio: %s is not supported on %s (soft-delete writes are UPDATEs); use rio.Exec with ALTER TABLE ... UPDATE", op, d.name())
+	return unsupportedf("rio: %s is not supported on %s (soft-delete writes are UPDATEs); use rio.Exec with ALTER TABLE ... UPDATE", op, d.name())
 }
 
 // checkGeneratedID upgrades the zero conventional ID from "let the database

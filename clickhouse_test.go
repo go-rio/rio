@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -475,6 +476,55 @@ func TestClickHouseRejectionMatrix(t *testing.T) {
 			requireRejected(t, f, tc.call(db), tc.want)
 		})
 	}
+}
+
+// TestCapabilityRejectionsAreErrUnsupported wires dialect-capability
+// rejections to errors.ErrUnsupported, so callers branch on the stdlib
+// sentinel instead of matching message text (the text itself is unchanged and
+// still asserted by TestClickHouseRejectionMatrix). Validation errors such as
+// ErrMissingWhere stay outside the family.
+func TestCapabilityRejectionsAreErrUnsupported(t *testing.T) {
+	ctx := context.Background()
+	u := &User{ID: 5, Email: "a@x", Version: 1}
+	acc := &Account{ID: 7}
+
+	for name, call := range map[string]func(db *DB) error{
+		"Update":       func(db *DB) error { return Update(ctx, db, u) },
+		"DeleteAll":    func(db *DB) error { _, err := From[User]().Where("age > ?", 1).DeleteAll(ctx, db); return err },
+		"Upsert":       func(db *DB) error { return Upsert(ctx, db, u, OnConflict("email")) },
+		"Tx":           func(db *DB) error { return db.Tx(ctx, func(tx *Tx) error { return nil }) },
+		"ForUpdate":    func(db *DB) error { _, err := From[User]().ForUpdate().All(ctx, db); return err },
+		"Attach":       func(db *DB) error { return Attach(ctx, db, acc, "Tags", 1) },
+		"SyncRelation": func(db *DB) error { return SyncRelation(ctx, db, acc, "Tags", []int64{1}) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := call(newFakeDB().open(ClickHouse))
+			if !errors.Is(err, errors.ErrUnsupported) {
+				t.Fatalf("errors.Is(err, errors.ErrUnsupported) = false; got %v", err)
+			}
+		})
+	}
+
+	// Final() is rejected at render on dialects without the FINAL modifier.
+	t.Run("FinalNonClickHouse", func(t *testing.T) {
+		_, err := From[User]().Final().All(ctx, newFakeDB().open(Postgres))
+		if !errors.Is(err, errors.ErrUnsupported) {
+			t.Fatalf("errors.Is(err, errors.ErrUnsupported) = false; got %v", err)
+		}
+	})
+
+	// Negative: a missing-conditions guard is a validation error, not a
+	// capability rejection — it fires before the dialect check and must not
+	// answer to errors.ErrUnsupported.
+	t.Run("MissingWhereNotUnsupported", func(t *testing.T) {
+		_, err := From[User]().UpdateAll(ctx, newFakeDB().open(ClickHouse), Set{"age": 1})
+		if !errors.Is(err, ErrMissingWhere) {
+			t.Fatalf("want ErrMissingWhere, got %v", err)
+		}
+		if errors.Is(err, errors.ErrUnsupported) {
+			t.Fatalf("ErrMissingWhere must not be errors.ErrUnsupported: %v", err)
+		}
+	})
 }
 
 func TestClickHouseForUpdateRejected(t *testing.T) {

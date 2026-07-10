@@ -11,12 +11,15 @@ import (
 // Set is the column assignment map for UpdateAll. Keys are database column
 // names; assignments render in sorted key order so the SQL is deterministic
 // (stable goldens, stable statement-cache keys). Values bind as parameters
-// unless they are Expr.
+// unless they are Expr, which is spliced verbatim (see Expr) — never build one
+// from untrusted input.
 type Set map[string]any
 
 // Expr is a raw SQL fragment used as an UpdateAll value — the escape hatch
 // for database-side arithmetic: rio.Set{"count": rio.Expr("count + 1")}.
-// It is spliced into the statement verbatim; never build one from user input.
+// It is spliced into the statement verbatim; never build one from untrusted
+// input — dynamic identifiers belong in column whitelists or rio.WriteColumns
+// constants.
 type Expr string
 
 // checkSetOpShape refuses query state a set-based write cannot honor.

@@ -665,6 +665,10 @@ func TestClickHouseRejectionsSendNothing(t *testing.T) {
 			_, err := rio.From[RejNote]().Where("id = ?", 1).DeleteAll(ctx, db)
 			return err
 		}},
+		{"ForceDeleteAll", func() error {
+			_, err := rio.From[RejNote]().Where("id = ?", 1).ForceDeleteAll(ctx, db)
+			return err
+		}},
 		{"Upsert", func() error { return rio.Upsert(ctx, db, row) }},
 		{"UpsertAll", func() error { return rio.UpsertAll(ctx, db, []RejNote{*row}) }},
 		{"FirstOrCreate", func() error { return rio.From[RejNote]().Where("id = ?", 1).FirstOrCreate(ctx, db, row) }},

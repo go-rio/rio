@@ -666,3 +666,101 @@ var ptrStampDDL = map[string]string{
 	"postgres": "CREATE TABLE ptr_stampeds (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ)",
 	"mysql":    "CREATE TABLE ptr_stampeds (id BIGINT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(32) NOT NULL, created_at DATETIME(6), updated_at DATETIME(6))",
 }
+
+// Widget has no soft-delete column: DeleteAll on it issues a real DELETE.
+type Widget struct {
+	ID   int64
+	Name string
+	Kind string
+}
+
+// Gadget has a soft-delete column: DeleteAll trashes matching rows, while
+// ForceDeleteAll hard-deletes them — trashed rows included.
+type Gadget struct {
+	ID        int64
+	Name      string
+	DeletedAt *time.Time `rio:",softdelete"`
+}
+
+var hardDeleteDDL = map[string][]string{
+	"sqlite": {
+		`DROP TABLE IF EXISTS widgets`, `DROP TABLE IF EXISTS gadgets`,
+		"CREATE TABLE widgets (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT NOT NULL)",
+		"CREATE TABLE gadgets (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, deleted_at DATETIME)",
+	},
+	"postgres": {
+		`DROP TABLE IF EXISTS widgets`, `DROP TABLE IF EXISTS gadgets`,
+		"CREATE TABLE widgets (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL)",
+		"CREATE TABLE gadgets (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, deleted_at TIMESTAMPTZ)",
+	},
+	"mysql": {
+		`DROP TABLE IF EXISTS widgets`, `DROP TABLE IF EXISTS gadgets`,
+		"CREATE TABLE widgets (id BIGINT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(64) NOT NULL, kind VARCHAR(64) NOT NULL)",
+		"CREATE TABLE gadgets (id BIGINT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(64) NOT NULL, deleted_at DATETIME(6))",
+	},
+}
+
+// runHardDelete covers the hard-delete verbs end-to-end on a real database.
+// DeleteAll on a model without a soft-delete column is a genuine DELETE that
+// removes only the rows the conditions match — the rest stay. On a soft-delete
+// model DeleteAll instead trashes the matching rows (they survive WithTrashed),
+// while ForceDeleteAll removes rows for good, reaching trashed rows too once
+// WithTrashed lifts the default filter.
+func runHardDelete(t *testing.T, db *rio.DB, dialect string) {
+	ctx := context.Background()
+	for _, ddl := range hardDeleteDDL[dialect] {
+		if _, err := rio.Exec(ctx, db, ddl); err != nil {
+			t.Fatalf("hard-delete ddl %q: %v", ddl, err)
+		}
+	}
+
+	// No soft-delete column: DeleteAll is a real DELETE that removes only the
+	// matching rows.
+	if err := rio.InsertAll(ctx, db, []Widget{
+		{Name: "a1", Kind: "a"}, {Name: "a2", Kind: "a"},
+		{Name: "b1", Kind: "b"}, {Name: "b2", Kind: "b"},
+	}); err != nil {
+		t.Fatalf("insert widgets: %v", err)
+	}
+	n, err := rio.From[Widget]().Where("kind = ?", "a").DeleteAll(ctx, db)
+	if err != nil || n != 2 {
+		t.Fatalf("DeleteAll(kind=a): n=%d err=%v", n, err)
+	}
+	if total, err := rio.From[Widget]().Count(ctx, db); err != nil || total != 2 {
+		t.Fatalf("only matching rows deleted: total=%d err=%v", total, err)
+	}
+	if gone, err := rio.From[Widget]().Where("kind = ?", "a").Count(ctx, db); err != nil || gone != 0 {
+		t.Fatalf("matched rows must be gone: gone=%d err=%v", gone, err)
+	}
+	if kept, err := rio.From[Widget]().Where("kind = ?", "b").Count(ctx, db); err != nil || kept != 2 {
+		t.Fatalf("unmatched rows must survive: kept=%d err=%v", kept, err)
+	}
+
+	// Soft-delete column: DeleteAll trashes the matching rows. They hide from
+	// the default scope but remain visible WithTrashed.
+	if err := rio.InsertAll(ctx, db, []Gadget{
+		{Name: "g1"}, {Name: "g2"}, {Name: "g3"}, {Name: "g4"},
+	}); err != nil {
+		t.Fatalf("insert gadgets: %v", err)
+	}
+	n, err = rio.From[Gadget]().Where("name IN (?)", []string{"g3", "g4"}).DeleteAll(ctx, db)
+	if err != nil || n != 2 {
+		t.Fatalf("soft DeleteAll: n=%d err=%v", n, err)
+	}
+	if live, err := rio.From[Gadget]().Count(ctx, db); err != nil || live != 2 {
+		t.Fatalf("soft-deleted rows hide from the default scope: live=%d err=%v", live, err)
+	}
+	if all, err := rio.From[Gadget]().WithTrashed().Count(ctx, db); err != nil || all != 4 {
+		t.Fatalf("soft DeleteAll keeps rows WithTrashed: all=%d err=%v", all, err)
+	}
+
+	// ForceDeleteAll hard-deletes, trashed rows included: WithTrashed lifts the
+	// default filter, AllRows opts into the unconditional bulk write.
+	n, err = rio.From[Gadget]().WithTrashed().AllRows().ForceDeleteAll(ctx, db)
+	if err != nil || n != 4 {
+		t.Fatalf("ForceDeleteAll: n=%d err=%v", n, err)
+	}
+	if remaining, err := rio.From[Gadget]().WithTrashed().Count(ctx, db); err != nil || remaining != 0 {
+		t.Fatalf("ForceDeleteAll must remove trashed rows too: remaining=%d err=%v", remaining, err)
+	}
+}

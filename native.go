@@ -15,6 +15,15 @@ import (
 // seam — rendering, hooks, error translation, scanning rules, savepoints —
 // stays the channel-independent core. Application code constructs through the
 // driver module (postgres.OpenNative), never this surface.
+//
+// Extension policy: NativeDB, NativeTx, and NativeRows are frozen — a driver
+// that satisfies them compiles against every v1 rio, because rio adds no
+// method to these three within v1. New capabilities arrive as optional
+// interfaces a driver may additionally implement, discovered by type assertion
+// at the seam (database/sql/driver's own pattern — Queryer, SessionResetter,
+// and the rest opt in this way), never as a new method on these three.
+// NativeCell is the sealed, rio-implemented counterpart and grows the other
+// way; see its godoc.
 
 // NativeDB is a driver-native execution channel: what rio needs from a driver
 // pool. Driver-module SPI, not application API.
@@ -89,6 +98,9 @@ const (
 	NativeKindString
 	NativeKindBytes
 	NativeKindTime
+	// NativeKindJSON takes the column's raw JSON payload through SetBytes or
+	// SetString — the bytes rio unmarshals into the field — not a value
+	// decoded driver-side.
 	NativeKindJSON
 )
 
@@ -96,27 +108,39 @@ const (
 // column values into — rio's side of the native scan path, one cell per
 // column. Driver-module SPI, not application API.
 //
-// Every Set method is exactly Scan with the interface boxing removed:
-// SetInt64(v) behaves like Scan(int64(v)), SetNull like Scan(nil), and so on
-// — same conversion rules, same overflow and NULL handling, same error
-// shapes, because both paths run the same store helpers (scan.go). SetBytes
-// never retains v — driver memory is copied where it is stored. SetString
-// stores its argument as-is, so hand over an owned string, never an unsafe
-// view of driver memory.
+// Drivers consume NativeCell; they never implement it. The interface is sealed
+// (sealedNativeCell), so rio may add Set methods in a minor version without
+// breaking a driver — a new sink is one more optional route a codec can take,
+// never a compile break. This is the mirror of the NativeDB, NativeTx, and
+// NativeRows freeze: those three, driver-implemented, cannot gain methods
+// within v1; NativeCell, rio-implemented, can.
 //
-// ScanKind reports the cell's strategy. Pointer fields report their
-// element's kind: the sinks allocate and publish the *T cell internally and
-// SetNull stores nil, so pointer-ness never crosses the SPI.
+// Every Set method is exactly Scan with the interface boxing removed:
+// SetInt64(v) behaves like Scan(int64(v)), SetUint64(v) like Scan(uint64(v)),
+// SetNull like Scan(nil), and so on — same conversion rules, same overflow and
+// NULL handling, same error shapes, mismatched-kind fallback included, because
+// both paths run the same store helpers (scan.go). SetBytes never retains v —
+// driver memory is copied where it is stored. SetString stores its argument
+// as-is, so hand over an owned string, never an unsafe view of driver memory.
+//
+// ScanKind reports the cell's strategy. Pointer fields report their element's
+// kind: the sinks allocate and publish the *T cell internally and SetNull
+// stores nil, so pointer-ness never crosses the SPI. A NativeKindJSON cell
+// takes the raw JSON payload through SetBytes or SetString — the bytes rio
+// unmarshals — not a value decoded driver-side.
 type NativeCell interface {
 	sql.Scanner // the fallback path: the cell scans driver-canonical values itself
 	ScanKind() NativeScanKind
 	SetInt64(int64) error
+	SetUint64(uint64) error
 	SetFloat64(float64) error
 	SetBool(bool) error
 	SetString(string) error
 	SetBytes([]byte) error
 	SetTime(time.Time) error
 	SetNull() error
+
+	sealedNativeCell() // rio implements NativeCell; drivers only consume it
 }
 
 // NativeConfig carries what a driver module hands NewNative, all wired to
@@ -144,10 +168,10 @@ type NativeConfig struct {
 //
 // Like New taking over the *sql.DB's Close, Close on the returned DB closes
 // what the config carries: first the SQLView, then the channel (whose
-// adapter closes the pool). WithStmtCache panics here — a native channel has
-// no database/sql prepared statements; statement caching belongs to the
-// driver (with pgx, the DSN parameter default_query_exec_mode, which
-// defaults to caching already).
+// adapter closes the pool). Panics if NativeConfig.DB or dialect is nil.
+// WithStmtCache panics here too — a native channel has no database/sql
+// prepared statements; statement caching belongs to the driver (with pgx, the
+// DSN parameter default_query_exec_mode, which defaults to caching already).
 func NewNative(nc NativeConfig, dialect Dialect, opts ...Option) *DB {
 	if nc.DB == nil {
 		panic("rio: NewNative: NativeConfig.DB must not be nil")

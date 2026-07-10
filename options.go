@@ -69,7 +69,9 @@ func WithoutArgs() Option {
 	return func(c *config) { c.logArgs = false }
 }
 
-// WithStmtCache enables the prepared-statement cache on this DB handle.
+// WithStmtCache enables the prepared-statement cache on this DB handle. With
+// the ClickHouse dialect it panics at New — clickhouse-go prepares only INSERT
+// batches, so a prepared SELECT fails on first use.
 //
 // Off by default: connection poolers in transaction/statement mode (PgBouncer
 // et al.) break server-side prepared statements. Enable it only when rio

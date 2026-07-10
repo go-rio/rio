@@ -547,6 +547,30 @@ func (s *colScanner) SetInt64(v int64) error {
 	return nil
 }
 
+func (s *colScanner) SetUint64(v uint64) error {
+	p, publish, kind, bits := s.sinkTarget()
+	var err error
+	switch kind {
+	case scanUint:
+		err = storeUint(s.f, p, bits, v)
+	case scanInt:
+		// A uint64 into a signed field: srcInt gates the high-bit overflow
+		// exactly as Scan(uint64(v)) would (a mismatched kind — a native driver
+		// routes here only off ScanKind's uint verdict).
+		var n int64
+		if n, err = srcInt(v, s.f); err == nil {
+			err = storeInt(s.f, p, bits, n)
+		}
+	default:
+		return s.sinkSlow(v)
+	}
+	if err != nil || publish == nil {
+		return err
+	}
+	*(*unsafe.Pointer)(publish) = p
+	return nil
+}
+
 func (s *colScanner) SetFloat64(v float64) error {
 	p, publish, kind, bits := s.sinkTarget()
 	if kind != scanFloat {
@@ -676,6 +700,10 @@ func (s *colScanner) SetTime(v time.Time) error {
 }
 
 func (s *colScanner) SetNull() error { return s.scanNull() }
+
+// sealedNativeCell seals NativeCell to this package: drivers consume cells,
+// never implement them, so rio can add Set methods without breaking a driver.
+func (s *colScanner) sealedNativeCell() {}
 
 // The src* converters accept, beyond database/sql's canonical driver values,
 // the natively typed values clickhouse-go delivers: it bypasses the canonical

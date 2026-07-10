@@ -37,6 +37,10 @@ type DB struct {
 // New wraps an existing *sql.DB. Driver modules (go-rio/postgres, go-rio/mysql,
 // go-rio/sqlite) call this for you and add driver-specific error translation;
 // use New directly when you bring your own driver.
+//
+// Panics on a nil db or dialect, and on WithStmtCache with the ClickHouse
+// dialect (clickhouse-go prepares only INSERT batches, so a prepared SELECT
+// fails on first use).
 func New(db *sql.DB, dialect Dialect, opts ...Option) *DB {
 	if db == nil {
 		panic("rio: New: db must not be nil")
@@ -71,7 +75,8 @@ func (d *DB) Unwrap() *sql.DB { return d.db }
 // NativeConfig.Handle, a *pgxpool.Pool under go-rio/postgres — and nil on
 // the database/sql channel. Application code goes through the driver
 // module's typed accessor (postgres.PoolOf); this is the raw door those
-// accessors are built on.
+// accessors are built on. Its transaction-scoped sibling is Tx.NativeTx, which
+// returns the SPI transaction adapter instead of a pool handle.
 func (d *DB) Native() any { return d.native }
 
 // Close closes the prepared-statement cache (if enabled) and the underlying
@@ -94,7 +99,7 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 		// clickhouse-go's Begin returns the connection itself and opens
 		// nothing: fn would run with every statement committing independently
 		// while looking transactional — the heaviest silent surprise there is.
-		return fmt.Errorf("rio: transactions are not supported on %s (the driver's Begin is a no-op and statements would commit independently); group rows into one InsertAll for per-statement atomicity, or use db.Unwrap() with clickhouse-go's native batch API", d.g.d.name())
+		return unsupportedf("rio: transactions are not supported on %s (the driver's Begin is a no-op and statements would commit independently); group rows into one InsertAll for per-statement atomicity, or use db.Unwrap() with clickhouse-go's native batch API", d.g.d.name())
 	}
 	// Armed before BEGIN: its AfterQuery hook can panic with the transaction
 	// already open, and the connection must be rolled back before the panic
@@ -108,7 +113,7 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 			panic(p)
 		}
 	}()
-	err = observe(ctx, d.cfg, d.g.d, "begin", "BEGIN", func() error {
+	err = observe(ctx, d.cfg, d.g.d, "begin", "BEGIN", func(ctx context.Context) error {
 		var berr error
 		te, berr = d.e.begin(ctx, opts)
 		return berr
@@ -127,7 +132,7 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 		}
 		return err
 	}
-	return observe(ctx, d.cfg, d.g.d, "commit", "COMMIT", func() error { return te.commit(ctx) })
+	return observe(ctx, d.cfg, d.g.d, "commit", "COMMIT", func(ctx context.Context) error { return te.commit(ctx) })
 }
 
 // finishTx rolls the transaction back. Unlike the savepoint statements below,
@@ -139,8 +144,11 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 // Either channel reports a transaction the driver already finished — a begin
 // context that died, for one — as sql.ErrTxDone, tolerated here.
 func (d *DB) finishTx(ctx context.Context, te txEngine, cause error) error {
-	cleanup := context.WithoutCancel(ctx)
-	err := observe(ctx, d.cfg, d.g.d, "rollback", "ROLLBACK", func() error { return te.rollback(cleanup) })
+	// WithoutCancel wraps the hook context, not the raw ctx: a BeforeQuery span
+	// still reaches the rollback, but a canceled caller ctx cannot suppress it.
+	err := observe(ctx, d.cfg, d.g.d, "rollback", "ROLLBACK", func(ctx context.Context) error {
+		return te.rollback(context.WithoutCancel(ctx))
+	})
 	if err != nil && !errors.Is(err, sql.ErrTxDone) {
 		return fmt.Errorf("rio: rollback after %q failed: %w", cause, err)
 	}
@@ -148,16 +156,18 @@ func (d *DB) finishTx(ctx context.Context, te txEngine, cause error) error {
 }
 
 // observe wraps transaction-control statements with hooks and error
-// translation. COMMIT in particular must translate: deferred constraints
-// surface their violations at commit time.
-func observe(ctx context.Context, cfg *config, d Dialect, op, sqlText string, fn func() error) error {
+// translation. fn runs under the context BeforeQuery returned (hooks.go), so
+// a hook's span or deadline reaches begin/commit/rollback/savepoint. COMMIT
+// in particular must translate: deferred constraints surface their violations
+// at commit time.
+func observe(ctx context.Context, cfg *config, d Dialect, op, sqlText string, fn func(context.Context) error) error {
 	if len(cfg.hooks) == 0 {
-		return translateErr(fn(), cfg, d)
+		return translateErr(fn(ctx), cfg, d)
 	}
 	ev := &QueryEvent{Op: op, Query: sqlText}
 	hctx := cfg.beforeQuery(ctx, ev)
 	start := time.Now()
-	err := translateErr(fn(), cfg, d)
+	err := translateErr(fn(hctx), cfg, d)
 	cfg.afterQuery(hctx, ev, start, err, -1)
 	return err
 }
@@ -181,10 +191,11 @@ type Tx struct {
 // there: postgres.TxOf returns the pgx.Tx this transaction runs on.
 func (t *Tx) Unwrap() *sql.Tx { return t.tx }
 
-// NativeTx returns the NativeTx value the native channel runs this
-// transaction on, and nil on the database/sql channel. Like (*DB).Native it
-// is the raw door: application code uses the driver module's typed accessor
-// (postgres.TxOf) instead.
+// NativeTx returns the NativeTx SPI transaction adapter the native channel
+// runs this transaction on, and nil on the database/sql channel. Like
+// (*DB).Native — which hands back the driver pool handle — it is the raw door:
+// application code uses the driver module's typed accessor (postgres.TxOf)
+// instead.
 func (t *Tx) NativeTx() any {
 	if ne, ok := t.e.(nativeTxEngine); ok {
 		return ne.nt
@@ -239,15 +250,16 @@ func (t *Tx) Tx(ctx context.Context, fn func(tx *Tx) error) (err error) {
 }
 
 func (t *Tx) spExec(ctx context.Context, stmt string) error {
-	return observe(ctx, t.cfg, t.g.d, "savepoint", stmt, func() error {
+	return observe(ctx, t.cfg, t.g.d, "savepoint", stmt, func(ctx context.Context) error {
 		_, err := t.e.exec(ctx, stmt, nil)
 		return err
 	})
 }
 
 // run executes a non-row-returning statement through the shared pipeline:
-// statement cache (DB only), hooks, error translation. Without hooks the
-// event is never materialized — the hot path allocates nothing here.
+// statement cache (DB only), hooks, error translation. The statement runs
+// under the context BeforeQuery returned (hooks.go). Without hooks the event
+// is never materialized — the hot path allocates nothing here.
 func run(ctx context.Context, q Queryer, op, model, sqlText string, args []any) (sql.Result, error) {
 	cfg := q.conf()
 	if len(cfg.hooks) == 0 {
@@ -257,7 +269,7 @@ func run(ctx context.Context, q Queryer, op, model, sqlText string, args []any) 
 	ev := &QueryEvent{Op: op, Model: model, Query: sqlText, Args: args}
 	hctx := cfg.beforeQuery(ctx, ev)
 	start := time.Now()
-	res, err := q.eng().exec(ctx, sqlText, args)
+	res, err := q.eng().exec(hctx, sqlText, args)
 	err = translateErr(err, cfg, q.gram().d)
 	var rows int64 = -1
 	hookErr := err
@@ -276,9 +288,11 @@ func run(ctx context.Context, q Queryer, op, model, sqlText string, args []any) 
 }
 
 // runQuery executes a row-returning statement through the shared pipeline.
-// The returned finish callback (nil without hooks — the hot path stays
-// allocation-free) fires AfterQuery once the rows are consumed, so hooks see
-// scan errors and a duration that includes row consumption.
+// The statement — and the row consumption its context governs — runs under
+// the context BeforeQuery returned (hooks.go). The returned finish callback
+// (nil without hooks — the hot path stays allocation-free) fires AfterQuery
+// once the rows are consumed, so hooks see scan errors and a duration that
+// includes row consumption.
 func runQuery(ctx context.Context, q Queryer, op, model, sqlText string, args []any) (rows, func(error), error) {
 	cfg := q.conf()
 	if len(cfg.hooks) == 0 {
@@ -288,7 +302,7 @@ func runQuery(ctx context.Context, q Queryer, op, model, sqlText string, args []
 	ev := &QueryEvent{Op: op, Model: model, Query: sqlText, Args: args}
 	hctx := cfg.beforeQuery(ctx, ev)
 	start := time.Now()
-	rs, err := q.eng().query(ctx, sqlText, args)
+	rs, err := q.eng().query(hctx, sqlText, args)
 	err = translateErr(err, cfg, q.gram().d)
 	if err != nil {
 		cfg.afterQuery(hctx, ev, start, err, -1)

@@ -38,6 +38,24 @@ var (
 	ErrNoPrimaryKey = errors.New("rio: model has no primary key")
 )
 
+// unsupportedError marks a dialect-capability rejection: an operation the
+// target dialect structurally cannot honor (not a validation or server-side
+// error). Error returns the original message verbatim; Is reports
+// errors.ErrUnsupported so callers branch on the stdlib sentinel rather than
+// matching message substrings.
+type unsupportedError string
+
+func (e unsupportedError) Error() string { return string(e) }
+
+func (unsupportedError) Is(target error) bool { return target == errors.ErrUnsupported }
+
+// unsupportedf builds a capability rejection from a format string, mirroring
+// fmt.Errorf. Every dialect-capability rejection funnels through it so all
+// satisfy errors.Is(err, errors.ErrUnsupported).
+func unsupportedf(format string, args ...any) error {
+	return unsupportedError(fmt.Sprintf(format, args...))
+}
+
 // translateErr wraps err with the matching sentinel so callers can use
 // errors.Is(err, rio.ErrDuplicateKey) while errors.As still reaches the
 // driver's own error type. The driver modules install precise translators;
