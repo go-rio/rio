@@ -592,6 +592,36 @@ func runHardening(t *testing.T, db *rio.DB, dialect string) {
 	if len(bps) != 1 || len(bps[0].Kids.Rows()) != 1 || bps[0].Kids.Rows()[0].Label != "kid" {
 		t.Fatalf("[]byte-keyed preload lost children: %+v", bps)
 	}
+
+	// Codex audit #1: a savepoint whose inner context died must still roll
+	// back — its ROLLBACK TO runs on a cancellation-decoupled context, so the
+	// inner insert cannot silently survive into the outer commit when the
+	// caller swallows the inner error.
+	spRow := AllDefault{Note: "sp-leak"}
+	err = db.Tx(ctx, func(tx *rio.Tx) error {
+		inner, cancel := context.WithCancel(ctx)
+		defer cancel()
+		spErr := tx.Tx(inner, func(sp *rio.Tx) error {
+			if err := rio.Insert(inner, sp, &spRow); err != nil {
+				return err
+			}
+			cancel() // the inner unit's deadline fires between statements
+			return errors.New("inner failure after its context died")
+		})
+		if spErr == nil {
+			t.Fatal("inner savepoint must report the failure")
+		}
+		return nil // swallowed: the outer transaction commits
+	})
+	if err != nil {
+		t.Fatalf("outer tx after swallowed savepoint failure: %v", err)
+	}
+	if spRow.ID == 0 {
+		t.Fatal("inner insert must have run before the rollback")
+	}
+	if _, err := rio.Find[AllDefault](ctx, db, spRow.ID); !errors.Is(err, rio.ErrNotFound) {
+		t.Fatalf("a row inside the rolled-back savepoint must not survive the outer commit: %v", err)
+	}
 }
 
 // BinParent/BinChild verify preloading across a binary ([]byte) key.

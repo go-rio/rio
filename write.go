@@ -21,7 +21,10 @@ import (
 // zero version column starts at 1. Time fields are normalized in place as
 // they bind (UTC, monotonic reading stripped, microsecond precision), so
 // after Insert the struct holds exactly what the database stores and an
-// insert-then-reload comparison stays Equal.
+// insert-then-reload comparison stays Equal. Stamping happens before
+// execution: after a failed Insert the struct may already carry this
+// attempt's timestamps and version=1 while the database is untouched —
+// retrying with the same struct is safe.
 func Insert[T any](ctx context.Context, db Queryer, row *T) error {
 	p, err := planOf[T]()
 	if err != nil {
@@ -89,7 +92,10 @@ func Insert[T any](ctx context.Context, db Queryer, row *T) error {
 // column — honestly, zero values included (partial scans beware: unscanned
 // fields overwrite with zeros). With a list it updates exactly those columns
 // plus UpdatedAt. A version column is checked and incremented atomically;
-// losing the race returns ErrStaleObject.
+// losing the race returns ErrStaleObject. UpdatedAt is stamped before
+// execution: after a failed Update the struct may already carry this
+// attempt's stamp while the database is untouched — retrying with the same
+// struct is safe (the stamp is reset to the clock on every call anyway).
 func Update[T any](ctx context.Context, db Queryer, row *T, cols ...string) error {
 	p, err := planOf[T]()
 	if err != nil {
@@ -635,8 +641,11 @@ func scanBackCols(rows *sql.Rows, back []*field, base unsafe.Pointer) error {
 // conflict), leaving the struct as given. The column list is rio's own
 // render, so no pre-Scan shape check: database/sql's Scan reports a count
 // mismatch just as loudly, without the extra Columns() copy per insert.
+// mergeClose, not a bare deferred Close: the single row leaves the result
+// undrained, so Close is where the driver reports whether the write actually
+// completed — dropped, a failed INSERT would return nil with a stale ID.
 func scanBackColsIfRow(rows *sql.Rows, back []*field, base unsafe.Pointer) (scanned bool, err error) {
-	defer rows.Close()
+	defer mergeClose(rows, &err)
 	if !rows.Next() {
 		return false, rows.Err()
 	}
@@ -650,8 +659,8 @@ func scanBackColsIfRow(rows *sql.Rows, back []*field, base unsafe.Pointer) (scan
 
 // scanBackRow fills the whole row from a single-row RETURNING result
 // (upserts: the surviving row's values are computed database-side).
-func scanBackRow(rows *sql.Rows, p *plan, base unsafe.Pointer) error {
-	defer rows.Close()
+func scanBackRow(rows *sql.Rows, p *plan, base unsafe.Pointer) (err error) {
+	defer mergeClose(rows, &err)
 	fields, err := entityFields(rows, p, 0)
 	if err != nil {
 		return err
@@ -748,7 +757,7 @@ func zeroAffectedMeansMissing(ctx context.Context, db Queryer, p *plan, rv refle
 	}
 	exists := rows.Next()
 	err = rows.Err()
-	rows.Close()
+	mergeClose(rows, &err) // the probe row leaves the result undrained
 	finishQuery(finish, err)
 	return !exists, err
 }

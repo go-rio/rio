@@ -504,8 +504,8 @@ func renderRelSelect(g *grammar, res *resolvedRel, kind relKind, keys []any, rq 
 
 // scanRel appends scanned rows to buf, returning the grown slice and, when
 // keyed, one owner key per appended row.
-func scanRel(rows *sql.Rows, p *plan, buf reflect.Value, keyed bool, res *resolvedRel) (reflect.Value, []any, error) {
-	defer rows.Close()
+func scanRel(rows *sql.Rows, p *plan, buf reflect.Value, keyed bool, res *resolvedRel) (out reflect.Value, keys []any, err error) {
+	defer mergeClose(rows, &err)
 	extra := 0
 	if keyed {
 		extra = 1
@@ -515,7 +515,6 @@ func scanRel(rows *sql.Rows, p *plan, buf reflect.Value, keyed bool, res *resolv
 		return buf, nil, err
 	}
 
-	var keys []any
 	var keyCell colScanner
 	var extras []any
 	if keyed {
@@ -745,8 +744,8 @@ func countRelation(ctx context.Context, db Queryer, owner *plan, name string, ro
 }
 
 // scanCounts drains (key, count) pairs into the grouping map.
-func scanCounts(rows *sql.Rows, keyType reflect.Type, byKey map[any]int64) error {
-	defer rows.Close()
+func scanCounts(rows *sql.Rows, keyType reflect.Type, byKey map[any]int64) (err error) {
+	defer mergeClose(rows, &err)
 	keyBuf := reflect.New(keyType)
 	kf := &field{name: "count key", column: "<key>", typ: keyType}
 	codec, err := codecFor(kf)

@@ -21,6 +21,28 @@ type upsertSpec struct {
 	keepTrashed bool
 }
 
+// normalize dedupes the conflict target in first-seen order, once the options
+// have all been applied. ON CONFLICT (email, email) matches no unique index —
+// PostgreSQL answers with the famously opaque "no unique or exclusion
+// constraint matching the ON CONFLICT specification" — so a repeated column
+// (one OnConflict call or several) collapses to the index the caller meant.
+// The DoUpdate whitelist dedupes separately in upsertUpdateSet.
+func (s *upsertSpec) normalize() {
+	if len(s.conflict) < 2 {
+		return
+	}
+	seen := make(map[string]bool, len(s.conflict))
+	out := s.conflict[:0]
+	for _, c := range s.conflict {
+		if seen[c] {
+			continue
+		}
+		seen[c] = true
+		out = append(out, c)
+	}
+	s.conflict = out
+}
+
 // OnConflict names the conflict target columns (the unique index). Required
 // with DoUpdate on PostgreSQL/SQLite; MySQL has no conflict target — its
 // ON DUPLICATE KEY reacts to any unique index, which is a documented
@@ -80,7 +102,10 @@ func KeepTrashed() UpsertOption {
 // UpdatedAt is reset to the clock on every non-DoNothing upsert, even when
 // nonzero: the conflict branch applies the would-be inserted row's stamp, so
 // that stamp must be this call's now — the same unconditional rule as entity
-// Update. DoNothing keeps Insert's fill-only-when-zero rule.
+// Update. DoNothing keeps Insert's fill-only-when-zero rule. All of this
+// stamping happens before execution: after a failed Upsert the struct may
+// already carry this attempt's timestamps and version=1 while the database
+// is untouched — retrying with the same struct is safe.
 //
 // omitzero: a zero omitzero column is skipped from the INSERT column list,
 // and the default conflict update set skips it too — on conflict the
@@ -98,6 +123,7 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 	for _, opt := range opts {
 		opt(&spec)
 	}
+	spec.normalize()
 	if spec.doNothing && len(spec.update) > 0 {
 		return errors.New("rio: Upsert cannot combine DoNothing with DoUpdate")
 	}
@@ -230,7 +256,14 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 	}
 	// MySQL reports 1 row affected for a fresh insert, 2 for a changed
 	// conflict update, and 0 for an unchanged conflict update.
-	if n, aerr := res.RowsAffected(); aerr == nil && n == 1 {
+	n, err := res.RowsAffected()
+	if err != nil {
+		// go-sql-driver never fails here today, but silently skipping the
+		// backfill would turn a broken driver result into "upsert succeeded,
+		// ID missing" — the wrong one of the two honest options.
+		return err
+	}
+	if n == 1 {
 		return fillLastInsertID(p, rv, res.LastInsertId)
 	}
 	return nil

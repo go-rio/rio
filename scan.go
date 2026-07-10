@@ -71,7 +71,23 @@ func codecFor(f *field) (fieldCodec, error) {
 			f.name)
 	}
 	if t.Implements(scannerType) || reflect.PointerTo(t).Implements(scannerType) {
-		return fieldCodec{kind: scanScanner}, nil
+		c := fieldCodec{kind: scanScanner}
+		// A Scanner type that also customizes its stored form through
+		// driver.Valuer needs the same treatment as the basic kinds below:
+		// binding the bare value would only run a value-receiver Value() —
+		// database/sql never takes an address — so a pointer-receiver Valuer
+		// would silently store the raw underlying value. The two null-time
+		// types are excluded: rio owns their encoding (bindArg normalizes and
+		// dialect-encodes the inner time), and their value-receiver Value()
+		// must not preempt that.
+		if t != nullTimeType && t != nullTimeGenericType {
+			if t.Implements(valuerType) {
+				c.bindValuer = true
+			} else if reflect.PointerTo(t).Implements(valuerType) {
+				c.bindPtrValuer = true
+			}
+		}
+		return c, nil
 	}
 	if t.Kind() == reflect.Pointer {
 		elem := t.Elem()
@@ -93,7 +109,7 @@ func codecFor(f *field) (fieldCodec, error) {
 	// (value receiver, so a bound value triggers it) must bind through Value(),
 	// not the unsafe fast read that would hand the driver the raw underlying
 	// value. Scan stays on the fast path: the column already holds the encoded
-	// form. (Scanner types are handled above and bind correctly via reflect.)
+	// form. (Scanner types get the same flags in their branch above.)
 	if t.Implements(valuerType) {
 		c.bindValuer = true
 	} else if reflect.PointerTo(t).Implements(valuerType) {
@@ -617,14 +633,25 @@ func namedFields(rows *sql.Rows, p *plan) ([]*field, error) {
 	return fields, nil
 }
 
+// mergeClose closes rows and, when consumption itself succeeded, promotes the
+// Close error to the result. For a result set left undrained (single-row
+// reads, probes), Close is where drivers surface deferred protocol and
+// connection errors — pgx reads the trailing command status there — so a
+// deferred rows.Close() that drops its return would report a failed statement
+// as success. err points at the caller's named return; on a fully drained
+// result Close is a no-op (database/sql already auto-closed at EOF) and
+// nothing changes.
+func mergeClose(rows *sql.Rows, err *error) {
+	if cerr := rows.Close(); cerr != nil && *err == nil {
+		*err = cerr
+	}
+}
+
 // scanAll drains rows into a []T. byName selects Raw-style column matching;
 // entity queries use plan order.
-func scanAll[T any](rows *sql.Rows, p *plan, byName bool) ([]T, error) {
-	defer rows.Close()
-	var (
-		fields []*field
-		err    error
-	)
+func scanAll[T any](rows *sql.Rows, p *plan, byName bool) (out []T, err error) {
+	defer mergeClose(rows, &err)
+	var fields []*field
 	if byName {
 		fields, err = namedFields(rows, p)
 	} else {
@@ -635,7 +662,7 @@ func scanAll[T any](rows *sql.Rows, p *plan, byName bool) ([]T, error) {
 	}
 	rs := newRowScanner(fields, nil)
 	defer rs.release()
-	out := []T{}
+	out = []T{}
 	for rows.Next() {
 		out = append(out, *new(T))
 		if err := rs.scan(rows, unsafe.Pointer(&out[len(out)-1])); err != nil {
@@ -650,8 +677,8 @@ func scanAll[T any](rows *sql.Rows, p *plan, byName bool) ([]T, error) {
 
 // scanScalars drains a single-column result into basic values. The codec is
 // classified once for the whole result, not per row.
-func scanScalars[T any](rows *sql.Rows) ([]T, error) {
-	defer rows.Close()
+func scanScalars[T any](rows *sql.Rows) (out []T, err error) {
+	defer mergeClose(rows, &err)
 	t := reflect.TypeFor[T]()
 	f := &field{name: t.String(), column: "<scalar>", typ: t}
 	codec, err := codecFor(f)
@@ -660,7 +687,7 @@ func scanScalars[T any](rows *sql.Rows) ([]T, error) {
 	}
 	f.code = codec
 	cs := colScanner{f: f}
-	out := []T{}
+	out = []T{}
 	for rows.Next() {
 		out = append(out, *new(T))
 		cs.base = unsafe.Pointer(&out[len(out)-1])
@@ -856,8 +883,8 @@ func fieldIsZero(f *field, base unsafe.Pointer, rv reflect.Value) bool {
 }
 
 // scanOne scans exactly one row into a fresh T, the Find fast path.
-func scanOne[T any](rows *sql.Rows, p *plan) (*T, error) {
-	defer rows.Close()
+func scanOne[T any](rows *sql.Rows, p *plan) (out *T, err error) {
+	defer mergeClose(rows, &err)
 	fields, err := entityFields(rows, p, 0)
 	if err != nil {
 		return nil, err
@@ -868,7 +895,7 @@ func scanOne[T any](rows *sql.Rows, p *plan) (*T, error) {
 		}
 		return nil, ErrNotFound
 	}
-	out := new(T)
+	out = new(T)
 	rs := newRowScanner(fields, nil)
 	defer rs.release()
 	if err := rs.scan(rows, unsafe.Pointer(out)); err != nil {

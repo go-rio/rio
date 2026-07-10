@@ -44,7 +44,10 @@ func WriteColumns(w io.Writer, pkgName string, models ...any) error {
 	}
 	gens := make([]gen, 0, len(models))
 	byName := make(map[string]string, len(models)) // struct name → full type
-	for _, m := range models {
+	for i, m := range models {
+		if m == nil {
+			return fmt.Errorf("rio: WriteColumns: model %d is nil; pass a model value like models.User{}", i+1)
+		}
 		t := reflect.TypeOf(m)
 		if t.Kind() == reflect.Pointer {
 			t = t.Elem()

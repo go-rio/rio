@@ -267,6 +267,7 @@ returns a clear error in v1.
 | Placeholders | always `?`, rebound per dialect with a per-dialect lexer; `??` escapes a literal `?` (PostgreSQL JSONB operators); `IN (?)` expands slices — sqlx/Bun's established conventions |
 | Scan priority | `rio:"-"` → `json` tag (beats Scanner, documented) → `sql.Scanner` (NULL handed to Scan(nil), no second-guessing) → pointer fields (NULL→nil) → `[]byte` (NULL→nil) → basic conversions (overflow-checked; MySQL unsigned BIGINT > MaxInt64 arrives as bytes and is parsed) → NULL into anything else errors with the column name |
 | Times | written as UTC, monotonic-stripped, truncated to microseconds (PG/MySQL precision — otherwise reload-and-Equal never holds), and the normalized value is written back to the struct as it binds, so the struct holds exactly what the database stores; trigger-rewritten columns are not read back; SQLite text format is rio's own, not the driver's |
+| Failed `Insert/Update/Upsert` | the struct may already carry this attempt's stamps (CreatedAt/UpdatedAt filled, a zero version set to 1) — stamping happens before execution, the database is untouched, and retrying with the same struct is safe |
 | Partial scans | `Raw[T]` into an entity requires the result to cover every mapped column — a partial scan errors (naming the missing columns and pointing at a DTO) rather than letting a later `rio.Update` write zeros to the unscanned ones (mirror image of GORM #6860) |
 
 ### ClickHouse: the read + append dialect

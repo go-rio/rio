@@ -26,11 +26,7 @@ func Raw[T any](sqlText string, args ...any) RawQuery[T] {
 // All runs the query and scans every row.
 func (r RawQuery[T]) All(ctx context.Context, db Queryer) ([]T, error) {
 	d := db.gram().d
-	sqlText, args, err := rebind(d.lexer(), d.style(), r.sql, r.args)
-	if err != nil {
-		return nil, err
-	}
-	args, err = normalizeArgs(d, args)
+	sqlText, args, err := finishSQLText(d, r.sql, r.args)
 	if err != nil {
 		return nil, err
 	}
@@ -87,11 +83,7 @@ func (r RawQuery[T]) Sole(ctx context.Context, db Queryer) (*T, error) {
 // the driver result.
 func Exec(ctx context.Context, db Queryer, sqlText string, args ...any) (sql.Result, error) {
 	d := db.gram().d
-	rebound, outArgs, err := rebind(d.lexer(), d.style(), sqlText, copyArgs(args))
-	if err != nil {
-		return nil, err
-	}
-	outArgs, err = normalizeArgs(d, outArgs)
+	rebound, outArgs, err := finishSQLText(d, sqlText, copyArgs(args))
 	if err != nil {
 		return nil, err
 	}

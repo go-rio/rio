@@ -3010,3 +3010,215 @@ func TestCondFragmentArityChecked(t *testing.T) {
 		t.Fatalf("zero-arg fragment: %v", err)
 	}
 }
+
+// --- codex audit: confirmed fixes ---
+
+// #5, shape 1: pointer-receiver Scanner + pointer-receiver Valuer.
+type encBoth string
+
+func (e *encBoth) Scan(src any) error {
+	if b, ok := src.([]byte); ok {
+		*e = encBoth(b)
+	}
+	return nil
+}
+func (e *encBoth) Value() (driver.Value, error) { return "ENC:" + string(*e), nil }
+
+// #5, shape 2: value-receiver Scanner + value-receiver Valuer.
+type encValVal string
+
+func (encValVal) Scan(any) error                 { return nil }
+func (e encValVal) Value() (driver.Value, error) { return "ENC:" + string(e), nil }
+
+// #5, shape 3: value-receiver Scanner + pointer-receiver Valuer — the shape
+// whose Value() the old codec never ran (the Scanner branch returned before
+// Valuer detection, and binding the bare value leaves Value() out of the
+// method set database/sql consults).
+type encValPtr string
+
+func (encValPtr) Scan(any) error                  { return nil }
+func (e *encValPtr) Value() (driver.Value, error) { return "ENC:" + string(*e), nil }
+
+type ScannerValuerRow struct {
+	ID int64
+	A  encBoth
+	B  encValVal
+	C  encValPtr
+}
+
+func TestScannerFieldsStillBindThroughValuer(t *testing.T) {
+	p, err := planOf[ScannerValuerRow]()
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	for col, want := range map[string]struct{ val, ptr bool }{
+		"a": {false, true}, // pointer-receiver Valuer binds the address
+		"b": {true, false}, // value-receiver Valuer binds the value
+		"c": {false, true},
+	} {
+		f := p.byColumn[col]
+		if f.code.kind != scanScanner {
+			t.Fatalf("%s must keep the scanScanner codec", col)
+		}
+		if f.code.bindValuer != want.val || f.code.bindPtrValuer != want.ptr {
+			t.Fatalf("%s flags: bindValuer=%v bindPtrValuer=%v", col, f.code.bindValuer, f.code.bindPtrValuer)
+		}
+	}
+
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(MySQL)
+	f.queueExec(1, 1)
+	row := ScannerValuerRow{ID: 1, A: "a", B: "b", C: "c"}
+	if err := Insert(ctx, db, &row); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	args := f.loggedContaining("INSERT")[0].args
+	if args[1] != "ENC:a" || args[2] != "ENC:b" || args[3] != "ENC:c" {
+		t.Fatalf("every Scanner+Valuer shape must bind through Value(), got %#v", args)
+	}
+}
+
+// #5 boundary: rio owns sql.NullTime / sql.Null[time.Time] encoding (bindArg
+// normalizes and dialect-encodes the inner time); their value-receiver
+// Value() must not be promoted over that.
+func TestNullTimeStaysRioEncoded(t *testing.T) {
+	type nullTimeRow struct {
+		ID int64
+		At sql.NullTime
+		Gt sql.Null[time.Time]
+	}
+	p, err := planOf[nullTimeRow]()
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	for _, col := range []string{"at", "gt"} {
+		if c := p.byColumn[col].code; c.bindValuer || c.bindPtrValuer {
+			t.Fatalf("%s must stay on rio's own null-time binding", col)
+		}
+	}
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueExec(1, 1)
+	row := nullTimeRow{ID: 1, At: sql.NullTime{Time: testNow, Valid: true}, Gt: sql.Null[time.Time]{V: testNow, Valid: true}}
+	if err := Insert(ctx, db, &row); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	args := f.loggedContaining("INSERT")[0].args
+	want := testNow.UTC().Format(sqliteTimeFormat)
+	if args[1] != want || args[2] != want {
+		t.Fatalf("null-time fields must bind rio's SQLite text form %q, got %#v", want, args)
+	}
+}
+
+// #4: a narrow version column wraps at its maximum while the struct keeps
+// counting — every later optimistic Update then reports ErrStaleObject
+// forever. Refused at plan time with the fix.
+func TestNarrowVersionColumnRefused(t *testing.T) {
+	type NarrowVersion struct {
+		ID int64
+		V  int16 `rio:",version"`
+	}
+	_, err := planOf[NarrowVersion]()
+	if err == nil || !strings.Contains(err.Error(), "too narrow") || !strings.Contains(err.Error(), "int64") {
+		t.Fatalf("int16 version must be refused with guidance: %v", err)
+	}
+
+	type ByteVersion struct {
+		ID int64
+		V  uint8 `rio:",version"`
+	}
+	if _, err := planOf[ByteVersion](); err == nil {
+		t.Fatal("uint8 version must be refused")
+	}
+
+	// ≥32-bit versions stay accepted (Counter pins uint32 elsewhere).
+	type WideVersion struct {
+		ID int64
+		V  int32 `rio:",version"`
+	}
+	if _, err := planOf[WideVersion](); err != nil {
+		t.Fatalf("int32 version must stay accepted: %v", err)
+	}
+}
+
+// #7: when Result.RowsAffected fails, the caller returns that error — the
+// hook must not record the same statement as a success.
+func TestQueryHookSeesRowsAffectedError(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	var hookErr error
+	hook := hookFunc(func(_ context.Context, e *QueryEvent) {
+		if e.Op == "update" {
+			hookErr = e.Err
+		}
+	})
+	db := f.openWith(MySQL, WithQueryHook(hook))
+	aerr := errors.New("driver: lost the affected-row count")
+	f.queueExecAffectedErr(aerr)
+
+	err := Update(ctx, db, &Post{ID: 1, UserID: 1, Title: "x"})
+	if !errors.Is(err, aerr) {
+		t.Fatalf("Update must return the RowsAffected error: %v", err)
+	}
+	if !errors.Is(hookErr, aerr) {
+		t.Fatalf("the hook must observe the same failure the caller reports, got: %v", hookErr)
+	}
+}
+
+// #8: a user slice expanding inside IN (?) past the dialect's bind budget
+// fails with rio's own error before any SQL reaches the driver — the server's
+// answer is an opaque protocol error, and ClickHouse (text-budget heuristic)
+// would not object at all.
+func TestINExpansionOverBindLimitFailsEarly(t *testing.T) {
+	ctx := context.Background()
+	ids := make([]int64, 70000)
+	for i := range ids {
+		ids[i] = int64(i)
+	}
+
+	f := newFakeDB()
+	db := f.open() // postgres: 65535
+	_, err := From[User]().Where("id IN (?)", ids).All(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "65535") || !strings.Contains(err.Error(), "70000") {
+		t.Fatalf("expansion over the limit must fail with both counts: %v", err)
+	}
+	if n := len(f.logged()); n != 0 {
+		t.Fatalf("nothing may reach the driver, got %d statement(s)", n)
+	}
+
+	// Raw and Exec run the same funnel.
+	if _, err := Raw[User]("SELECT * FROM users WHERE id IN (?)", ids).All(ctx, db); err == nil || !strings.Contains(err.Error(), "65535") {
+		t.Fatalf("Raw: %v", err)
+	}
+	if _, err := Exec(ctx, db, "DELETE FROM users WHERE id IN (?)", ids); err == nil || !strings.Contains(err.Error(), "65535") {
+		t.Fatalf("Exec: %v", err)
+	}
+
+	// ClickHouse enforces its 8192 text budget through the same check.
+	fch := newFakeDB()
+	ch := fch.open(ClickHouse)
+	_, err = From[User]().Where("id IN (?)", ids[:9000]).All(ctx, ch)
+	if err == nil || !strings.Contains(err.Error(), "8192") {
+		t.Fatalf("clickhouse budget: %v", err)
+	}
+
+	// At the budget exactly, the statement still goes out.
+	f.queueRows(userCols)
+	if _, err := From[User]().Where("id IN (?)", ids[:65535]).All(ctx, db); err != nil {
+		t.Fatalf("at-limit expansion must pass: %v", err)
+	}
+}
+
+// #10: WriteColumns(w, pkg, nil) reflected on the nil and panicked.
+func TestWriteColumnsNilModelErrors(t *testing.T) {
+	var buf strings.Builder
+	err := WriteColumns(&buf, "models", nil)
+	if err == nil || !strings.Contains(err.Error(), "model 1 is nil") {
+		t.Fatalf("nil model must error, not panic: %v", err)
+	}
+	if err := WriteColumns(&buf, "models", User{}, nil); err == nil || !strings.Contains(err.Error(), "model 2 is nil") {
+		t.Fatalf("nil in any position must error: %v", err)
+	}
+}

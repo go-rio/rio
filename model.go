@@ -377,7 +377,17 @@ func (p *plan) classify() []error {
 	}
 	for _, f := range p.fields {
 		if f.isVersion {
-			if !isIntKind(f.typ.Kind()) {
+			switch f.typ.Kind() {
+			case reflect.Int, reflect.Int32, reflect.Int64,
+				reflect.Uint, reflect.Uint32, reflect.Uint64:
+				// wide enough: version = version + 1 forever
+			case reflect.Int8, reflect.Int16, reflect.Uint8, reflect.Uint16:
+				// The database wraps the column (or errors) at 127/255/32767/…
+				// while the struct keeps counting — every later optimistic
+				// Update then misses and reports ErrStaleObject forever. A
+				// plan-time refusal beats that runtime dead end.
+				errs = append(errs, fmt.Errorf("version field %s is %s, too narrow to count updates (wraps at its maximum and then reports ErrStaleObject forever); use int64", f.name, f.typ))
+			default:
 				errs = append(errs, fmt.Errorf("version field %s must be an integer type, got %s", f.name, f.typ))
 			}
 			p.version = single("version", p.version, f)

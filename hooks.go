@@ -20,13 +20,17 @@ type QueryEvent struct {
 	Query string
 	// Args are the bind arguments, nil when the DB was built WithoutArgs.
 	Args []any
-	// Err is the translated execution error, nil on success. After only.
+	// Err is the translated execution error, nil on success. A write whose
+	// Result.RowsAffected fails carries that failure here — the caller
+	// returns the same error, and the hook must not record the statement as
+	// a success. After only.
 	Err error
 	// Duration is the execution wall time; for row-returning queries it runs
 	// through row consumption. After only.
 	Duration time.Duration
 	// RowsAffected is the driver-reported count for writes, -1 when unknown
-	// (row-returning queries). After only.
+	// (row-returning queries, or the driver failed to report it — the
+	// failure is then in Err). After only.
 	RowsAffected int64
 }
 

@@ -140,6 +140,11 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 	return observe(ctx, d.cfg, d.g.d, "commit", "COMMIT", tx.Commit)
 }
 
+// finishTx rolls the transaction back. Unlike the savepoint statements below,
+// a canceled ctx cannot suppress this cleanup: database/sql's Tx.Rollback
+// takes no context and always reaches the driver, and BeginTx's own watcher
+// already rolls back automatically when the begin context dies (Rollback then
+// reports ErrTxDone, tolerated here).
 func (d *DB) finishTx(ctx context.Context, tx *sql.Tx, cause error) error {
 	err := observe(ctx, d.cfg, d.g.d, "rollback", "ROLLBACK", tx.Rollback)
 	if err != nil && !errors.Is(err, sql.ErrTxDone) {
@@ -201,10 +206,19 @@ func (t *Tx) Tx(ctx context.Context, fn func(tx *Tx) error) (err error) {
 	if err := t.spExec(ctx, "SAVEPOINT "+name); err != nil {
 		return err
 	}
+	// Cleanup statements run on a cancellation-decoupled context. fn failing
+	// *because* its context died is exactly when ROLLBACK TO must still reach
+	// the database: on the caller's ctx, database/sql short-circuits before
+	// sending it, the savepoint's writes silently survive, and the outer
+	// transaction — its own context still live — would commit them. The
+	// connection itself is healthy; only the context is dead. SAVEPOINT above
+	// keeps the caller's ctx: refusing to *open* work under a canceled
+	// context is the correct half of cancellation.
+	cleanup := context.WithoutCancel(ctx)
 	inner := &Tx{tx: t.tx, g: t.g, cfg: t.cfg, spSeq: t.spSeq}
 	defer func() {
 		if p := recover(); p != nil {
-			_ = t.spExec(ctx, "ROLLBACK TO SAVEPOINT "+name)
+			_ = t.spExec(cleanup, "ROLLBACK TO SAVEPOINT "+name)
 			panic(p)
 		}
 	}()
@@ -214,13 +228,13 @@ func (t *Tx) Tx(ctx context.Context, fn func(tx *Tx) error) (err error) {
 		// itself fail legitimately — a MySQL deadlock (1213) rolls back the
 		// whole transaction and destroys every savepoint — so its error is
 		// joined rather than allowed to mask the cause.
-		if rbErr := t.spExec(ctx, "ROLLBACK TO SAVEPOINT "+name); rbErr != nil {
+		if rbErr := t.spExec(cleanup, "ROLLBACK TO SAVEPOINT "+name); rbErr != nil {
 			return errors.Join(err, rbErr)
 		}
-		_ = t.spExec(ctx, "RELEASE SAVEPOINT "+name) // keep the stack clean; failure is harmless here
+		_ = t.spExec(cleanup, "RELEASE SAVEPOINT "+name) // keep the stack clean; failure is harmless here
 		return err
 	}
-	return t.spExec(ctx, "RELEASE SAVEPOINT "+name)
+	return t.spExec(cleanup, "RELEASE SAVEPOINT "+name)
 }
 
 func (t *Tx) spExec(ctx context.Context, stmt string) error {
@@ -245,12 +259,20 @@ func run(ctx context.Context, q Queryer, op, model, sqlText string, args []any) 
 	res, err := execute(ctx, q, sqlText, args)
 	err = translateErr(err, cfg, q.gram().d)
 	var rows int64 = -1
+	hookErr := err
 	if err == nil && res != nil {
 		if n, aerr := res.RowsAffected(); aerr == nil {
 			rows = n
+		} else {
+			// The write-path callers all consult RowsAffected themselves and
+			// will surface this same failure; the hook must not record the
+			// statement as a success the caller then reports as an error.
+			// run's own return stays (res, nil): which errors abort the call
+			// is the caller's contract, not the observer's.
+			hookErr = aerr
 		}
 	}
-	cfg.afterQuery(hctx, ev, start, err, rows)
+	cfg.afterQuery(hctx, ev, start, hookErr, rows)
 	return res, err
 }
 

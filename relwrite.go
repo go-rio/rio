@@ -288,7 +288,7 @@ func selectJoinRefs(ctx context.Context, tx *Tx, p *plan, res *resolvedRel, owne
 }
 
 func scanJoinRefs(rows *sql.Rows, res *resolvedRel) (keys []any, vals []any, set map[any]struct{}, err error) {
-	defer rows.Close()
+	defer mergeClose(rows, &err)
 	// res.fk is the target's PK — the type the join column's values are.
 	kf := &field{name: "join key", column: res.joinRef, typ: res.fk.typ}
 	codec, err := codecFor(kf)

@@ -808,22 +808,48 @@ func renderExists(b []byte, args []any, g *grammar, owner *plan, ownerRef string
 }
 
 // finishSQL runs the rebind pipeline: IN expansion first, placeholder
-// renumbering second, in one lexer pass — then normalizes arguments.
+// renumbering second, in one lexer pass — then checks the dialect's bind
+// budget and normalizes arguments.
 //
 // finishSQL takes ownership of b: the returned SQL may alias its memory
 // (rebind returns its input unchanged when nothing rewrites), so the caller
 // must not read or append to b afterwards. Every call site builds b locally
 // and drops it at this call — keep it that way.
 func finishSQL(d Dialect, b []byte, args []any) (string, []any, error) {
-	sqlText, outArgs, err := rebind(d.lexer(), d.style(), byteString(b), args)
+	return finishSQLText(d, byteString(b), args)
+}
+
+// finishSQLText is finishSQL for caller-owned SQL strings (Raw, Exec).
+func finishSQLText(d Dialect, sqlText string, args []any) (string, []any, error) {
+	out, outArgs, err := rebind(d.lexer(), d.style(), sqlText, args)
 	if err != nil {
+		return "", nil, err
+	}
+	if err := checkBindCount(d, len(outArgs)); err != nil {
 		return "", nil, err
 	}
 	outArgs, err = normalizeArgs(d, outArgs)
 	if err != nil {
 		return "", nil, err
 	}
-	return sqlText, outArgs, nil
+	return out, outArgs, nil
+}
+
+// checkBindCount rejects a statement whose post-expansion argument count
+// exceeds the dialect's bind budget before the SQL leaves rio. The server's
+// own answer is an opaque protocol error (PostgreSQL: "bind message has
+// 65536 parameter formats but 0 parameters"), and ClickHouse's budget is
+// rio's text-size heuristic the server never enforces per parameter — this
+// funnel is the only place the limit fails honestly on every dialect. rio's
+// own writers already chunk to the budget (InsertAll, preloads, join-table
+// writes); a large user slice expanding inside IN (?) is the path that can
+// blow through it.
+func checkBindCount(d Dialect, n int) error {
+	if limit := d.caps().maxBindParams; n > limit {
+		return fmt.Errorf("rio: statement binds %d parameters, over the %s limit of %d; chunk the query yourself (preloading via With chunks automatically)",
+			n, d.name(), limit)
+	}
+	return nil
 }
 
 // normalizeArgs applies the write-side time rule to user-supplied arguments

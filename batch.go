@@ -204,6 +204,7 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 	for _, opt := range opts {
 		opt(&spec)
 	}
+	spec.normalize()
 	if spec.doNothing && len(spec.update) > 0 {
 		return errors.New("rio: UpsertAll cannot combine DoNothing with DoUpdate")
 	}

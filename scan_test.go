@@ -3,6 +3,7 @@ package rio
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
 	"runtime"
 	"strings"
 	"testing"
@@ -231,4 +232,20 @@ func TestEntityColumnMismatchErrors(t *testing.T) {
 			t.Fatalf("err = %v", err)
 		}
 	})
+}
+
+// Codex audit #2, read side: scanOne stops after its single row, so the
+// result is never drained and rows.Close performs the real close — an error
+// there (connection loss mid-protocol) must reach the caller instead of
+// returning a half-trusted row as success.
+func TestFindReportsRowsCloseError(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+	closeErr := errors.New("driver: connection reset while closing rows")
+	f.queueRowsCloseErr(closeErr, userCols, userRow(1, "a@x"))
+
+	_, err := Find[User](context.Background(), db, int64(1))
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("Find must surface the rows.Close error, got: %v", err)
+	}
 }

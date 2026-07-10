@@ -132,6 +132,51 @@ func TestInsertReturningBackfillsGenerated(t *testing.T) {
 	}
 }
 
+// Codex audit #2: on a single-row RETURNING result the rows are never
+// drained, so rows.Close is where the driver reports whether the statement
+// actually completed (pgx reads the trailing command status there). A
+// deferred Close whose error is dropped turns a failed INSERT into a nil
+// return with a stale backfill.
+func TestInsertReturningReportsRowsCloseError(t *testing.T) {
+	f := newFakeDB()
+	db := f.open() // postgres: RETURNING path
+	closeErr := errors.New("driver: connection reset while reading command status")
+	f.queueRowsCloseErr(closeErr, []string{"id"}, []driver.Value{int64(7)})
+
+	err := Insert(context.Background(), db, &User{Email: "a@x"})
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("Insert must surface the rows.Close error, got: %v", err)
+	}
+}
+
+// The full-row RETURNING consumer (upserts) drops the same error.
+func TestUpsertReturningReportsRowsCloseError(t *testing.T) {
+	f := newFakeDB()
+	db := f.open() // postgres
+	closeErr := errors.New("driver: connection reset while reading command status")
+	f.queueRowsCloseErr(closeErr, userCols, userRow(1, "a@x"))
+
+	err := Upsert(context.Background(), db, &User{Email: "a@x"}, OnConflict("email"))
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("Upsert must surface the rows.Close error, got: %v", err)
+	}
+}
+
+// And the MySQL zero-affected probe: its single row also leaves the result
+// undrained.
+func TestUpdateProbeReportsRowsCloseError(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(MySQL)
+	closeErr := errors.New("driver: connection reset while reading command status")
+	f.queueExec(0, 0) // idempotent-looking update: triggers the PK probe
+	f.queueRowsCloseErr(closeErr, []string{"1"}, []driver.Value{int64(1)})
+
+	err := Update(context.Background(), db, &Post{ID: 1, UserID: 1, Title: "x"})
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("the probe must surface the rows.Close error, got: %v", err)
+	}
+}
+
 func TestInsertMySQLLastInsertID(t *testing.T) {
 	f := newFakeDB()
 	db := f.open(MySQL)
@@ -484,6 +529,48 @@ func TestUpsertDoNothing(t *testing.T) {
 	}
 }
 
+// Codex audit #12: a repeated conflict-target column — one OnConflict call or
+// several — must collapse: ON CONFLICT (email, email) matches no unique index
+// and PostgreSQL answers with its famously opaque constraint-matching error.
+func TestUpsertConflictTargetDeduped(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open() // postgres
+	f.queueRows(userCols, userRow(1, "a@x"))
+
+	if err := Upsert(ctx, db, &User{Email: "a@x"}, OnConflict("email", "email"), OnConflict("email")); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	got := f.logged()[0]
+	if !strings.Contains(got, `ON CONFLICT ("email") DO UPDATE SET`) {
+		t.Fatalf("conflict target must render deduplicated:\n%s", got)
+	}
+
+	// The batch path shares the normalization.
+	f.queueExec(0, 2)
+	if err := UpsertAll(ctx, db, []User{{ID: 1, Email: "a@x"}, {ID: 2, Email: "b@x"}}, OnConflict("email", "email")); err != nil {
+		t.Fatalf("UpsertAll: %v", err)
+	}
+	got = f.logged()[1]
+	if !strings.Contains(got, `ON CONFLICT ("email") DO UPDATE SET`) {
+		t.Fatalf("UpsertAll conflict target must render deduplicated:\n%s", got)
+	}
+}
+
+// Codex audit #6: a failing Result.RowsAffected on the MySQL upsert path must
+// propagate, not silently skip the ID backfill and report success.
+func TestUpsertMySQLRowsAffectedErrorPropagates(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(MySQL)
+	aerr := errors.New("driver: lost the affected-row count")
+	f.queueExecAffectedErr(aerr)
+
+	err := Upsert(context.Background(), db, &User{Email: "a@x"}, OnConflict("email"), DoUpdate("age"))
+	if !errors.Is(err, aerr) {
+		t.Fatalf("Upsert must propagate the RowsAffected error, got: %v", err)
+	}
+}
+
 func TestTxCommitAndRollback(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -615,6 +702,76 @@ func TestSavepointRollbackFailureJoinsErrors(t *testing.T) {
 			t.Fatalf("no RELEASE after a failed ROLLBACK TO: %s", logs)
 		}
 	})
+}
+
+// Codex audit #1: a savepoint's ROLLBACK TO / RELEASE must still reach the
+// database when the inner fn's context died — database/sql short-circuits
+// statements on a canceled ctx before sending them, so on the caller's ctx
+// the savepoint's writes would silently survive and the outer transaction
+// (its own context alive) would commit them.
+func TestSavepointCleanupSurvivesCanceledContext(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
+
+	boom := errors.New("inner work failed after its context died")
+	err := db.Tx(context.Background(), func(tx *Tx) error {
+		inner, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		spErr := tx.Tx(inner, func(sp *Tx) error {
+			if err := Insert(inner, sp, &Post{UserID: 1, Title: "leak"}); err != nil {
+				return err
+			}
+			cancel() // the inner unit's deadline fires between its statements
+			return boom
+		})
+		if !errors.Is(spErr, boom) {
+			t.Fatalf("inner savepoint must report the failure: %v", spErr)
+		}
+		if errors.Is(spErr, context.Canceled) {
+			t.Fatalf("cleanup must not fail on the dead context: %v", spErr)
+		}
+		return nil // swallowed: the outer transaction goes on to commit
+	})
+	if err != nil {
+		t.Fatalf("outer Tx: %v", err)
+	}
+	logs := f.logged()
+	joined := strings.Join(logs, " | ")
+	for _, want := range []string{"SAVEPOINT rio_sp_1", "ROLLBACK TO SAVEPOINT rio_sp_1", "RELEASE SAVEPOINT rio_sp_1"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q — the inner insert leaks into the outer commit: %s", want, joined)
+		}
+	}
+	if logs[len(logs)-1] != "COMMIT" {
+		t.Fatalf("outer transaction must commit: %s", joined)
+	}
+}
+
+// The panic flavor of the same leak: the recover-path ROLLBACK TO runs on the
+// cancellation-decoupled context too.
+func TestSavepointPanicRollbackSurvivesCanceledContext(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("the panic must propagate")
+			}
+		}()
+		_ = db.Tx(context.Background(), func(tx *Tx) error {
+			inner, cancel := context.WithCancel(context.Background())
+			return tx.Tx(inner, func(sp *Tx) error {
+				cancel()
+				panic("inner panic with a dead context")
+			})
+		})
+	}()
+	joined := strings.Join(f.logged(), " | ")
+	if !strings.Contains(joined, "ROLLBACK TO SAVEPOINT rio_sp_1") {
+		t.Fatalf("panic-path ROLLBACK TO must still be sent: %s", joined)
+	}
 }
 
 func TestTxBeginHookPanicRollsBack(t *testing.T) {

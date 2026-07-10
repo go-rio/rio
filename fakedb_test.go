@@ -33,10 +33,14 @@ type fakeStmt struct {
 type fakeRows struct {
 	cols []string
 	rows [][]driver.Value
+	// closeErr is returned by the driver rows' Close — the channel where real
+	// drivers surface deferred protocol errors on partially consumed results.
+	closeErr error
 }
 
 type fakeResult struct {
 	lastID, affected int64
+	affectedErr      error // RowsAffected() failure injection
 }
 
 func newFakeDB() *fakeDB {
@@ -62,12 +66,28 @@ func (f *fakeDB) queueRows(cols []string, rows ...[]driver.Value) {
 	f.results = append(f.results, fakeRows{cols: cols, rows: rows})
 }
 
+// queueRowsCloseErr scripts the next row-returning statement's result with a
+// Close that fails after the rows were served.
+func (f *fakeDB) queueRowsCloseErr(closeErr error, cols []string, rows ...[]driver.Value) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.results = append(f.results, fakeRows{cols: cols, rows: rows, closeErr: closeErr})
+}
+
 // queueExec scripts the next non-query statement's result. Unscripted execs
 // report (1, 1).
 func (f *fakeDB) queueExec(lastID, affected int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.execs = append(f.execs, fakeResult{lastID: lastID, affected: affected})
+}
+
+// queueExecAffectedErr scripts the next non-query statement's result whose
+// RowsAffected() fails.
+func (f *fakeDB) queueExecAffectedErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.execs = append(f.execs, fakeResult{lastID: 1, affectedErr: err})
 }
 
 // failContaining makes any statement containing sub fail with err.
@@ -205,7 +225,7 @@ func (c *fakeConn) ExecContext(_ context.Context, query string, args []driver.Na
 type fakeExecResult struct{ r fakeResult }
 
 func (e fakeExecResult) LastInsertId() (int64, error) { return e.r.lastID, nil }
-func (e fakeExecResult) RowsAffected() (int64, error) { return e.r.affected, nil }
+func (e fakeExecResult) RowsAffected() (int64, error) { return e.r.affected, e.r.affectedErr }
 
 func values(args []driver.NamedValue) []driver.Value {
 	out := make([]driver.Value, len(args))
@@ -256,7 +276,7 @@ type fakeRowsIter struct {
 func newFakeRowsIter(data fakeRows) *fakeRowsIter { return &fakeRowsIter{data: data} }
 
 func (r *fakeRowsIter) Columns() []string { return r.data.cols }
-func (r *fakeRowsIter) Close() error      { return nil }
+func (r *fakeRowsIter) Close() error      { return r.data.closeErr }
 
 func (r *fakeRowsIter) Next(dest []driver.Value) error {
 	if r.pos >= len(r.data.rows) {
