@@ -210,13 +210,63 @@ sets too large to page, stream with `Rows`.
 
 ## Observability
 
+`QueryHook` sees every statement rio runs — op, model, SQL, args (redactable
+with `rio.WithoutArgs()`), duration, rows affected — and cannot alter them.
+There are no model hooks.
+
 ```go
-db, _ := postgres.Open(dsn, rio.WithQueryHook(myHook))
+type SlogHook struct {
+    Log  *slog.Logger
+    Slow time.Duration // statements at or over this log at WARN
+}
+
+func (SlogHook) BeforeQuery(ctx context.Context, e *rio.QueryEvent) context.Context {
+    return ctx
+}
+
+func (h SlogHook) AfterQuery(ctx context.Context, e *rio.QueryEvent) {
+    level := slog.LevelDebug
+    switch {
+    case e.Err != nil:
+        level = slog.LevelError
+    case h.Slow > 0 && e.Duration >= h.Slow:
+        level = slog.LevelWarn
+    }
+    h.Log.LogAttrs(ctx, level, "query",
+        slog.String("op", e.Op), slog.String("model", e.Model),
+        slog.Duration("dur", e.Duration), slog.Int64("rows", e.RowsAffected),
+        slog.String("sql", e.Query), slog.Any("err", e.Err))
+}
+
+db, _ := postgres.Open(dsn, rio.WithQueryHook(SlogHook{
+    Log: slog.Default(), Slow: 200 * time.Millisecond,
+}))
 ```
 
-`QueryHook` sees every statement — op, model, SQL, args (redactable with
-`rio.WithoutArgs()`), duration, rows affected — and cannot alter them. There
-are no model hooks.
+The context `BeforeQuery` returns is the execution context rio hands the
+driver, so tracing spans and deadlines you attach there flow into the query,
+and `AfterQuery` receives that same context. To emit OpenTelemetry spans, start
+a span in `BeforeQuery` (return its context) and `End()` it in `AfterQuery`,
+recording `Op` and `Model` as span attributes.
+
+## Security
+
+rio sorts every string argument into two kinds:
+
+| Argument | APIs | Treatment |
+|---|---|---|
+| Column names | `Update` whitelist, `rio.Set` keys, `Pluck`, `OnConflict`/`DoUpdate`, `With` paths | validated against the model's mapped columns (relation names for `With`) and emitted as escaped identifiers; an unknown name errors, never injects SQL |
+| SQL fragments | `Where`, `OrderBy`, `GroupBy`, `Having`, `Join`, `RelWhere`, `Expr`, `Raw` | rendered verbatim — build them from constants, never from untrusted input |
+
+Values bind as `?` parameters everywhere; only fragment *text* is verbatim. For
+an identifier chosen at runtime, map user input to a column constant
+(`rio.WriteColumns`) instead of concatenating it:
+
+```go
+allowed := map[string]string{"newest": UserCols.CreatedAt, "name": UserCols.Name}
+col, ok := allowed[userInput]; if !ok { col = UserCols.ID } // reject unknown keys
+users, err := rio.From[User]().OrderBy(col + " DESC").All(ctx, db)
+```
 
 ## Performance
 

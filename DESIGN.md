@@ -390,7 +390,10 @@ Each of these is a decision, not a gap:
   (Rails' callback hell, reproduced by GORM). Side effects belong in visible
   application code; invariants belong in database constraints. Observability
   gets `QueryHook` (before/after, ctx-deriving, with op/model/duration/args;
-  `WithoutArgs` for redaction), which cannot alter queries.
+  `WithoutArgs` for redaction), which cannot alter queries. The context
+  `BeforeQuery` returns *is* the execution context rio hands the driver — spans
+  and deadlines set there flow into the statement, and `AfterQuery` receives
+  that same context.
 - **No implicit lazy loading.** The only source of invisible N+1. Unloaded
   relations fail instead.
 - **No dirty tracking / unit of work / identity map / flush.** Go has no
@@ -424,6 +427,15 @@ Each of these is a decision, not a gap:
   produce entity values (Doctrine deleted partial objects for a reason, and Go's
   zero values make it worse); projections go through `Raw[T]` with any target
   shape.
+- **No read/write splitting or multi-DB routing.** Builders are connection-free
+  values — construct two `*rio.DB` (primary, replica) and choose one at the call
+  site; routing is a caller decision, not ORM state.
+- **No retry or circuit breaking.** That belongs to the platform layer; rio
+  never retries a statement.
+- **No global or default timeouts.** The context is the caller's — every
+  execution takes `ctx`, and rio imposes no deadline of its own.
+- **No named parameters.** The single `?`-placeholder pipeline, rebound per
+  dialect, is deliberate: one binding convention, one lexer.
 
 ## Testing & engineering
 
