@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sync"
 )
 
 type relKind int
@@ -41,17 +42,40 @@ type relContainer interface {
 	setLoaded(v reflect.Value)
 }
 
-func notLoadedPanic(kind relKind, target reflect.Type) string {
+// relFieldNames maps a container type (HasMany[Post]) to the Go struct field
+// name it is declared under, recorded when a plan builds, so notLoadedPanic
+// can name the exact With argument — With takes the field name, not the
+// target type name (a Posts HasMany[Post] field needs With("Posts")). Two
+// models declaring the same container type under different names collapse
+// the entry to "" and the panic falls back to generic wording.
+var relFieldNames sync.Map // reflect.Type → field name string; "" once ambiguous
+
+func registerRelFieldName(container reflect.Type, name string) {
+	if prev, loaded := relFieldNames.LoadOrStore(container, name); loaded && prev.(string) != name {
+		relFieldNames.Store(container, "")
+	}
+}
+
+func notLoadedPanic(kind relKind, container, target reflect.Type) string {
+	if name, ok := relFieldNames.Load(container); ok && name.(string) != "" {
+		return fmt.Sprintf(
+			"rio: %s[%s] accessed before loading; add With(%q) to the query or assemble it manually with Set",
+			kind, target.Name(), name)
+	}
+	// The owning model's plan was never built (or the container type appears
+	// under several field names): the exact field name is unknown here.
 	return fmt.Sprintf(
-		"rio: %s[%s] accessed before loading; add With(%q) to the query or assemble it manually with Set",
-		kind, target.Name(), target.Name())
+		"rio: %s[%s] accessed before loading; add With(\"<the Go field name of this %s[%s] field>\") to the query or assemble it manually with Set",
+		kind, target.Name(), kind, target.Name())
 }
 
 // HasMany holds the "child rows pointing at this row" side of a one-to-many
 // relation. It is a container rather than a bare slice so that "not loaded"
 // and "loaded, empty" are different states: rio never returns silently empty
 // data and never lazy-loads. Structs containing relation containers are not
-// comparable; compare with cmp.Diff in tests.
+// comparable, and cmp.Diff panics on the containers' unexported state — pass
+// cmpopts.IgnoreUnexported(rio.HasMany[Post]{}, ...) and compare relation
+// contents through the exported accessors (Rows/Row) instead.
 type HasMany[T any] struct {
 	loaded bool
 	rows   []T
@@ -65,7 +89,7 @@ func (r HasMany[T]) Loaded() bool { return r.loaded }
 // result.
 func (r HasMany[T]) Rows() []T {
 	if !r.loaded {
-		panic(notLoadedPanic(relHasMany, reflect.TypeFor[T]()))
+		panic(notLoadedPanic(relHasMany, reflect.TypeFor[HasMany[T]](), reflect.TypeFor[T]()))
 	}
 	return r.rows
 }
@@ -118,7 +142,7 @@ func (r ManyToMany[T]) Loaded() bool { return r.loaded }
 // Rows returns the loaded rows, panicking when the relation was never loaded.
 func (r ManyToMany[T]) Rows() []T {
 	if !r.loaded {
-		panic(notLoadedPanic(relManyToMany, reflect.TypeFor[T]()))
+		panic(notLoadedPanic(relManyToMany, reflect.TypeFor[ManyToMany[T]](), reflect.TypeFor[T]()))
 	}
 	return r.rows
 }
@@ -171,7 +195,7 @@ func (r HasOne[T]) Loaded() bool { return r.loaded }
 // if the relation was never loaded.
 func (r HasOne[T]) Row() *T {
 	if !r.loaded {
-		panic(notLoadedPanic(relHasOne, reflect.TypeFor[T]()))
+		panic(notLoadedPanic(relHasOne, reflect.TypeFor[HasOne[T]](), reflect.TypeFor[T]()))
 	}
 	return r.row
 }
@@ -220,7 +244,7 @@ func (r BelongsTo[T]) Loaded() bool { return r.loaded }
 // panics if the relation was never loaded.
 func (r BelongsTo[T]) Row() *T {
 	if !r.loaded {
-		panic(notLoadedPanic(relBelongsTo, reflect.TypeFor[T]()))
+		panic(notLoadedPanic(relBelongsTo, reflect.TypeFor[BelongsTo[T]](), reflect.TypeFor[T]()))
 	}
 	return r.row
 }

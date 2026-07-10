@@ -126,6 +126,11 @@ func buildPlan(t reflect.Type) (*plan, error) {
 	if err := errors.Join(errs...); err != nil {
 		return nil, fmt.Errorf("rio: invalid model %s: %w", t.Name(), err)
 	}
+	// Only valid models teach notLoadedPanic their relation field names —
+	// registering earlier would let a rejected model shape poison the hint.
+	for name, rf := range p.rels {
+		registerRelFieldName(t.FieldByIndex(rf.index).Type, name)
+	}
 	return p, nil
 }
 

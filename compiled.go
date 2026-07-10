@@ -153,6 +153,20 @@ func hasArgsInHasConds(s *queryState) bool {
 	return false
 }
 
+// validateRelSpecs eagerly checks every With path and WithCount name at the
+// query entry points, before any row comes back — a typo must fail on every
+// execution, not only when the result set happens to be non-empty. Metadata
+// only: map lookups, no database work, no allocation on the success path.
+func validateRelSpecs(p *plan, s *queryState) error {
+	if len(s.withs) == 0 && len(s.counts) == 0 {
+		return nil
+	}
+	if err := validatePaths(p, s.withs); err != nil {
+		return err
+	}
+	return validateCounts(p, s.counts)
+}
+
 // validatePaths walks With paths through relation metadata only — no
 // database, no key resolution (that stays lazy).
 func validatePaths(p *plan, specs []preloadSpec) error {

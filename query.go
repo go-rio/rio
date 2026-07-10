@@ -209,6 +209,9 @@ func (q Query[T]) All(ctx context.Context, db Queryer) ([]T, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := validateRelSpecs(p, &q.s); err != nil {
+		return nil, err
+	}
 	sqlText, args, err := renderSelect(db.gram(), p, &q.s, selectRows)
 	if err != nil {
 		return nil, err
@@ -236,6 +239,12 @@ func (q Query[T]) All(ctx context.Context, db Queryer) ([]T, error) {
 func (q Query[T]) First(ctx context.Context, db Queryer) (*T, error) {
 	p, err := planOf[T]()
 	if err != nil {
+		return nil, err
+	}
+	// Before the query: a miss returns ErrNotFound without reaching the
+	// preloader, which would otherwise hide a misspelled With until a row
+	// happened to match.
+	if err := validateRelSpecs(p, &q.s); err != nil {
 		return nil, err
 	}
 	one := q.Limit(1)

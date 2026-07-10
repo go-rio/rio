@@ -609,6 +609,15 @@ func appendPKWhereSQL(b []byte, d Dialect, p *plan) []byte {
 // ambiguous path, keeps the ErrNotFound contract identical on all three
 // dialects. If the connection uses CLIENT_FOUND_ROWS, matched idempotent
 // updates report nonzero and simply skip this probe.
+//
+// The probe is a locking read (FOR UPDATE): under InnoDB REPEATABLE READ a
+// plain SELECT reads the transaction's snapshot while the UPDATE is a
+// current read, so a row deleted and committed by another transaction would
+// look present to the probe and turn the lost write into silent success. The
+// current-read probe sees what the UPDATE saw. Outside a transaction the two
+// statements still commit independently — a delete landing between them
+// reports ErrNotFound, which is the race-honest answer (same stance as
+// FirstOrCreate).
 func zeroAffectedMeansMissing(ctx context.Context, db Queryer, p *plan, rv reflect.Value) (bool, error) {
 	g := db.gram()
 	if g.d.name() != "mysql" {
@@ -620,7 +629,10 @@ func zeroAffectedMeansMissing(ctx context.Context, db Queryer, p *plan, rv refle
 		b = append(b, "SELECT 1 FROM "...)
 		b = d.quote(b, g.table(p))
 		b = appendPKWhereSQL(b, d, p) // version is nil on this path: PKs only
-		return append(b, " LIMIT 1"...)
+		// Single-row PK lock, MySQL-only path (see the early return above):
+		// autocommit releases it immediately, and MySQL 5.7/8.x and MariaDB
+		// all support the clause.
+		return append(b, " LIMIT 1 FOR UPDATE"...)
 	})
 	if err != nil {
 		return false, err

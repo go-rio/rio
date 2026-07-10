@@ -44,6 +44,26 @@ func TestPreloadHasOne(t *testing.T) {
 	}
 }
 
+// Two child rows for one parent contradict HasOne — silently keeping
+// whichever row the driver returned first is a nondeterministic answer
+// (AUDIT LB5).
+func TestPreloadHasOneRefusesMultipleRows(t *testing.T) {
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
+	f.queueRows([]string{"id", "user_id", "nick"},
+		[]driver.Value{int64(9), int64(1), "first"},
+		[]driver.Value{int64(10), int64(1), "second"})
+
+	_, err := From[Owner]().With("Profile").All(context.Background(), db)
+	if err == nil || !strings.Contains(err.Error(), "HasOne loaded 2 rows for one parent") {
+		t.Fatalf("HasOne with two rows must refuse: %v", err)
+	}
+	if !strings.Contains(err.Error(), "use HasMany") {
+		t.Fatalf("error must name the fixes: %v", err)
+	}
+}
+
 func TestFirstOrCreate(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1007,28 +1027,59 @@ func TestWriteColumns(t *testing.T) {
 	}
 }
 
+// Sync converges by reading the existing join rows and diffing in memory
+// (AUDIT M14: a NOT IN over the full id set breaks at the bind limit, and
+// chunking a NOT IN would delete every other chunk's ids). Existing {1,2,3}
+// against target {2,3,4} must delete exactly 1 and insert exactly 4.
 func TestSyncRelation(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
 	db := f.open()
 
 	acc := &Account{ID: 7}
-	f.queueExec(0, 1) // delete not-in
-	f.queueExec(0, 2) // attach
-	if err := SyncRelation(ctx, db, acc, "Tags", []int64{100, 101}); err != nil {
+	f.queueRows([]string{"id"}, []driver.Value{int64(7)}) // owner lock
+	f.queueRows([]string{"tag_id"},
+		[]driver.Value{int64(1)}, []driver.Value{int64(2)}, []driver.Value{int64(3)})
+	f.queueExec(0, 1) // delete stale
+	f.queueExec(0, 1) // insert missing
+	if err := SyncRelation(ctx, db, acc, "Tags", []int64{2, 3, 4}); err != nil {
 		t.Fatalf("SyncRelation: %v", err)
 	}
 	logs := f.logged()
 	joined := strings.Join(logs, " | ")
 	for _, frag := range []string{
 		"BEGIN",
-		`DELETE FROM "account_tags" WHERE "account_id" = $1 AND "tag_id" NOT IN ($2, $3)`,
-		`INSERT INTO "account_tags" ("account_id", "tag_id") VALUES ($1, $2), ($3, $4) ON CONFLICT DO NOTHING`,
+		`SELECT "tag_id" FROM "account_tags" WHERE "account_id" = $1 FOR UPDATE`,
+		`DELETE FROM "account_tags" WHERE "account_id" = $1 AND "tag_id" IN ($2)`,
+		`INSERT INTO "account_tags" ("account_id", "tag_id") VALUES ($1, $2) ON CONFLICT DO NOTHING`,
 		"COMMIT",
 	} {
 		if !strings.Contains(joined, frag) {
 			t.Fatalf("missing %q in %s", frag, joined)
 		}
+	}
+	if strings.Contains(joined, "NOT IN") {
+		t.Fatalf("sync must diff in memory, not render NOT IN: %s", joined)
+	}
+	del := f.loggedContaining(`DELETE FROM "account_tags"`)[0]
+	if len(del.args) != 2 || del.args[1] != int64(1) {
+		t.Fatalf("delete must target only the stale id: %v", del.args)
+	}
+	ins := f.loggedContaining(`INSERT INTO "account_tags"`)[0]
+	if len(ins.args) != 2 || ins.args[1] != int64(4) {
+		t.Fatalf("insert must add only the missing id: %v", ins.args)
+	}
+
+	// Already in sync: reads only, no writes.
+	f1 := newFakeDB()
+	db1 := f1.open()
+	f1.queueRows([]string{"id"}, []driver.Value{int64(7)})
+	f1.queueRows([]string{"tag_id"}, []driver.Value{int64(2)})
+	if err := SyncRelation(ctx, db1, acc, "Tags", []int64{2}); err != nil {
+		t.Fatalf("SyncRelation no-op: %v", err)
+	}
+	if got := strings.Join(f1.logged(), " | "); strings.Contains(got, "DELETE") || strings.Contains(got, "INSERT") {
+		t.Fatalf("an in-sync relation must not be written: %s", got)
 	}
 
 	// Empty set explicitly empties the relation.
@@ -1077,9 +1128,10 @@ func TestCompiledRows(t *testing.T) {
 func TestSyncRelationLocksOwner(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
-	db := f.open() // postgres: forUpdate capable
-	f.queueRows([]string{"id"}, []driver.Value{int64(7)})
-	f.queueExec(0, 0)
+	db := f.open()                                            // postgres: forUpdate capable
+	f.queueRows([]string{"id"}, []driver.Value{int64(7)})     // owner lock
+	f.queueRows([]string{"tag_id"}, []driver.Value{int64(1)}) // existing links
+	f.queueExec(0, 1)
 	f.queueExec(0, 1)
 
 	if err := SyncRelation(ctx, db, &Account{ID: 7}, "Tags", []int64{100}); err != nil {
@@ -1087,18 +1139,23 @@ func TestSyncRelationLocksOwner(t *testing.T) {
 	}
 	joined := strings.Join(f.logged(), " | ")
 	lock := `SELECT "id" FROM "accounts" WHERE "id" = $1 FOR UPDATE`
+	read := `SELECT "tag_id" FROM "account_tags"`
 	del := `DELETE FROM "account_tags"`
 	if !strings.Contains(joined, lock) {
 		t.Fatalf("missing owner lock in %s", joined)
 	}
-	if strings.Index(joined, lock) > strings.Index(joined, del) {
-		t.Fatal("the lock must precede the delete")
+	if strings.Index(joined, lock) > strings.Index(joined, read) {
+		t.Fatal("the lock must precede the join-row read")
+	}
+	if strings.Index(joined, read) > strings.Index(joined, del) {
+		t.Fatal("the locked read must precede the delete")
 	}
 
-	// SQLite: single-writer, no FOR UPDATE — and none rendered.
+	// SQLite: single-writer, no FOR UPDATE — and none rendered, neither on
+	// the owner nor on the join-row read.
 	f2 := newFakeDB()
 	db2 := f2.open(SQLite)
-	f2.queueExec(0, 0)
+	f2.queueRows([]string{"tag_id"})
 	f2.queueExec(0, 1)
 	if err := SyncRelation(ctx, db2, &Account{ID: 7}, "Tags", []int64{100}); err != nil {
 		t.Fatalf("sqlite sync: %v", err)
@@ -1410,7 +1467,9 @@ func TestManyToManyJoinColumnOverrides(t *testing.T) {
 
 // MySQL counts changed rows, not matched rows: an idempotent Update must not
 // report ErrNotFound. One PK probe resolves the ambiguity; a truly missing
-// row still errors.
+// row still errors. The probe must be a locking read — a snapshot read under
+// REPEATABLE READ would see a concurrently deleted row and turn the lost
+// write into silent success (AUDIT M5).
 func TestMySQLIdempotentUpdateProbes(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1422,8 +1481,8 @@ func TestMySQLIdempotentUpdateProbes(t *testing.T) {
 		t.Fatalf("idempotent update must succeed: %v", err)
 	}
 	probe := f.logged()[1]
-	if !strings.Contains(probe, "SELECT 1 FROM `posts` WHERE `id` = ? LIMIT 1") {
-		t.Fatalf("probe sql: %s", probe)
+	if !strings.Contains(probe, "SELECT 1 FROM `posts` WHERE `id` = ? LIMIT 1 FOR UPDATE") {
+		t.Fatalf("probe must be a locking read: %s", probe)
 	}
 
 	f.queueExec(0, 0)          // UPDATE: no such row
@@ -1433,7 +1492,7 @@ func TestMySQLIdempotentUpdateProbes(t *testing.T) {
 		t.Fatalf("missing row must stay ErrNotFound: %v", err)
 	}
 
-	// PostgreSQL counts matched rows; no probe happens.
+	// PostgreSQL counts matched rows; no probe (and so no FOR UPDATE) happens.
 	fp := newFakeDB()
 	dbp := fp.open()
 	fp.queueExec(0, 0)
@@ -1442,6 +1501,17 @@ func TestMySQLIdempotentUpdateProbes(t *testing.T) {
 	}
 	if len(fp.logged()) != 1 {
 		t.Fatalf("pg must not probe: %v", fp.logged())
+	}
+
+	// SQLite likewise counts matched rows: zero affected is ErrNotFound.
+	fs := newFakeDB()
+	dbs := fs.open(SQLite)
+	fs.queueExec(0, 0)
+	if err := Update(ctx, dbs, &Post{ID: 1, UserID: 5}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("sqlite zero-affected means missing: %v", err)
+	}
+	if len(fs.logged()) != 1 {
+		t.Fatalf("sqlite must not probe: %v", fs.logged())
 	}
 }
 
@@ -1462,6 +1532,86 @@ func TestAttachDetachTypedIDs(t *testing.T) {
 	}
 	if got := f.logged()[1]; !strings.Contains(got, `"tag_id" IN ($2, $3)`) {
 		t.Fatalf("detach expansion: %s", got)
+	}
+}
+
+// Attach and Detach chunk to the dialect's bind ceiling like InsertAll —
+// one oversized id set must never surface a driver "too many SQL variables"
+// (AUDIT M14). SQLite's 999-parameter cap keeps the fixture small: an
+// INSERT holds 499 (owner, id) pairs, a DELETE holds 998 ids plus the owner.
+func TestAttachDetachChunkByBindLimit(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite)
+	acc := &Account{ID: 7}
+
+	ids := make([]int64, 600)
+	for i := range ids {
+		ids[i] = int64(1000 + i)
+	}
+	if err := Attach(ctx, db, acc, "Tags", ids...); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	inserts := f.loggedContaining("INSERT INTO")
+	if len(inserts) != 2 {
+		t.Fatalf("600 pairs at 999 params must be 2 inserts, got %d", len(inserts))
+	}
+	if len(inserts[0].args) != 998 || len(inserts[1].args) != 202 {
+		t.Fatalf("chunk arg counts: %d, %d", len(inserts[0].args), len(inserts[1].args))
+	}
+	for _, st := range inserts {
+		if len(st.args) > 999 {
+			t.Fatalf("insert exceeds the bind limit: %d args", len(st.args))
+		}
+		if !strings.Contains(st.sql, "ON CONFLICT DO NOTHING") {
+			t.Fatalf("every chunk stays idempotent: %s", st.sql)
+		}
+	}
+
+	del := make([]int64, 1000)
+	for i := range del {
+		del[i] = int64(5000 + i)
+	}
+	if err := Detach(ctx, db, acc, "Tags", del...); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+	deletes := f.loggedContaining("DELETE FROM")
+	if len(deletes) != 2 {
+		t.Fatalf("1000 ids at 999 params must be 2 deletes, got %d", len(deletes))
+	}
+	if len(deletes[0].args) != 999 || len(deletes[1].args) != 3 {
+		t.Fatalf("chunk arg counts: %d, %d", len(deletes[0].args), len(deletes[1].args))
+	}
+}
+
+// SyncRelation's removals chunk the same way: 1200 existing links converging
+// on a single kept id must issue two IN deletes, never one oversized (or a
+// NOT IN) statement — and nothing gets inserted when the id is already there.
+func TestSyncRelationChunksDeletes(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite)
+
+	existing := make([][]driver.Value, 1200)
+	for i := range existing {
+		existing[i] = []driver.Value{int64(i + 1)}
+	}
+	f.queueRows([]string{"tag_id"}, existing...)
+	f.queueExec(0, 998)
+	f.queueExec(0, 201)
+
+	if err := SyncRelation(ctx, db, &Account{ID: 7}, "Tags", []int64{1}); err != nil {
+		t.Fatalf("SyncRelation: %v", err)
+	}
+	deletes := f.loggedContaining("DELETE FROM")
+	if len(deletes) != 2 {
+		t.Fatalf("1199 stale ids must chunk into 2 deletes, got %d", len(deletes))
+	}
+	if len(deletes[0].args) != 999 || len(deletes[1].args) != 202 {
+		t.Fatalf("chunk arg counts: %d, %d", len(deletes[0].args), len(deletes[1].args))
+	}
+	if got := f.loggedContaining("INSERT INTO"); len(got) != 0 {
+		t.Fatalf("the kept id already exists, nothing to insert: %v", got)
 	}
 }
 

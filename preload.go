@@ -45,11 +45,21 @@ func resolveRel(owner *plan, r *relField) (*resolvedRel, error) {
 	}
 	res := &resolvedRel{target: target}
 
+	// singlePK serves the direct-FK kinds, where ref: names the key column
+	// and is real advice. ManyToMany goes through m2mPK: there ref: names a
+	// join-table column and cannot substitute for a composite key.
 	singlePK := func(p *plan, side string) (*field, error) {
 		if len(p.pks) == 1 {
 			return p.pks[0], nil
 		}
 		return nil, fmt.Errorf("%s %s needs exactly one primary key column for convention-based relations (has %d); set ref: explicitly or restructure",
+			side, p.structName, len(p.pks))
+	}
+	m2mPK := func(p *plan, side string) (*field, error) {
+		if len(p.pks) == 1 {
+			return p.pks[0], nil
+		}
+		return nil, fmt.Errorf("ManyToMany across composite primary keys is not supported in v1 (%s %s has %d primary key columns); give it a single-column surrogate key, or query the join table by hand",
 			side, p.structName, len(p.pks))
 	}
 
@@ -93,11 +103,11 @@ func resolveRel(owner *plan, r *relField) (*resolvedRel, error) {
 			return nil, err
 		}
 	case relManyToMany:
-		ownPK, err := singlePK(owner, "owner")
+		ownPK, err := m2mPK(owner, "owner")
 		if err != nil {
 			return nil, err
 		}
-		targetPK, err := singlePK(target, "target")
+		targetPK, err := m2mPK(target, "target")
 		if err != nil {
 			return nil, err
 		}
@@ -126,7 +136,39 @@ func resolveRel(owner *plan, r *relField) (*resolvedRel, error) {
 			return nil, fmt.Errorf("both join-table columns would be %q; a self-referential ManyToMany needs explicit fk: and ref: tags naming the two columns", res.joinFK)
 		}
 	}
+	if r.kind != relManyToMany && keyFamily(res.fk.typ) != keyFamily(res.ref.typ) {
+		// The assembly loop pairs owner-side and child-side keys through
+		// canonKey; keys from different families can never compare equal, so
+		// every row the IN query returns would silently assemble empty.
+		// ManyToMany is exempt: its grouping key is re-scanned from the join
+		// table as the owner key's type, never compared across the two PKs.
+		return nil, fmt.Errorf("cannot match %s.%s (%s) against %s.%s (%s): the key types never compare equal and every preload would silently come back empty; align the Go types (integer kinds are interchangeable; string matches []byte) or point fk:/ref: at compatible columns",
+			owner.structName, res.ref.name, res.ref.typ, target.structName, res.fk.name, res.fk.typ)
+	}
 	return res, nil
+}
+
+// keyFamily buckets a key type by the canonical form canonKey folds it into:
+// every integer kind shares one family, string and []byte share another, and
+// any other type groups only with itself. Pointers bucket by their element.
+// resolveRel refuses FK/ref pairs from different families — their canonical
+// keys can never be equal.
+func keyFamily(t reflect.Type) any {
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return "integer"
+	case reflect.String:
+		return "string"
+	case reflect.Slice:
+		if t.Elem().Kind() == reflect.Uint8 {
+			return "string"
+		}
+	}
+	return t
 }
 
 // preloadSpec is one With() request: a dot path plus options for the leaf.
@@ -363,6 +405,12 @@ func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, r
 			if len(matches) == 0 {
 				container.setLoaded(reflect.Zero(ptrType))
 				continue
+			}
+			if rel.kind == relHasOne && len(matches) > 1 {
+				// HasOne declares "one" — silently keeping whichever row the
+				// driver returned first would be a nondeterministic answer.
+				return fmt.Errorf("rio: relation %s.%s: HasOne loaded %d rows for one parent; the schema evidently allows several — use HasMany, or make %s.%s unique",
+					owner.structName, rel.name, len(matches), target.structName, res.fk.column)
 			}
 			cp := reflect.New(elemType)
 			cp.Elem().Set(buf.Index(matches[0]))

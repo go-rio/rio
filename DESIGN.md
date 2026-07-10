@@ -206,7 +206,10 @@ type User struct {
   plan time (binding cannot address unexported fields). Embed by value:
   pointer embedding is rejected because offset-based scanning cannot hop a nil.
 - Structs containing relation containers are not comparable (they hold
-  slices); use cmp.Diff in tests.
+  slices), and cmp.Diff panics on the containers' unexported state: pass
+  cmpopts.IgnoreUnexported(rio.HasMany[Post]{}, ...) and compare relation
+  contents through the exported accessors (Rows/Row), or diff those
+  accessors directly.
 
 ### Relations are containers, not slices
 
