@@ -11,12 +11,17 @@ import (
 	"unsafe"
 )
 
-// Insert writes one row and fills in what the database generated: the whole
-// row via RETURNING on PostgreSQL/SQLite, the auto-increment ID on MySQL —
-// never a hidden second SELECT. Zero values are written as-is; columns
-// tagged omitzero are skipped when zero so DB defaults apply, and a zero
-// auto-increment PK is skipped implicitly. CreatedAt/UpdatedAt are set to
-// the clock when zero; a zero version column starts at 1.
+// Insert writes one row and fills in what the database generated: the
+// columns the INSERT skipped — the zero auto-increment PK and zero omitzero
+// columns — via RETURNING on PostgreSQL/SQLite, the auto-increment ID on
+// MySQL. Never a hidden second SELECT; columns rewritten by triggers are not
+// read back. Zero values are written as-is; columns tagged omitzero are
+// skipped when zero so DB defaults apply, and a zero auto-increment PK is
+// skipped implicitly. CreatedAt/UpdatedAt are set to the clock when zero; a
+// zero version column starts at 1. Time fields are normalized in place as
+// they bind (UTC, monotonic reading stripped, microsecond precision), so
+// after Insert the struct holds exactly what the database stores and an
+// insert-then-reload comparison stays Equal.
 func Insert[T any](ctx context.Context, db Queryer, row *T) error {
 	p, err := planOf[T]()
 	if err != nil {
@@ -376,7 +381,14 @@ func setTime(f *field, rv reflect.Value, now time.Time) {
 		*(*time.Time)(unsafe.Add(rv.Addr().UnsafePointer(), f.offset)) = now
 		return
 	}
-	rv.FieldByIndex(f.index).Set(reflect.ValueOf(&now)) // *time.Time
+	setTimePtr(f, rv, now)
+}
+
+// setTimePtr sets a *time.Time field. Split out of setTime so &now's escape
+// stays off the value-field fast path: escape analysis is per parameter, not
+// per branch, and would otherwise heap-allocate now on every setTime call.
+func setTimePtr(f *field, rv reflect.Value, now time.Time) {
+	rv.FieldByIndex(f.index).Set(reflect.ValueOf(&now))
 }
 
 func bumpVersion(f *field, rv reflect.Value) {

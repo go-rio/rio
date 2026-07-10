@@ -35,7 +35,8 @@ func DoUpdate(cols ...string) UpsertOption {
 
 // DoNothing turns conflicts into no-ops. On MySQL this renders as a no-op
 // assignment rather than INSERT IGNORE, which would swallow unrelated
-// errors. A conflicting soft-deleted row stays deleted.
+// errors — and without the DoUpdate row alias, so it stays valid on MariaDB
+// and MySQL before 8.0.19. A conflicting soft-deleted row stays deleted.
 func DoNothing() UpsertOption {
 	return func(s *upsertSpec) { s.doNothing = true }
 }
@@ -71,6 +72,23 @@ func KeepTrashed() UpsertOption {
 // deletion semantics; resurrect-on-upsert is its consistent extension (the
 // alternative is Eloquent's famous trap: "upsert succeeded but the row is
 // invisible").
+//
+// UpdatedAt is reset to the clock on every non-DoNothing upsert, even when
+// nonzero: the conflict branch applies the would-be inserted row's stamp, so
+// that stamp must be this call's now — the same unconditional rule as entity
+// Update. DoNothing keeps Insert's fill-only-when-zero rule.
+//
+// omitzero: a zero omitzero column is skipped from the INSERT column list,
+// and the default conflict update set skips it too — on conflict the
+// existing value survives (an uninserted column's excluded value is the DB
+// DEFAULT, not something rio should write over data). Naming such a column
+// in DoUpdate errors. UpsertAll differs: the batch path binds every column,
+// so batch zeros are written on both branches.
+//
+// MySQL version floor: the DoUpdate branch references the would-be inserted
+// row through a row alias — 8.0.19+ syntax (the VALUES() function it
+// replaces is deprecated). MySQL before 8.0.19 and MariaDB reject it;
+// DoNothing renders alias-free and runs everywhere.
 func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption) error {
 	var spec upsertSpec
 	for _, opt := range opts {
@@ -107,7 +125,7 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 		return fmt.Errorf("rio: Upsert on %s with every column defaulted (all omitzero columns zero); set a column or use Insert", p.structName)
 	}
 
-	update, err := upsertUpdateSet(p, &spec)
+	update, err := upsertUpdateSet(p, &spec, back)
 	if err != nil {
 		return err
 	}
@@ -177,8 +195,13 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 	}
 
 	// MySQL: ON DUPLICATE KEY UPDATE. The VALUES() function for referring to
-	// the would-be inserted row is deprecated, so rio always names that row.
-	b = appendMySQLUpsertAlias(b)
+	// the would-be inserted row is deprecated, so the DoUpdate branch names
+	// that row with an alias instead — 8.0.19+ syntax that MariaDB and older
+	// MySQL reject. DoNothing's no-op assignment never references the new
+	// row, so it renders alias-free and stays portable.
+	if !spec.doNothing {
+		b = appendMySQLUpsertAlias(b)
+	}
 	b = append(b, " ON DUPLICATE KEY UPDATE "...)
 	if spec.doNothing {
 		// A no-op assignment needs some column; models without a PK still
@@ -217,6 +240,15 @@ func appendMySQLUpsertAlias(b []byte) []byte {
 
 func prepareUpsertRow(p *plan, rv reflect.Value, spec *upsertSpec, now time.Time) {
 	stampForInsert(p, rv, now)
+	if p.updated != nil && !spec.doNothing {
+		// The conflict branch renders updated_at = excluded.updated_at (row
+		// alias on MySQL): the would-be inserted row must carry this call's
+		// clock even when the struct holds a stale stamp from an earlier load
+		// — matching entity Update's unconditional now. DoNothing never
+		// references the new row on conflict and keeps Insert's
+		// fill-only-when-zero rule.
+		setTime(p.updated, rv, now)
+	}
 	if p.softDel != nil && !spec.doNothing && !spec.keepTrashed {
 		clearTime(p.softDel, rv)
 	}
@@ -224,10 +256,18 @@ func prepareUpsertRow(p *plan, rv reflect.Value, spec *upsertSpec, now time.Time
 
 // upsertUpdateSet resolves the DoUpdate whitelist (or derives the default:
 // everything except PKs, CreatedAt, the version column, the softdelete
-// column, and the conflict target itself). An empty resolved set with no
-// maintained columns to render either would emit "DO UPDATE SET" with no
-// assignments — invalid SQL on every dialect — so it errors with the fix.
-func upsertUpdateSet(p *plan, spec *upsertSpec) ([]*field, error) {
+// column, the conflict target itself, and the columns this statement skipped).
+// skipped holds the columns absent from the INSERT list (zero omitzero
+// columns and the zero auto-increment PK): excluded.col for an uninserted
+// column is its DB DEFAULT, so referencing one would silently reset the
+// existing row's data on conflict — the default set leaves those columns
+// untouched and the whitelist refuses them. The derivation stays a pure
+// function of (insert column set, spec) — skipped is the insert bitmap's
+// complement — so it can join the cached-SQL key later. An empty resolved
+// set with no maintained columns to render either would emit "DO UPDATE SET"
+// with no assignments — invalid SQL on every dialect — so it errors with
+// the fix.
+func upsertUpdateSet(p *plan, spec *upsertSpec, skipped []*field) ([]*field, error) {
 	if spec.doNothing {
 		return nil, nil
 	}
@@ -241,6 +281,9 @@ func upsertUpdateSet(p *plan, spec *upsertSpec) ([]*field, error) {
 			if f.isPK || f.isVersion || f.isSoftDelete || f.isCreated || f.isUpdated {
 				return nil, fmt.Errorf("rio: DoUpdate: column %q is maintained by rio and cannot be listed", c)
 			}
+			if fieldIn(skipped, f) {
+				return nil, fmt.Errorf("rio: DoUpdate: column %q is tagged omitzero and %s.%s is zero, so this statement inserts no value the conflict update could reference; set the field or drop the column from DoUpdate", c, p.structName, f.name)
+			}
 			out = append(out, f)
 		}
 		return out, nil
@@ -250,8 +293,13 @@ func upsertUpdateSet(p *plan, spec *upsertSpec) ([]*field, error) {
 		inTarget[c] = true
 	}
 	var out []*field
+	omitted := false
 	for _, f := range p.fields {
 		if f.isPK || f.isVersion || f.isSoftDelete || f.isCreated || f.isUpdated || f.isAutoIncr || inTarget[f.column] {
+			continue
+		}
+		if fieldIn(skipped, f) {
+			omitted = true
 			continue
 		}
 		out = append(out, f)
@@ -259,9 +307,22 @@ func upsertUpdateSet(p *plan, spec *upsertSpec) ([]*field, error) {
 	if len(out) == 0 && p.updated == nil && p.version == nil && (p.softDel == nil || spec.keepTrashed) {
 		// Nothing would render after DO UPDATE SET / ON DUPLICATE KEY UPDATE
 		// — invalid SQL on every dialect (lookup tables, join tables).
+		if omitted {
+			return nil, fmt.Errorf("rio: upsert on %s has nothing to update on conflict (every column is a key, rio-maintained, or a zero omitzero column skipped this call); use DoNothing()", p.structName)
+		}
 		return nil, fmt.Errorf("rio: upsert on %s has nothing to update on conflict (every column is a key or rio-maintained); use DoNothing()", p.structName)
 	}
 	return out, nil
+}
+
+// fieldIn reports membership by identity; plan fields are canonical pointers.
+func fieldIn(fs []*field, f *field) bool {
+	for _, s := range fs {
+		if s == f {
+			return true
+		}
+	}
+	return false
 }
 
 // appendConflictClause renders "ON CONFLICT (cols) " — or the bare

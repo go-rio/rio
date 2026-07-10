@@ -136,7 +136,7 @@ code compiled into your binary.
 | `rio:",version"` | optimistic locking: `UPDATE … SET version = version+1 WHERE … AND version = ?`; a lost race returns `ErrStaleObject` |
 | `rio:",softdelete"` | on `time.Time`/`*time.Time`: `Delete` becomes an UPDATE, default queries filter, `WithTrashed`/`OnlyTrashed`/`ForceDelete` opt out |
 | `rio:",json"` | (de)serialize the field as JSON |
-| `rio:",omitzero"` | skip the column when zero so DB defaults apply (and RETURNING fills it back) |
+| `rio:",omitzero"` | skip the column when zero so DB defaults apply (and RETURNING fills it back); a single-row `Upsert` conflict then leaves the existing value untouched |
 | `rio:"-"` | not a column |
 | `CreatedAt`, `UpdatedAt` | maintained automatically when present (`rio:",nostamp"` opts out) |
 | `TableName() string` | override the pluralized table name (`User` → `users`, `Person` → `people`) |
@@ -173,6 +173,9 @@ backfill, timestamp maintenance:
 ```go
 err := rio.Upsert(ctx, db, &user, rio.OnConflict("email"), rio.DoUpdate("name"))
 ```
+
+On MySQL the DoUpdate branch uses the 8.0.19+ row-alias syntax (`VALUES()`
+is deprecated); MySQL before 8.0.19 and MariaDB support `DoNothing` only.
 
 Batch writes chunk automatically to each dialect's bind limit; backfill
 promises only what dialects can keep (documented per dialect on `InsertAll`).

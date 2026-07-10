@@ -87,7 +87,7 @@ user, err := rio.From[User]().Where("email = ?", e).First(ctx, db)
 n, err    := rio.From[User]().Where(...).Count(ctx, db)
 
 // Writes: immediate, explicit, zero values are real values.
-err = rio.Insert(ctx, db, &user)                     // fills ID (+ full row via RETURNING on PG/SQLite)
+err = rio.Insert(ctx, db, &user)                     // fills ID + skipped omitzero columns via RETURNING on PG/SQLite
 err = rio.InsertAll(ctx, db, users)                  // single multi-VALUES statement, auto-chunked
 err = rio.Update(ctx, db, &user)                     // full-column UPDATE by PK (honest), or:
 err = rio.Update(ctx, db, &user, "name", "email")    // explicit column whitelist
@@ -183,9 +183,14 @@ type User struct {
   naming) are automatic; anything that changes query semantics or error paths
   (optimistic locking, soft delete) requires an explicit tag.
 - `rio:",omitzero"`: skip the column when the field is zero, letting the DB
-  default apply. Auto-increment PKs get this implicitly. The default for every
-  other column is to write the zero value — Go zero values are values
-  (go-pg's `NULL`-by-default is the canonical counterexample).
+  default apply. Auto-increment PKs get this implicitly. On a single-row
+  `Upsert`, a skipped column also leaves the default conflict update set —
+  the existing row's value survives a conflict — and naming it in `DoUpdate`
+  is an error (the statement inserts no value to reference). `UpsertAll`
+  binds every column (one statement, one column list), so batch zeros are
+  written on both branches. The default for every other column is to write
+  the zero value — Go zero values are values (go-pg's `NULL`-by-default is
+  the canonical counterexample).
 - Composite primary keys: tag multiple fields `rio:",pk"`. `Find` takes all
   parts in field-declaration order. Models without a PK return
   `ErrNoPrimaryKey` from Find/Update/Delete.
@@ -248,10 +253,13 @@ returns a clear error in v1.
 | Batch backfill | InsertAll backfills auto-inc PKs only (PG by position; SQLite sorted-by-PK since RETURNING order is documented as undefined; MySQL none — interleaved autoinc); UpsertAll never backfills (DoNothing shrinks the row set) |
 | Soft-deleted model queries | filtered by default *because the tag is explicit*; `WithTrashed()` / `OnlyTrashed()`; `Delete` becomes UPDATE, `ForceDelete` is real |
 | Upsert on a soft-deleted row | **invariant: a successful Upsert leaves the row visible** — DoUpdate automatically sets `deleted_at = NULL` (+updated_at); `rio.KeepTrashed()` opts out; DoNothing never revives |
+| Upsert `updated_at` | reset to the clock on every non-DoNothing upsert, even when nonzero — the conflict branch applies the would-be inserted row's stamp, so it must be this call's now (entity Update's unconditional rule) |
+| Zero `omitzero` column in `Upsert` | skipped from the INSERT list **and** the default conflict update set — a conflict preserves the existing value instead of resetting it to the DB DEFAULT; naming it in `DoUpdate` errors; `UpsertAll` binds every column and writes zeros on conflict |
+| MySQL Upsert version floor | the DoUpdate branch names the new row with the 8.0.19+ row alias (`VALUES()` is deprecated); MySQL <8.0.19 and MariaDB reject that syntax — `DoNothing` renders alias-free and runs everywhere |
 | `First` ordering | no implicit ORDER BY — LIMIT 1 over whatever order the DB returns; add OrderBy for determinism (SQL correspondence) |
 | Placeholders | always `?`, rebound per dialect with a per-dialect lexer; `??` escapes a literal `?` (PostgreSQL JSONB operators); `IN (?)` expands slices — sqlx/Bun's established conventions |
 | Scan priority | `rio:"-"` → `json` tag (beats Scanner, documented) → `sql.Scanner` (NULL handed to Scan(nil), no second-guessing) → pointer fields (NULL→nil) → `[]byte` (NULL→nil) → basic conversions (overflow-checked; MySQL unsigned BIGINT > MaxInt64 arrives as bytes and is parsed) → NULL into anything else errors with the column name |
-| Times | written as UTC, monotonic-stripped, truncated to microseconds (PG/MySQL precision — otherwise reload-and-Equal never holds); SQLite text format is rio's own, not the driver's |
+| Times | written as UTC, monotonic-stripped, truncated to microseconds (PG/MySQL precision — otherwise reload-and-Equal never holds), and the normalized value is written back to the struct as it binds, so the struct holds exactly what the database stores; trigger-rewritten columns are not read back; SQLite text format is rio's own, not the driver's |
 | Partial scans | `Raw[T]` into an entity requires the result to cover every mapped column — a partial scan errors (naming the missing columns and pointing at a DTO) rather than letting a later `rio.Update` write zeros to the unscanned ones (mirror image of GORM #6860) |
 
 ## Performance

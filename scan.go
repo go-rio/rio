@@ -647,7 +647,15 @@ func bindArgFast(f *field, base unsafe.Pointer, d Dialect) (any, bool, error) {
 		if t.IsZero() && f.isSoftDelete {
 			return nil, true, nil
 		}
-		return d.bindTime(normalizeTime(t)), true, nil
+		nt := normalizeTime(t)
+		if nt != t {
+			// Write the normalized form back (representation compare — the
+			// instant is unchanged): the struct then holds exactly what the
+			// database stores, so insert-then-reload compares Equal even for
+			// caller-provided nanosecond or zoned times.
+			*(*time.Time)(p) = nt
+		}
+		return d.bindTime(nt), true, nil
 	}
 	return nil, false, nil
 }
@@ -769,27 +777,38 @@ func bindArg(f *field, v reflect.Value, d Dialect) (any, error) {
 	// Mirror normalizeArgs: left to the driver's Valuer path, the inner time
 	// would skip microsecond truncation and rio's SQLite text encoding —
 	// the same field would then store differently under Insert and Upsert.
+	// As on the fast path, a changed normalization is written back so the
+	// struct holds exactly what the database stores.
 	if v.Type() == nullTimeType {
 		if nv := v.Interface().(sql.NullTime); nv.Valid {
-			return d.bindTime(normalizeTime(nv.Time)), nil
+			nt := normalizeTime(nv.Time)
+			if nt != nv.Time && v.CanSet() {
+				v.Set(reflect.ValueOf(sql.NullTime{Time: nt, Valid: true}))
+			}
+			return d.bindTime(nt), nil
 		}
 		return nil, nil
 	}
 	if v.Type() == nullTimeGenericType {
 		if nv := v.Interface().(sql.Null[time.Time]); nv.Valid {
-			return d.bindTime(normalizeTime(nv.V)), nil
+			nt := normalizeTime(nv.V)
+			if nt != nv.V && v.CanSet() {
+				v.Set(reflect.ValueOf(sql.Null[time.Time]{V: nt, Valid: true}))
+			}
+			return d.bindTime(nt), nil
 		}
 		return nil, nil
 	}
 	if v.Type() == timeType {
 		t := v.Interface().(time.Time)
-		if t.IsZero() {
-			if f.isSoftDelete {
-				return nil, nil // zero time on the softdelete column stores NULL
-			}
-			return d.bindTime(normalizeTime(t)), nil
+		if t.IsZero() && f.isSoftDelete {
+			return nil, nil // zero time on the softdelete column stores NULL
 		}
-		return d.bindTime(normalizeTime(t)), nil
+		nt := normalizeTime(t)
+		if nt != t && v.CanSet() {
+			v.Set(reflect.ValueOf(nt))
+		}
+		return d.bindTime(nt), nil
 	}
 	if isUintKind(v.Kind()) {
 		if n := v.Uint(); n > math.MaxInt64 {

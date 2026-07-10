@@ -2318,3 +2318,259 @@ func TestUnexportedEmbeddedColumnRefusedAtPlanTime(t *testing.T) {
 		t.Fatalf("unexported embedded scanner column must be a plan error: %v", err)
 	}
 }
+
+// --- pre-release audit (fable multi-lens) write-domain regressions ---
+
+// Audit: a zero omitzero column is absent from the INSERT column list, yet
+// the default conflict update set still rendered `note = excluded.note`; a
+// column missing from the INSERT list makes excluded.note the column's DB
+// DEFAULT (NULL without one), so upserting onto an existing row silently
+// reset its data.
+type Contact struct {
+	ID    int64
+	Email string
+	Name  string
+	Note  string `rio:",omitzero"`
+}
+
+var contactCols = []string{"id", "email", "name", "note"}
+
+func TestUpsertSkippedOmitzeroColumnStaysOutOfConflictSet(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite)
+
+	f.queueRows(contactCols, []driver.Value{int64(1), "a@x", "n", "orig"})
+	if err := Upsert(ctx, db, &Contact{Email: "a@x", Name: "n"}, OnConflict("email")); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	got := f.logged()[0]
+	if !strings.HasPrefix(got, `INSERT INTO "contacts" ("email", "name") VALUES`) {
+		t.Fatalf("zero omitzero column must be skipped from INSERT: %s", got)
+	}
+	if !strings.Contains(got, `"name" = excluded."name"`) {
+		t.Fatalf("inserted columns still update on conflict: %s", got)
+	}
+	if strings.Contains(got, `"note" = excluded."note"`) {
+		t.Fatalf("skipped omitzero column must stay out of the conflict update set: %s", got)
+	}
+
+	// Control: a nonzero omitzero column inserts and updates as usual.
+	f.queueRows(contactCols, []driver.Value{int64(1), "a@x", "n", "kept"})
+	if err := Upsert(ctx, db, &Contact{Email: "a@x", Name: "n", Note: "kept"}, OnConflict("email")); err != nil {
+		t.Fatalf("Upsert nonzero: %v", err)
+	}
+	if got := f.logged()[1]; !strings.Contains(got, `"note" = excluded."note"`) {
+		t.Fatalf("nonzero omitzero column must update on conflict: %s", got)
+	}
+}
+
+func TestUpsertDoUpdateNamingSkippedOmitzeroColumnErrors(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite)
+
+	err := Upsert(ctx, db, &Contact{Email: "a@x", Name: "n"}, OnConflict("email"), DoUpdate("note"))
+	if err == nil || !strings.Contains(err.Error(), "omitzero") {
+		t.Fatalf("whitelisting a skipped omitzero column must error with guidance: %v", err)
+	}
+	if n := len(f.logged()); n != 0 {
+		t.Fatalf("nothing may execute, logged %d statements", n)
+	}
+
+	// A nonzero value inserts the column, so the whitelist may reference it.
+	f.queueRows(contactCols, []driver.Value{int64(1), "a@x", "n", "v"})
+	if err := Upsert(ctx, db, &Contact{Email: "a@x", Name: "n", Note: "v"}, OnConflict("email"), DoUpdate("note")); err != nil {
+		t.Fatalf("Upsert with nonzero omitzero column: %v", err)
+	}
+}
+
+// UpsertAll pins the documented contrast: the batch path applies no omitzero
+// (one statement, one column list), so zero omitzero columns are inserted and
+// the conflict update writes them — batch zero values are real values.
+func TestUpsertAllBindsZeroOmitzeroColumns(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueExec(0, 1)
+
+	if err := UpsertAll(ctx, db, []Contact{{ID: 1, Email: "a@x", Name: "n"}}, OnConflict("email")); err != nil {
+		t.Fatalf("UpsertAll: %v", err)
+	}
+	stmt := f.loggedContaining("INSERT")[0]
+	if !strings.HasPrefix(stmt.sql, `INSERT INTO "contacts" ("id", "email", "name", "note")`) {
+		t.Fatalf("batch upsert inserts every column: %s", stmt.sql)
+	}
+	if !strings.Contains(stmt.sql, `"note" = excluded."note"`) {
+		t.Fatalf("batch conflict update writes every column: %s", stmt.sql)
+	}
+	if stmt.args[3] != "" {
+		t.Fatalf("zero note must bind as the empty string: %#v", stmt.args)
+	}
+}
+
+// Audit: the conflict branch renders updated_at = excluded.updated_at, but
+// stampForInsert fills stamps only when zero — a loaded entity carried its
+// old UpdatedAt through the upsert and the surviving row kept a stale stamp,
+// while entity Update stamps unconditionally.
+func TestUpsertConflictPathRefreshesUpdatedAt(t *testing.T) {
+	ctx := context.Background()
+	stale := testNow.Add(-24 * time.Hour)
+
+	f := newFakeDB()
+	db := f.open(MySQL)
+	f.queueExec(0, 2) // affected=2: the conflict took the update branch
+	u := &User{ID: 1, Email: "a@x", Age: 31, Version: 1, CreatedAt: stale, UpdatedAt: stale}
+	if err := Upsert(ctx, db, u, OnConflict("email"), DoUpdate("age")); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	stmt := f.loggedContaining("INSERT")[0]
+	if !strings.Contains(stmt.sql, "`updated_at` = _rio_new.`updated_at`") {
+		t.Fatalf("conflict branch must take the new row's stamp: %s", stmt.sql)
+	}
+	// The new-row value the conflict branch references must be this call's
+	// clock, not the stale stamp the loaded struct carried.
+	if bound, ok := stmt.args[7].(time.Time); !ok || !bound.Equal(normalizeTime(testNow)) {
+		t.Fatalf("bound updated_at must be now, got %#v", stmt.args[7])
+	}
+	if !u.UpdatedAt.Equal(normalizeTime(testNow)) {
+		t.Fatalf("in-memory UpdatedAt must match the surviving row: %v", u.UpdatedAt)
+	}
+	if !u.CreatedAt.Equal(stale) {
+		t.Fatalf("CreatedAt is not refreshed by upserts: %v", u.CreatedAt)
+	}
+}
+
+func TestUpsertAllConflictPathRefreshesUpdatedAt(t *testing.T) {
+	ctx := context.Background()
+	stale := testNow.Add(-24 * time.Hour)
+
+	f := newFakeDB()
+	db := f.open(MySQL)
+	f.queueExec(0, 2)
+	rows := []User{{ID: 1, Email: "a@x", Age: 31, Version: 1, CreatedAt: stale, UpdatedAt: stale}}
+	if err := UpsertAll(ctx, db, rows, OnConflict("email"), DoUpdate("age")); err != nil {
+		t.Fatalf("UpsertAll: %v", err)
+	}
+	stmt := f.loggedContaining("INSERT")[0]
+	if !strings.Contains(stmt.sql, "`updated_at` = _rio_new.`updated_at`") {
+		t.Fatalf("conflict branch must take the new row's stamp: %s", stmt.sql)
+	}
+	if bound, ok := stmt.args[7].(time.Time); !ok || !bound.Equal(normalizeTime(testNow)) {
+		t.Fatalf("bound updated_at must be now, got %#v", stmt.args[7])
+	}
+	if !rows[0].UpdatedAt.Equal(normalizeTime(testNow)) {
+		t.Fatalf("in-memory UpdatedAt must match the surviving row: %v", rows[0].UpdatedAt)
+	}
+}
+
+// Audit: normalizeTime truncated only the bound parameter — the struct kept
+// its nanosecond, zoned value while the database stored UTC microseconds, so
+// insert-then-reload never compared Equal for caller-provided times.
+type Meeting struct {
+	ID      int64
+	StartAt time.Time
+	EndAt   *time.Time
+}
+
+func TestWritesNormalizeTimeFieldsInPlace(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(MySQL)
+
+	zone := time.FixedZone("UTC+1", 3600)
+	start := time.Date(2026, 7, 9, 13, 4, 5, 123456789, zone)
+	end := start.Add(time.Hour)
+	want := normalizeTime(start)
+
+	f.queueExec(1, 1)
+	m := &Meeting{StartAt: start, EndAt: &end}
+	if err := Insert(ctx, db, m); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if m.StartAt != want {
+		t.Fatalf("StartAt must be normalized in place (UTC, microseconds): %v", m.StartAt)
+	}
+	// Truncation drops sub-microsecond digits by design (the DB never stored
+	// them); everything above stays the same instant.
+	if d := start.Sub(m.StartAt); d < 0 || d >= time.Microsecond {
+		t.Fatalf("normalization may only drop sub-microsecond precision, moved by %v", d)
+	}
+	if *m.EndAt != normalizeTime(end) {
+		t.Fatalf("pointer time fields normalize in place too: %v", *m.EndAt)
+	}
+	// The zero auto-increment ID is skipped, so start_at binds first.
+	if bound, _ := f.loggedContaining("INSERT")[0].args[0].(time.Time); bound != m.StartAt {
+		t.Fatalf("struct and bound value must agree: %v vs %v", m.StartAt, bound)
+	}
+
+	// Update binds through the same path.
+	m.StartAt = start
+	f.queueExec(0, 1)
+	if err := Update(ctx, db, m, "start_at"); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if m.StartAt != want {
+		t.Fatalf("Update must normalize in place: %v", m.StartAt)
+	}
+}
+
+func TestInsertNormalizesCallerProvidedStamps(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(MySQL)
+	f.queueExec(1, 1)
+
+	// stampForInsert honors a nonzero CreatedAt; the honored value must still
+	// come back normalized so a reload compares Equal.
+	at := time.Date(2026, 7, 9, 3, 4, 5, 123456789, time.UTC)
+	u := &User{Email: "t@x", CreatedAt: at}
+	if err := Insert(ctx, db, u); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if u.CreatedAt != normalizeTime(at) {
+		t.Fatalf("caller-provided CreatedAt must normalize in place: %v", u.CreatedAt)
+	}
+
+	f.queueExec(2, 1)
+	r := &Reminder{ID: 7, Remind: sql.NullTime{Time: at, Valid: true}}
+	if err := Insert(ctx, db, r); err != nil {
+		t.Fatalf("Insert reminder: %v", err)
+	}
+	if r.Remind.Time != normalizeTime(at) {
+		t.Fatalf("NullTime fields must normalize in place: %v", r.Remind.Time)
+	}
+}
+
+// Audit: appendMySQLUpsertAlias ran before the DoNothing branch, so even the
+// no-op assignment — which never references the new row — carried the
+// 8.0.19+ row alias and broke DoNothing on every MariaDB and older MySQL.
+func TestUpsertMySQLDoNothingRendersNoAlias(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(MySQL)
+
+	f.queueExec(5, 1)
+	if err := Upsert(ctx, db, &User{Email: "a@x"}, DoNothing()); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	got := f.logged()[0]
+	if strings.Contains(got, mysqlUpsertAlias) {
+		t.Fatalf("DoNothing must not render the row alias: %s", got)
+	}
+	if !strings.Contains(got, "ON DUPLICATE KEY UPDATE `id` = `id`") {
+		t.Fatalf("DoNothing renders the no-op assignment: %s", got)
+	}
+
+	f.queueExec(0, 2)
+	if err := UpsertAll(ctx, db, []User{{ID: 1, Email: "a@x"}, {ID: 2, Email: "b@x"}}, DoNothing()); err != nil {
+		t.Fatalf("UpsertAll: %v", err)
+	}
+	got = f.logged()[1]
+	if strings.Contains(got, mysqlUpsertAlias) {
+		t.Fatalf("batch DoNothing must not render the row alias: %s", got)
+	}
+	if !strings.Contains(got, "ON DUPLICATE KEY UPDATE `id` = `id`") {
+		t.Fatalf("batch DoNothing renders the no-op assignment: %s", got)
+	}
+}

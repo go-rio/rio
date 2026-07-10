@@ -175,6 +175,12 @@ func insertChunk[T any](ctx context.Context, db Queryer, p *plan, cols []*field,
 // clause as Upsert. It never backfills: DoNothing shrinks the returned row
 // set, so positional matching would silently misalign (the batch-backfill
 // killer). Reload rows you need generated values for.
+//
+// omitzero does not apply on the batch path (one statement, one column
+// list): unlike Upsert, zero omitzero columns are inserted and stay in the
+// default conflict update set, so batch zeros overwrite on conflict.
+// UpdatedAt is reset to the clock on every non-DoNothing row, like Upsert.
+// The MySQL DoUpdate version floor (8.0.19+, no MariaDB) also matches Upsert.
 func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertOption) error {
 	if len(rows) == 0 {
 		return nil
@@ -206,7 +212,9 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 	if len(cols) == 0 {
 		return fmt.Errorf("rio: UpsertAll: %s has no insertable columns", p.structName)
 	}
-	update, err := upsertUpdateSet(p, &spec)
+	// The batch column list applies no omitzero (batchColumns), so nothing is
+	// skipped — every column the conflict update references was inserted.
+	update, err := upsertUpdateSet(p, &spec, nil)
 	if err != nil {
 		return err
 	}
@@ -253,7 +261,11 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 				b = appendConflictSets(b, d, table, p, update, &spec, "excluded")
 			}
 		} else {
-			b = appendMySQLUpsertAlias(b)
+			// The row alias is DoUpdate-only, as in Upsert: 8.0.19+ syntax
+			// that DoNothing's no-op assignment never needs.
+			if !spec.doNothing {
+				b = appendMySQLUpsertAlias(b)
+			}
 			b = append(b, " ON DUPLICATE KEY UPDATE "...)
 			if spec.doNothing {
 				col := p.fields[0].column
