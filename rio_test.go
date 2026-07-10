@@ -181,8 +181,10 @@ func TestUpdateFullColumnWithOptimisticLock(t *testing.T) {
 		t.Fatalf("Update: %v", err)
 	}
 	got := f.logged()[0]
-	// created_at is never updated; version renders as an atomic increment.
-	want := `UPDATE "users" SET "email" = ?, "age" = ?, "bio" = ?, "deleted_at" = ?, "updated_at" = ?, "version" = "version" + 1 WHERE "id" = ? AND "version" = ?`
+	// created_at is never updated; version renders as an atomic increment;
+	// deleted_at is owned by Delete/Restore/ForceDelete and never rides along
+	// (a stale live struct would silently resurrect a tombstoned row).
+	want := `UPDATE "users" SET "email" = ?, "age" = ?, "bio" = ?, "updated_at" = ?, "version" = "version" + 1 WHERE "id" = ? AND "version" = ?`
 	if got != want {
 		t.Fatalf("sql:\n got: %s\nwant: %s", got, want)
 	}

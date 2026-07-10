@@ -50,6 +50,14 @@ func codecFor(f *field) (fieldCodec, error) {
 	if f.jsonCol {
 		return fieldCodec{kind: scanJSON}, nil
 	}
+	if t.Kind() == reflect.Interface {
+		// An interface satisfying sql.Scanner would pass the Implements check
+		// below, but a zero struct holds a nil interface: scanning has nothing
+		// to Scan into, and a panic inside Rows.Scan wedges rows.Close forever.
+		return fieldCodec{}, fmt.Errorf(
+			"field %s: interface-typed fields cannot be mapped to a column; use a concrete type implementing sql.Scanner, or exclude it with `rio:\"-\"`",
+			f.name)
+	}
 	if t.Implements(scannerType) || reflect.PointerTo(t).Implements(scannerType) {
 		return fieldCodec{kind: scanScanner}, nil
 	}
@@ -294,7 +302,13 @@ func (s *colScanner) slowScanner(src any) error {
 		return elem.Interface().(sql.Scanner).Scan(src)
 	}
 	// The value type implements Scanner directly (rare, value receiver).
-	return v.Elem().Interface().(sql.Scanner).Scan(src)
+	// comma-ok, not a bare assertion: a panic here happens while database/sql
+	// holds closemu.RLock, turning it into a permanently blocked rows.Close.
+	sc, ok := v.Elem().Interface().(sql.Scanner)
+	if !ok {
+		return fmt.Errorf("rio: column %q: field %s (%s) does not implement sql.Scanner as a value", f.column, f.name, f.typ)
+	}
+	return sc.Scan(src)
 }
 
 func convErr(f *field, src any) error {

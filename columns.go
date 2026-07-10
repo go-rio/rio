@@ -65,9 +65,9 @@ func WriteColumns(w io.Writer, pkgName string, models ...any) error {
 		if p.tableOverride != "" {
 			table = p.tableOverride
 		}
-		// Flattened embedded structs may map same-named Go fields to
-		// distinct columns — a valid plan whose generated struct would not
-		// compile. Refuse with the fix instead of emitting broken code.
+		// Shadowing resolution keeps plan field names unique (same-depth
+		// duplicates are refused, deeper ones dropped), so this is defense
+		// in depth for the generated struct's compilability.
 		seen := make(map[string]string, len(p.fields))
 		for _, f := range p.fields {
 			if prev, dup := seen[f.name]; dup {

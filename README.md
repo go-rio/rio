@@ -129,7 +129,7 @@ code compiled into your binary.
 
 | Declaration | Meaning |
 |---|---|
-| `ID int64` | primary key + auto-increment, by convention |
+| `ID int64` | primary key + auto-increment, by convention; a rename or other role-neutral tag keeps it — an explicit `,pk` anywhere in the model opts out |
 | `rio:"col_name"` | rename the column (default: snake_case, `UserID` → `user_id`) |
 | `rio:",pk"` | primary key (tag several fields for composite keys) |
 | `rio:",noautoincr"` | integer single PK that rio must not treat as auto-increment |

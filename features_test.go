@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 type Profile struct {
@@ -1107,7 +1109,9 @@ func TestSyncRelationLocksOwner(t *testing.T) {
 }
 
 // Codex v0.3 review: flattened embedded structs with same-named fields would
-// generate uncompilable column structs; refuse with guidance.
+// generate uncompilable column structs. The check has since moved down into
+// the plan itself (same-depth embedded names are ambiguous in Go and refused
+// for every caller, not just codegen); WriteColumns surfaces that error.
 func TestWriteColumnsRefusesDuplicateFieldNames(t *testing.T) {
 	type Meta struct {
 		ID int64 `rio:"meta_id,pk,noautoincr"`
@@ -1121,7 +1125,7 @@ func TestWriteColumnsRefusesDuplicateFieldNames(t *testing.T) {
 	}
 	var buf strings.Builder
 	err := WriteColumns(&buf, "models", Doubled{})
-	if err == nil || !strings.Contains(err.Error(), "two fields named ID") {
+	if err == nil || !strings.Contains(err.Error(), "same depth") {
 		t.Fatalf("duplicate field names must refuse: %v", err)
 	}
 }
@@ -1709,8 +1713,10 @@ func TestPointerTimestampsStamped(t *testing.T) {
 	}
 }
 
-// Two fields both claiming the CreatedAt role (reachable via embedding + a
-// column rename) must fail loud, like version/softdelete duplicates.
+// An outer CreatedAt and an embedded, renamed CreatedAt used to race for the
+// stamp role. Under Go shadowing semantics the outer field wins and the
+// embedded one does not map at all — exactly what a Go selector (and
+// encoding/json) resolves to; only same-depth duplicates are refused.
 type DupCreatedInner struct {
 	CreatedAt time.Time `rio:"made_at"`
 }
@@ -1720,10 +1726,16 @@ type DupCreated struct {
 	DupCreatedInner
 }
 
-func TestDuplicateCreatedRoleRejected(t *testing.T) {
-	_, err := planOf[DupCreated]()
-	if err == nil || !strings.Contains(err.Error(), "CreatedAt") {
-		t.Fatalf("two CreatedAt roles must be rejected: %v", err)
+func TestShadowedCreatedRoleResolvesToOuter(t *testing.T) {
+	p, err := planOf[DupCreated]()
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if p.byColumn["made_at"] != nil {
+		t.Fatal("the shadowed embedded CreatedAt must not map")
+	}
+	if p.created == nil || len(p.created.index) != 1 {
+		t.Fatal("the outer CreatedAt must be the single stamp target")
 	}
 }
 
@@ -2010,5 +2022,299 @@ func TestBigUintDialectBinding(t *testing.T) {
 	ds := fs.open(SQLite)
 	if err := Insert(ctx, ds, &BigUint{ID: 1, N: math.MaxUint64}); err == nil || !strings.Contains(err.Error(), "SQLite") {
 		t.Fatalf("sqlite must fail loud on uint64 overflow: %v", err)
+	}
+}
+
+// --- pre-release audit (fable multi-lens) plan-domain regressions ---
+
+// The ID primary-key convention must survive role-neutral tags: a rename,
+// omitzero, or noautoincr does not change what the field is. Only a tag that
+// assigns an incompatible role, or an explicit pk elsewhere, opts out. The
+// old rule ("any tag cancels the convention") silently produced no-PK models
+// and wrote literal 0 into renamed PK columns.
+type RenamedID struct {
+	ID   int64 `rio:"gid"`
+	Name string
+}
+
+func TestRenamedIDKeepsPKConvention(t *testing.T) {
+	p, err := planOf[RenamedID]()
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if len(p.pks) != 1 || p.pks[0].column != "gid" {
+		t.Fatalf("renamed ID must stay the conventional PK, got %d pk(s)", len(p.pks))
+	}
+	if p.autoIncr == nil {
+		t.Fatal("renamed integer ID must stay auto-increment")
+	}
+
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open() // postgres
+	f.queueRows([]string{"gid"}, []driver.Value{int64(7)})
+	u := &RenamedID{Name: "x"}
+	if err := Insert(ctx, db, u); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	want := `INSERT INTO "renamed_ids" ("name") VALUES ($1) RETURNING "gid"`
+	if got := f.logged()[0]; got != want {
+		t.Fatalf("sql:\n got: %s\nwant: %s", got, want)
+	}
+	if u.ID != 7 {
+		t.Fatalf("auto-increment must backfill through the renamed column: %d", u.ID)
+	}
+
+	f.queueRows([]string{"gid", "name"}, []driver.Value{int64(7), "x"})
+	if _, err := Find[RenamedID](ctx, db, 7); err != nil {
+		t.Fatalf("Find by renamed PK: %v", err)
+	}
+	if !strings.Contains(f.logged()[1], `"gid" = $1`) {
+		t.Fatalf("Find must key on the renamed column: %s", f.logged()[1])
+	}
+}
+
+// README documents `rio:",noautoincr"` as "integer single PK that rio must
+// not treat as auto-increment" — the tag opts out of auto-increment, not out
+// of being the primary key.
+type ExternalID struct {
+	ID   int64 `rio:",noautoincr"`
+	Name string
+}
+
+func TestNoAutoIncrIDStaysPrimaryKey(t *testing.T) {
+	p, err := planOf[ExternalID]()
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if len(p.pks) != 1 || p.pks[0].column != "id" {
+		t.Fatalf("noautoincr ID must stay the PK, got %d pk(s)", len(p.pks))
+	}
+	if p.autoIncr != nil {
+		t.Fatal("noautoincr must suppress auto-increment")
+	}
+
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueExec(0, 1)
+	u := &ExternalID{ID: 42, Name: "x"}
+	if err := Insert(ctx, db, u); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	st := f.loggedContaining("INSERT")[0]
+	if !strings.Contains(st.sql, `"id"`) || st.args[0] != int64(42) {
+		t.Fatalf("caller-supplied ID must be written: %s %v", st.sql, st.args)
+	}
+
+	f.queueExec(0, 1)
+	if err := Update(ctx, db, u); err != nil {
+		t.Fatalf("Update must see the PK: %v", err)
+	}
+}
+
+// An explicit pk tag anywhere in the model turns the ID convention off:
+// explicit declarations beat conventions.
+type CodePK struct {
+	Code string `rio:",pk"`
+	ID   int64
+}
+
+func TestExplicitPKElsewhereDisablesIDConvention(t *testing.T) {
+	p, err := planOf[CodePK]()
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if len(p.pks) != 1 || p.pks[0].column != "code" {
+		t.Fatalf("the explicit pk must be the only key, got %d pk(s)", len(p.pks))
+	}
+	if p.byColumn["id"].isPK || p.autoIncr != nil {
+		t.Fatal("a bare ID next to an explicit pk is an ordinary column")
+	}
+}
+
+// A tag that assigns ID an incompatible role does opt out of the convention.
+type RoleTaggedID struct {
+	ID   map[string]int `rio:",json"`
+	Name string
+}
+
+func TestRoleTaggedIDIsNotPK(t *testing.T) {
+	p, err := planOf[RoleTaggedID]()
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if len(p.pks) != 0 {
+		t.Fatalf("a json-tagged ID must not become the conventional PK: %d pk(s)", len(p.pks))
+	}
+}
+
+// An interface-typed field satisfying sql.Scanner passed plan validation and
+// then panicked inside Rows.Scan — a panic database/sql escalates into a
+// permanently blocked rows.Close (goroutine + connection leak). Refuse at
+// plan time instead.
+type IfaceScanned struct {
+	ID  int64
+	Val sql.Scanner
+}
+
+func TestInterfaceFieldRefusedAtPlanTime(t *testing.T) {
+	_, err := planOf[IfaceScanned]()
+	if err == nil || !strings.Contains(err.Error(), "interface") {
+		t.Fatalf("interface-typed field must be a plan-time error: %v", err)
+	}
+}
+
+// Defense in depth for the same bug: even if a scanScanner codec ever reaches
+// an interface field again, slowScanner must return an error, not panic —
+// panicking under Rows.Scan wedges rows.Close forever.
+func TestSlowScannerInterfaceReturnsError(t *testing.T) {
+	var row struct{ Val sql.Scanner }
+	cs := &colScanner{
+		f: &field{
+			name: "Val", column: "val",
+			typ:  reflect.TypeFor[sql.Scanner](),
+			code: fieldCodec{kind: scanScanner},
+		},
+		base: unsafe.Pointer(&row),
+	}
+	if err := cs.Scan("x"); err == nil {
+		t.Fatal("scanning into a nil interface must error, not panic")
+	}
+}
+
+// The full-column Update set must not include the softdelete column: a stale
+// live struct (DeletedAt zero) would write deleted_at back to NULL and
+// silently resurrect a row another session tombstoned. Delete, Restore, and
+// ForceDelete are the only APIs that touch it.
+type Ghost struct {
+	ID        int64
+	Name      string
+	DeletedAt time.Time `rio:",softdelete"`
+}
+
+func TestFullUpdateExcludesSoftDeleteColumn(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueExec(0, 1)
+
+	g := &Ghost{ID: 1, Name: "n"}
+	if err := Update(ctx, db, g); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	want := `UPDATE "ghosts" SET "name" = ? WHERE "id" = ?`
+	if got := f.logged()[0]; got != want {
+		t.Fatalf("sql:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestUpdateWhitelistRefusesSoftDeleteColumn(t *testing.T) {
+	ctx := context.Background()
+	db := newFakeDB().open(SQLite)
+	err := Update(ctx, db, &Ghost{ID: 1}, "deleted_at")
+	if err == nil || !strings.Contains(err.Error(), "Restore") {
+		t.Fatalf("whitelisting the softdelete column must refuse with guidance: %v", err)
+	}
+}
+
+// Flattening must honor Go's shadowing semantics: the shallowest of two
+// same-named fields wins, even when it is excluded with rio:"-" or renamed.
+// The old plan silently mapped the original column to the shadowed embedded
+// field — a field d.Notes can never reach — splitting reads and writes.
+type NoteBase struct {
+	Notes string
+}
+
+type ShadowedDoc struct {
+	ID int64
+	NoteBase
+	Notes string `rio:"-"`
+}
+
+type RenamedShadowDoc struct {
+	ID int64
+	NoteBase
+	Notes string `rio:"pinned"`
+}
+
+func TestEmbeddedShadowingFollowsGoSemantics(t *testing.T) {
+	p, err := planOf[ShadowedDoc]()
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if p.byColumn["notes"] != nil {
+		t.Fatal(`the outer rio:"-" Notes shadows NoteBase.Notes; the embedded field must not map`)
+	}
+
+	p2, err := planOf[RenamedShadowDoc]()
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if p2.byColumn["notes"] != nil {
+		t.Fatal("the renamed outer Notes shadows NoteBase.Notes entirely")
+	}
+	f := p2.byColumn["pinned"]
+	if f == nil || len(f.index) != 1 {
+		t.Fatalf("pinned must map the outer field, got %+v", f)
+	}
+}
+
+// Two same-named fields at the same embedding depth are inaccessible in Go
+// (ambiguous selector); encoding/json drops both silently — rio refuses.
+type ClashA struct {
+	Code string
+}
+type ClashB struct {
+	Code string `rio:"code_b"`
+}
+type Clashing struct {
+	ID int64
+	ClashA
+	ClashB
+}
+
+func TestSameDepthEmbeddedNameClashRefused(t *testing.T) {
+	_, err := planOf[Clashing]()
+	if err == nil || !strings.Contains(err.Error(), "Code") {
+		t.Fatalf("same-depth name clash must be a plan error: %v", err)
+	}
+}
+
+// An unexported embedded type may flatten (documented), but tagging it into a
+// column of its own passed every plan check and then panicked at bind time:
+// reflect refuses Interface() on unexported embedded fields.
+type jsonPrefs struct {
+	Theme string
+}
+
+type JSONEmbedded struct {
+	ID        int64
+	jsonPrefs `rio:",json"`
+}
+
+type scannedBox struct {
+	raw string
+}
+
+func (b *scannedBox) Scan(src any) error {
+	s, _ := src.(string)
+	b.raw = s
+	return nil
+}
+
+func (b scannedBox) Value() (driver.Value, error) { return b.raw, nil }
+
+type ScannerEmbedded struct {
+	ID         int64
+	scannedBox `rio:"box"`
+}
+
+func TestUnexportedEmbeddedColumnRefusedAtPlanTime(t *testing.T) {
+	if _, err := planOf[JSONEmbedded](); err == nil || !strings.Contains(err.Error(), "export") {
+		t.Fatalf("unexported embedded json column must be a plan error: %v", err)
+	}
+	if _, err := planOf[ScannerEmbedded](); err == nil || !strings.Contains(err.Error(), "export") {
+		t.Fatalf("unexported embedded scanner column must be a plan error: %v", err)
 	}
 }

@@ -193,7 +193,12 @@ type User struct {
   parent — a shared `type Timestamps struct { CreatedAt, UpdatedAt time.Time }`
   maps the same as if written inline, and this holds even when the embedded
   type's own name is unexported (`encoding/json` flattens these too; silently
-  dropping mapped columns is the surprise rio refuses). Embed by value:
+  dropping mapped columns is the surprise rio refuses). Same-named fields
+  follow Go's shadowing rules: the shallowest declaration wins — even one
+  excluded with `rio:"-"` or renamed — and deeper ones do not map; two at the
+  same depth are a plan-time error, not a silent drop. An unexported embedded
+  type can only flatten: tagging it into a column of its own is refused at
+  plan time (binding cannot address unexported fields). Embed by value:
   pointer embedding is rejected because offset-based scanning cannot hop a nil.
 - Structs containing relation containers are not comparable (they hold
   slices); use cmp.Diff in tests.

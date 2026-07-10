@@ -298,9 +298,10 @@ func hardDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 // --- shared helpers ---
 
 // updateSet resolves Update's column set. No list: every column except PKs,
-// CreatedAt, and the version column (rendered separately as version+1) —
-// including zero values, honestly. With a list: exactly those columns by
-// database name, plus UpdatedAt.
+// CreatedAt, the version column (rendered separately as version+1), and the
+// softdelete column (owned by Delete/Restore/ForceDelete) — including zero
+// values, honestly. With a list: exactly those columns by database name,
+// plus UpdatedAt.
 func updateSet(p *plan, cols []string) ([]*field, error) {
 	if len(cols) == 0 {
 		if len(p.updatable) == 0 {
@@ -317,6 +318,9 @@ func updateSet(p *plan, cols []string) ([]*field, error) {
 		}
 		if f.isPK || f.isVersion || f.isCreated {
 			return nil, fmt.Errorf("rio: Update: column %q is maintained by rio and cannot be listed", c)
+		}
+		if f.isSoftDelete {
+			return nil, fmt.Errorf("rio: Update: column %q is the softdelete column; use Delete, Restore, or ForceDelete", c)
 		}
 		if seen[c] {
 			continue

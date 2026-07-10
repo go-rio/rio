@@ -113,7 +113,7 @@ func buildPlan(t reflect.Type) (*plan, error) {
 	}
 
 	var errs []error
-	if err := p.addFields(t, nil, 0); err != nil {
+	if err := p.addFields(t); err != nil {
 		errs = append(errs, err)
 	}
 	for i, f := range p.fields {
@@ -129,8 +129,24 @@ func buildPlan(t reflect.Type) (*plan, error) {
 	return p, nil
 }
 
-func (p *plan) addFields(t reflect.Type, prefix []int, baseOffset uintptr) error {
-	var errs []error
+// rawField is one struct field as collected before shadowing resolution:
+// every exported field and every anonymous embedded struct, at every depth.
+type rawField struct {
+	sf      reflect.StructField
+	owner   reflect.Type // declaring struct, for collision messages
+	index   []int
+	offset  uintptr
+	tag     string
+	opts    tagOpts
+	flatten bool // anonymous value struct that flattens rather than mapping
+}
+
+func (r *rawField) depth() int { return len(r.index) - 1 }
+
+// collectFields gathers the raw field set depth-first. Only tag syntax errors
+// are reported here; role and mapping validation waits until shadowing has
+// decided which fields exist at all.
+func collectFields(t reflect.Type, prefix []int, baseOffset uintptr, raw *[]rawField, errs *[]error) {
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
 		if !sf.IsExported() {
@@ -146,14 +162,76 @@ func (p *plan) addFields(t reflect.Type, prefix []int, baseOffset uintptr) error
 		}
 		tag, opts, err := parseTag(sf)
 		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if opts.skip {
+			*errs = append(*errs, err)
 			continue
 		}
 		index := append(append([]int(nil), prefix...), i)
-		offset := baseOffset + sf.Offset
+		r := rawField{
+			sf: sf, owner: t, index: index, offset: baseOffset + sf.Offset,
+			tag: tag, opts: opts,
+		}
+		// Anonymous value structs flatten into the parent unless a tag makes
+		// them a column. The embedded field still occupies its Go name: it
+		// shadows, and is shadowed like, any other field.
+		r.flatten = sf.Anonymous && !opts.skip && tag == "" && !opts.json &&
+			sf.Type.Kind() == reflect.Struct && sf.Type != timeType && !isRelContainer(sf.Type)
+		*raw = append(*raw, r)
+		if r.flatten {
+			collectFields(sf.Type, index, r.offset, raw, errs)
+		}
+	}
+}
+
+func (p *plan) addFields(t reflect.Type) error {
+	var errs []error
+	var raw []rawField
+	collectFields(t, nil, 0, &raw, &errs)
+
+	// Go shadowing semantics, matching encoding/json: for one Go field name
+	// the shallowest declaration wins — even a rio:"-" or renamed winner
+	// shadows deeper same-named fields entirely, because that is the field a
+	// selector resolves to. Two at the shallowest depth are inaccessible in
+	// Go (ambiguous selector); json drops both silently, rio refuses loudly.
+	type nameState struct {
+		winner int // index into raw of the shallowest occurrence
+		clash  int // second occurrence at the same depth, -1 when unique
+	}
+	names := make(map[string]*nameState, len(raw))
+	for i := range raw {
+		r := &raw[i]
+		st, ok := names[r.sf.Name]
+		if !ok {
+			names[r.sf.Name] = &nameState{winner: i, clash: -1}
+			continue
+		}
+		switch d, w := r.depth(), raw[st.winner].depth(); {
+		case d < w:
+			st.winner, st.clash = i, -1
+		case d == w && st.clash < 0:
+			st.clash = i
+		}
+	}
+
+	var idConv *field // the ID-convention candidate, decided once all fields exist
+	for i := range raw {
+		r := &raw[i]
+		st := names[r.sf.Name]
+		if st.clash >= 0 {
+			if st.winner == i {
+				other := &raw[st.clash]
+				errs = append(errs, fmt.Errorf(
+					"fields %s.%s and %s.%s are embedded at the same depth; Go can address neither — rename one",
+					r.owner.Name(), r.sf.Name, other.owner.Name(), other.sf.Name))
+			}
+			continue
+		}
+		if st.winner != i {
+			continue // shadowed by a shallower field, exactly as a Go selector resolves
+		}
+		if r.opts.skip || r.flatten {
+			continue // flattened embeds contributed their inner fields in collect
+		}
+		sf, tag, opts := r.sf, r.tag, r.opts
 
 		if isRelContainer(sf.Type) {
 			kind, target := containerInfo(sf.Type)
@@ -162,7 +240,7 @@ func (p *plan) addFields(t reflect.Type, prefix []int, baseOffset uintptr) error
 				continue
 			}
 			p.rels[sf.Name] = &relField{
-				name: sf.Name, kind: kind, index: index, target: target,
+				name: sf.Name, kind: kind, index: r.index, target: target,
 				fkTag: opts.fk, refTag: opts.ref, joinTag: opts.join,
 			}
 			p.relNames = append(p.relNames, sf.Name)
@@ -175,7 +253,7 @@ func (p *plan) addFields(t reflect.Type, prefix []int, baseOffset uintptr) error
 				errs = append(errs, fmt.Errorf("field %s: countof targets must be int64, got %s", sf.Name, sf.Type))
 				continue
 			}
-			p.counts[opts.countOf] = index
+			p.counts[opts.countOf] = r.index
 			continue
 		}
 		if opts.fk != "" || opts.ref != "" || opts.join != "" {
@@ -183,25 +261,27 @@ func (p *plan) addFields(t reflect.Type, prefix []int, baseOffset uintptr) error
 			continue
 		}
 
-		// Anonymous value structs flatten into the parent unless a tag makes
-		// them a column. Pointer embedding would break offset-based scanning
-		// (nil hop) and is refused.
-		if sf.Anonymous && tag == "" && !opts.json && sf.Type.Kind() == reflect.Struct && sf.Type != timeType {
-			if err := p.addFields(sf.Type, index, offset); err != nil {
-				errs = append(errs, err)
-			}
-			continue
-		}
+		// Pointer embedding would break offset-based scanning (nil hop).
 		if sf.Anonymous && sf.Type.Kind() == reflect.Pointer {
 			errs = append(errs, fmt.Errorf("field %s: embed the struct by value, not by pointer", sf.Name))
+			continue
+		}
+		if sf.Anonymous && !sf.IsExported() {
+			// A tag kept this embedded field out of the flatten path, so it is
+			// about to map to a column of its own — but reflect refuses
+			// Interface() on unexported embedded fields, and binding would
+			// panic on the first write. Flattening is the only supported use.
+			errs = append(errs, fmt.Errorf(
+				"field %s: an unexported embedded type cannot map to a column itself; export the type or use an exported named field",
+				sf.Name))
 			continue
 		}
 
 		f := &field{
 			name:   sf.Name,
 			column: tag,
-			index:  index,
-			offset: offset,
+			index:  r.index,
+			offset: r.offset,
 			typ:    sf.Type,
 
 			isPK:     opts.pk,
@@ -231,8 +311,8 @@ func (p *plan) addFields(t reflect.Type, prefix []int, baseOffset uintptr) error
 				f.isUpdated = true
 			}
 		}
-		if sf.Name == "ID" && !opts.tagged {
-			f.isPK = true
+		if sf.Name == "ID" && !opts.pk && !opts.json && !opts.version && !opts.softDelete {
+			idConv = f
 		}
 		f.noAutoIncr = opts.noAutoIncr
 
@@ -249,6 +329,23 @@ func (p *plan) addFields(t reflect.Type, prefix []int, baseOffset uintptr) error
 			continue
 		}
 		f.code = codec
+	}
+
+	// The ID primary-key convention survives role-neutral tags (a rename,
+	// omitzero, noautoincr): it yields only to an explicit pk tag — on ID
+	// itself or on any other field — or to a tag assigning an incompatible
+	// role, filtered out of the candidate above.
+	if idConv != nil {
+		explicit := false
+		for _, f := range p.fields {
+			if f.isPK {
+				explicit = true
+				break
+			}
+		}
+		if !explicit {
+			idConv.isPK = true
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -294,7 +391,11 @@ func (p *plan) classify() []error {
 		errs = append(errs, errors.New("the version column cannot be part of the primary key"))
 	}
 	for _, f := range p.fields {
-		if f.isPK || f.isCreated || f.isVersion {
+		if f.isPK || f.isCreated || f.isVersion || f.isSoftDelete {
+			// The softdelete column is excluded like the other rio-maintained
+			// columns: a full-column Update from a stale live struct would
+			// write deleted_at back to NULL and silently resurrect the row.
+			// Delete/Restore/ForceDelete are the only APIs that touch it.
 			continue
 		}
 		p.updatable = append(p.updatable, f)
@@ -304,7 +405,6 @@ func (p *plan) classify() []error {
 
 type tagOpts struct {
 	skip       bool
-	tagged     bool // any rio tag present (an explicitly tagged ID is not auto-PK)
 	pk         bool
 	omitZero   bool
 	json       bool
@@ -325,7 +425,6 @@ func parseTag(sf reflect.StructField) (column string, opts tagOpts, err error) {
 	if raw == "-" {
 		return "", tagOpts{skip: true}, nil
 	}
-	opts.tagged = true
 	parts := strings.Split(raw, ",")
 	column = parts[0]
 	for _, part := range parts[1:] {
