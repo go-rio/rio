@@ -11,7 +11,7 @@ import (
 
 	_ "github.com/glebarez/go-sqlite"
 
-	glebarez "github.com/glebarez/sqlite"
+	libtnb "github.com/libtnb/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -65,7 +65,7 @@ func seed(b *testing.B, raw *sql.DB, n int) {
 
 func benchGorm(b *testing.B, name string) *gorm.DB {
 	b.Helper()
-	gdb, err := gorm.Open(glebarez.Open("file:"+name+"?mode=memory&cache=shared"), &gorm.Config{
+	gdb, err := gorm.Open(libtnb.Open("file:"+name+"?mode=memory&cache=shared"), &gorm.Config{
 		Logger:      logger.Discard,
 		QueryFields: true,
 	})

@@ -34,9 +34,3 @@ require (
 	modernc.org/memory v1.5.0 // indirect
 	modernc.org/sqlite v1.23.1 // indirect
 )
-
-replace github.com/go-rio/rio => ../
-
-replace github.com/go-rio/postgres => ../../postgres
-
-replace github.com/go-rio/mysql => ../../mysql

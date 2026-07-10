@@ -1,12 +1,14 @@
 package integration
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/go-rio/postgres"
 	"github.com/go-rio/rio"
 	"github.com/go-sql-driver/mysql"
 
@@ -47,6 +49,26 @@ func TestPostgresSuite(t *testing.T) {
 		t.Fatal(err)
 	}
 	db := rio.New(raw, rio.Postgres)
+	t.Cleanup(func() { _ = db.Close() })
+	runSuite(t, db, "postgres")
+	runV02Suite(t, db, "postgres")
+	runV03Sync(t, db, "postgres")
+	runHardening(t, db, "postgres")
+}
+
+// TestPostgresNativeSuite replays the entire PostgreSQL suite through the
+// pgx-native channel (postgres.OpenNative): same DSN, same schema, same
+// assertions. The double run is the design's keystone test — every rio
+// semantic the stdlib channel passes must hold natively too.
+func TestPostgresNativeSuite(t *testing.T) {
+	dsn := os.Getenv("RIO_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("RIO_POSTGRES_DSN not set")
+	}
+	db, err := postgres.OpenNative(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = db.Close() })
 	runSuite(t, db, "postgres")
 	runV02Suite(t, db, "postgres")
