@@ -28,12 +28,14 @@ type compiledSQL struct {
 
 // MustCompile compiles a connection-free query for reuse, panicking on
 // structural problems — bad tags, unknown relation paths, mixed inline and
-// exec-time parameters. Passing MustCompile does not mean execution cannot
-// fail: dialect capabilities, exact placeholder arity, and driver errors
-// surface at the execution point. Queries are either fully inline (every ?
-// already has its argument — a frozen constant query) or fully
-// exec-parameterized (no inline arguments; every ? binds at the call).
-// Slice expansion inside IN (?) needs value shapes and is inline-only.
+// exec-time parameters, or a ? placeholder in a clause with no argument
+// channel (Join, GroupBy, OrderBy). Passing MustCompile does not mean
+// execution cannot fail: dialect capabilities, exact placeholder arity, and
+// driver errors surface at the execution point. Queries are either fully
+// inline (every ? already has its argument — a frozen constant query) or
+// fully exec-parameterized (no inline arguments; every ? binds at the call).
+// Slice expansion inside IN (?) needs value shapes and is inline-only, on
+// every execution point including Count and Exists.
 //
 // Rendered SQL is cached per DB handle for the Compiled value's lifetime.
 // Treat *DB as the long-lived object it is meant to be; churning through
@@ -51,6 +53,12 @@ func MustCompile[T any](q Query[T]) *Compiled[T] {
 func Compile[T any](q Query[T]) (*Compiled[T], error) {
 	p, err := planOf[T]()
 	if err != nil {
+		return nil, err
+	}
+	if q.s.err != nil {
+		return nil, q.s.err
+	}
+	if err := checkNoArgClauses(p, &q.s); err != nil {
 		return nil, err
 	}
 	if err := validatePaths(p, q.s.withs); err != nil {
@@ -100,6 +108,46 @@ func Compile[T any](q Query[T]) (*Compiled[T], error) {
 			p.structName)
 	}
 	return c, nil
+}
+
+// checkNoArgClauses rejects ? placeholders in clauses that carry no argument
+// channel — Join, GroupBy, OrderBy. A hole there can never receive a value on
+// any execution path (the row SELECT renders these clauses, Count/Exists
+// never see them), so it is a structural error and MustCompile panics at the
+// declaration site. The rebind lexers decide what counts: ?? escapes and ?
+// inside strings, quoted identifiers, or comments are not placeholders.
+// Compile is dialect-independent, so a fragment any one dialect reads as
+// holding a placeholder is rejected.
+func checkNoArgClauses(p *plan, s *queryState) error {
+	check := func(clause, expr string) error {
+		holes := 0
+		for _, lex := range [...]lexProfile{pgLex, mysqlLex, sqliteLex} {
+			n := 0
+			_, _, _ = rebindCount(lex, expr, &n)
+			holes = max(holes, n)
+		}
+		if holes == 0 {
+			return nil
+		}
+		return fmt.Errorf("rio: Compile[%s]: %s(%q) contains %d placeholder(s), but %s has no argument channel; put parameterized conditions in Where/Having or inline the value",
+			p.structName, clause, expr, holes, clause)
+	}
+	for _, j := range s.joins {
+		if err := check("Join", j); err != nil {
+			return err
+		}
+	}
+	for _, g := range s.groups {
+		if err := check("GroupBy", g); err != nil {
+			return err
+		}
+	}
+	for _, o := range s.orders {
+		if err := check("OrderBy", o); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // checkHasCondArity requires every WhereHas condition to carry exactly its
@@ -477,6 +525,14 @@ func (c *Compiled[T]) rebindInline(db Queryer, args []any) (Query[T], error) {
 	}
 	if idx != len(args) {
 		return q, fmt.Errorf("rio: compiled query takes %d argument(s), got %d", idx, len(args))
+	}
+	// Same contract as bind: slice expansion needs value shapes at compile
+	// time. Without this, Count/Exists would happily expand what All/First/
+	// Rows reject — one compiled object, two contracts.
+	for i, a := range args {
+		if _, isSlice := sliceElems(a); isSlice {
+			return q, fmt.Errorf("rio: compiled queries cannot expand slice argument %d; IN (?) needs inline values", i+1)
+		}
 	}
 	return q, nil
 }

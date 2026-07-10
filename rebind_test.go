@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
 // The rebinder is the single component that rewrites user SQL, so its
@@ -223,6 +224,40 @@ func TestRebindDialectDivergence(t *testing.T) {
 	}
 }
 
+// BenchmarkRebind pins the per-execution cost of the rebind pass on the
+// three shapes that matter: question-style with nothing to rewrite (the
+// MySQL/SQLite common case), dollar renumbering, and slice expansion.
+func BenchmarkRebind(b *testing.B) {
+	q := `SELECT "users"."id", "users"."email", "users"."age" FROM "users" WHERE (age > ?) AND (email = ?) AND "users"."deleted_at" IS NULL ORDER BY created_at DESC LIMIT 10`
+	args := []any{18, "a@x"}
+	b.Run("question-nochange", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			if _, _, err := rebind(sqliteLex, bindQuestion, q, args); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("dollar-renumber", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			if _, _, err := rebind(pgLex, bindDollar, q, args); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	eq := `SELECT "users"."id" FROM "users" WHERE (id IN (?))`
+	eargs := []any{[]int64{1, 2, 3, 4}}
+	b.Run("question-expand", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			if _, _, err := rebind(sqliteLex, bindQuestion, eq, eargs); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 // equalArgs compares argument lists by value, treating nil and empty as the
 // same so table entries can spell "no arguments" as nil.
 func equalArgs(a, b []any) bool {
@@ -235,4 +270,72 @@ func equalArgs(a, b []any) bool {
 		}
 	}
 	return true
+}
+
+// AUDIT LB4 regression: when nothing rewrites — question style, no slice
+// expansion, no ?? escape — rebind must return the input string itself
+// instead of an identical copy, so the unchanged path allocates nothing.
+func TestRebindReusesInputWhenUnchanged(t *testing.T) {
+	q := "SELECT * FROM t WHERE a = ? AND b = ?"
+	got, gotArgs, err := rebind(sqliteLex, bindQuestion, q, []any{1, 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != q {
+		t.Fatalf("got %q, want %q", got, q)
+	}
+	if unsafe.StringData(got) != unsafe.StringData(q) {
+		t.Fatal("unchanged rebind must reuse the input string, not copy it")
+	}
+	if len(gotArgs) != 2 {
+		t.Fatalf("args: %v", gotArgs)
+	}
+
+	// Any rewrite — here the ?? escape — still produces fresh output.
+	q = "SELECT data ?? 'k' FROM t WHERE a = ?"
+	got, _, err = rebind(sqliteLex, bindQuestion, q, []any{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "SELECT data ? 'k' FROM t WHERE a = ?"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// BenchmarkRenderSelect measures the uncompiled query render pipeline —
+// clause rendering plus the rebind pass in finishSQL — the per-execution
+// cost every builder query pays before the driver sees it.
+func BenchmarkRenderSelect(b *testing.B) {
+	p, err := planOf[User]()
+	if err != nil {
+		b.Fatal(err)
+	}
+	q := From[User]().Where("age > ?", 18).Where("email = ?", "a@x").OrderBy("created_at DESC").Limit(10)
+	dbs := []struct {
+		name string
+		db   *DB
+	}{
+		{"sqlite", newFakeDB().open(SQLite)},
+		{"postgres", newFakeDB().open(Postgres)},
+	}
+	for _, d := range dbs {
+		b.Run(d.name, func(b *testing.B) {
+			g := d.db.gram()
+			b.ReportAllocs()
+			for range b.N {
+				if _, _, err := renderSelect(g, p, &q.s, selectRows); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkQueryBuild measures builder-call cost, including the per-fragment
+// arity check Where runs at build time.
+func BenchmarkQueryBuild(b *testing.B) {
+	b.ReportAllocs()
+	for range b.N {
+		_ = From[User]().Where("age > ?", 18).Where("email = ?", "a@x").OrderBy("created_at DESC").Limit(10)
+	}
 }

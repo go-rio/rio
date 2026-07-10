@@ -134,3 +134,103 @@ func TestCompiledFirstAndCount(t *testing.T) {
 		t.Fatalf("count sql: %s", last)
 	}
 }
+
+// AUDIT M3 regression: Compile's placeholder accounting only looked at
+// Where/Having, so a ? in OrderBy/GroupBy/Join slipped the inline/exec
+// classification — MustCompile did not panic and every execution failed (or
+// the arity contract split between All and Count). Those clauses have no
+// argument channel, so a placeholder there is now a structural error.
+func TestCompileRejectsPlaceholdersInNoArgClauses(t *testing.T) {
+	cases := []struct {
+		name   string
+		q      Query[User]
+		clause string
+	}{
+		{"orderby", From[User]().Where("age > ?").OrderBy("CASE WHEN name = ? THEN 0 ELSE 1 END"), "OrderBy"},
+		{"groupby", From[User]().GroupBy("substr(email, ?, 3)"), "GroupBy"},
+		{"join", From[User]().Join("INNER JOIN orgs ON orgs.plan = ?"), "Join"},
+	}
+	for _, tc := range cases {
+		_, err := Compile[User](tc.q)
+		if err == nil || !strings.Contains(err.Error(), tc.clause+"(") ||
+			!strings.Contains(err.Error(), "no argument channel") {
+			t.Errorf("%s: err = %v", tc.name, err)
+		}
+	}
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("MustCompile must panic on a placeholder in OrderBy")
+		}
+	}()
+	MustCompile[User](From[User]().Where("age > ?").OrderBy("CASE WHEN name = ? THEN 0 ELSE 1 END"))
+}
+
+// Placeholder lookalikes in those clauses stay legal: a ? inside a string
+// literal and the ?? escape are not placeholders under any dialect's lexer.
+// With the holes closed, All and Count agree on the exec arity again.
+func TestCompileAllowsPlaceholderLookalikesInOrderBy(t *testing.T) {
+	ctx := context.Background()
+	q := MustCompile[User](
+		From[User]().Where("age > ?").OrderBy("CASE WHEN email = '?' THEN 0 ELSE 1 END"),
+	)
+
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows(userCols)
+	if _, err := q.All(ctx, db, 18); err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	f.queueRows([]string{"count"}, []driver.Value{int64(0)})
+	if _, err := q.Count(ctx, db, 18); err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+
+	if _, err := Compile[User](From[User]().Where("age > ?").OrderBy("data ?? 'k' DESC")); err != nil {
+		t.Fatalf("?? escape: %v", err)
+	}
+}
+
+// Uncompiled queries keep their behavior: a ? in OrderBy still fails loudly
+// at the statement-level render check, never silently.
+func TestUncompiledOrderByPlaceholderFailsAtRender(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	_, err := From[User]().Where("age > ?", 18).OrderBy("CASE WHEN name = ? THEN 0 ELSE 1 END").All(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "has no argument") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// AUDIT M4 regression: Count/Exists accepted and expanded slice exec
+// arguments that All/First/Rows reject — the same compiled object carried
+// two contracts. Slice expansion is inline-only on all execution points.
+func TestCompiledCountExistsRejectSliceArgs(t *testing.T) {
+	ctx := context.Background()
+	q := MustCompile[User](From[User]().Where("id IN (?)"))
+
+	f := newFakeDB()
+	db := f.open()
+	if _, err := q.Count(ctx, db, []int64{1, 2}); err == nil || !strings.Contains(err.Error(), "cannot expand slice") {
+		t.Fatalf("Count: %v", err)
+	}
+	if _, err := q.Exists(ctx, db, []int64{1, 2}); err == nil || !strings.Contains(err.Error(), "cannot expand slice") {
+		t.Fatalf("Exists: %v", err)
+	}
+
+	// Inline slices expand at compile time; all four execution points agree.
+	inline := MustCompile[User](From[User]().Where("id IN (?)", []int64{1, 2}))
+	f.queueRows(userCols)
+	if _, err := inline.All(ctx, db); err != nil {
+		t.Fatalf("inline All: %v", err)
+	}
+	f.queueRows([]string{"count"}, []driver.Value{int64(2)})
+	if n, err := inline.Count(ctx, db); err != nil || n != 2 {
+		t.Fatalf("inline Count: %v n=%d", err, n)
+	}
+	f.queueRows([]string{"1"}, []driver.Value{int64(1)})
+	if ok, err := inline.Exists(ctx, db); err != nil || !ok {
+		t.Fatalf("inline Exists: %v %v", err, ok)
+	}
+}

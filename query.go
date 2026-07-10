@@ -34,6 +34,12 @@ type queryState struct {
 	orders  []string
 	groups  []string
 
+	// err is the first structural error a builder call detected (a condition
+	// fragment whose own placeholder count contradicts its own arguments).
+	// Builders cannot return errors, so it surfaces at the render entry
+	// points and at Compile — before any SQL is sent.
+	err error
+
 	limit, offset       int
 	limitSet, offsetSet bool
 
@@ -89,6 +95,7 @@ func appendOne[E any](s []E, e E) []E {
 // Slice arguments expand inside IN (?).
 func (q Query[T]) Where(expr string, args ...any) Query[T] {
 	q.s.wheres = appendOne(q.s.wheres, cond{expr: expr, args: copyArgs(args)})
+	q.s.noteCondArity("Where", expr, len(args))
 	return q
 }
 
@@ -108,7 +115,41 @@ func (q Query[T]) GroupBy(expr string) Query[T] {
 // Having adds an AND-ed HAVING condition.
 func (q Query[T]) Having(expr string, args ...any) Query[T] {
 	q.s.havings = appendOne(q.s.havings, cond{expr: expr, args: copyArgs(args)})
+	q.s.noteCondArity("Having", expr, len(args))
 	return q
+}
+
+// noteCondArity checks one condition fragment's placeholder count against
+// its own arguments at build time. The statement-level total in rebind cannot
+// see fragment boundaries: complementary mismatches across fragments
+// (Where("name = ?", "alice", 30).Where("age = ?")) balance the total and
+// silently shift bindings, so each fragment carrying arguments must account
+// for itself. A slice argument counts as one — it expands inside IN (?) at
+// render. Fragments with no arguments stay legal: that is the compiled
+// exec-parameterized shape, and uncompiled they still fail loudly at the
+// statement level. When the three dialect lexers disagree on the count the
+// fragment is dialect-sensitive and the decision defers to render, which
+// knows the real lexer.
+func (s *queryState) noteCondArity(clause, expr string, argc int) {
+	if argc == 0 || s.err != nil {
+		return
+	}
+	// One lexer pass decides the happy path: when the sqlite count matches,
+	// the full three-lexer comparison could only end in agreement (pass) or
+	// disagreement (defer) — never an error — so the other two passes are
+	// skipped.
+	lite := 0
+	_, _, _ = rebindCount(sqliteLex, expr, &lite)
+	if lite == argc {
+		return
+	}
+	pg, my := 0, 0
+	_, _, _ = rebindCount(pgLex, expr, &pg)
+	_, _, _ = rebindCount(mysqlLex, expr, &my)
+	if pg != my || my != lite {
+		return
+	}
+	s.err = fmt.Errorf("rio: %s(%q) has %d placeholder(s) but %d argument(s)", clause, expr, pg, argc)
 }
 
 // Join appends a verbatim JOIN clause, for filtering through other tables:
@@ -236,6 +277,9 @@ func (q Query[T]) All(ctx context.Context, db Queryer) ([]T, error) {
 
 // First returns the first matching row, or ErrNotFound. No implicit ORDER BY
 // is added: like SQL itself, order is undefined unless you ask for one.
+// Without a caller Limit, First fetches with LIMIT 1; an explicit Limit is
+// respected — Limit(0).First matches no rows and returns ErrNotFound, just
+// like All returning none.
 func (q Query[T]) First(ctx context.Context, db Queryer) (*T, error) {
 	p, err := planOf[T]()
 	if err != nil {
@@ -247,7 +291,10 @@ func (q Query[T]) First(ctx context.Context, db Queryer) (*T, error) {
 	if err := validateRelSpecs(p, &q.s); err != nil {
 		return nil, err
 	}
-	one := q.Limit(1)
+	one := q
+	if !one.s.limitSet {
+		one = one.Limit(1)
+	}
 	sqlText, args, err := renderSelect(db.gram(), p, &one.s, selectRows)
 	if err != nil {
 		return nil, err
@@ -275,9 +322,15 @@ func (q Query[T]) First(ctx context.Context, db Queryer) (*T, error) {
 }
 
 // Sole returns the single matching row; ErrNotFound when none match and
-// ErrMultipleRows when more than one does.
+// ErrMultipleRows when more than one does. Without a caller Limit it probes
+// with LIMIT 2; an explicit Limit is respected (like Compiled.Sole running
+// the compiled SQL as-is), so Limit(1) cannot detect a second row.
 func (q Query[T]) Sole(ctx context.Context, db Queryer) (*T, error) {
-	rows, err := q.Limit(2).All(ctx, db)
+	probe := q
+	if !probe.s.limitSet {
+		probe = probe.Limit(2)
+	}
+	rows, err := probe.All(ctx, db)
 	if err != nil {
 		return nil, err
 	}
@@ -558,8 +611,12 @@ func appendLimitOffset(b []byte, d Dialect, s *queryState) ([]byte, error) {
 }
 
 // renderWhere renders user conditions, EXISTS relation filters, and the
-// soft-delete filter.
+// soft-delete filter. Every statement that carries user conditions renders
+// through here, so this is where a builder-recorded fragment error surfaces.
 func renderWhere(b []byte, args []any, g *grammar, table string, p *plan, s *queryState) ([]byte, []any, error) {
+	if s.err != nil {
+		return nil, nil, s.err
+	}
 	d := g.d
 	first := true
 	and := func() {
@@ -698,8 +755,13 @@ func renderExists(b []byte, args []any, g *grammar, owner *plan, ownerRef string
 
 // finishSQL runs the rebind pipeline: IN expansion first, placeholder
 // renumbering second, in one lexer pass — then normalizes arguments.
+//
+// finishSQL takes ownership of b: the returned SQL may alias its memory
+// (rebind returns its input unchanged when nothing rewrites), so the caller
+// must not read or append to b afterwards. Every call site builds b locally
+// and drops it at this call — keep it that way.
 func finishSQL(d Dialect, b []byte, args []any) (string, []any, error) {
-	sqlText, outArgs, err := rebind(d.lexer(), d.style(), string(b), args)
+	sqlText, outArgs, err := rebind(d.lexer(), d.style(), byteString(b), args)
 	if err != nil {
 		return "", nil, err
 	}

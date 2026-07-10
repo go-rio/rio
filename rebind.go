@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"unsafe"
 )
 
 // lexProfile is the per-dialect lexical grammar the rebinder needs to walk a
@@ -52,13 +53,28 @@ const (
 //     caller's responsibility.
 //   - Placeholder/argument count mismatches error with both counts and the
 //     byte offset of the offending placeholder.
+//
+// The output is built copy-on-write: while nothing rewrites — question style,
+// scalar arguments, no ?? escape, the MySQL/SQLite common case — the scan
+// only advances positions and the input string itself is returned, so the
+// unchanged path allocates nothing.
 func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []any, error) {
-	out := make([]byte, 0, len(query)+8)
+	var out []byte // nil until the first rewrite; query[:copied] already appended
+	copied := 0
 	outArgs := args // reused verbatim unless a slice expands
 	expanded := false
 	argIdx := 0
 	n := 0 // emitted placeholder count
 
+	// rewriteTo starts (or continues) the rewrite buffer, with everything up
+	// to byte i passing through verbatim.
+	rewriteTo := func(i int) {
+		if out == nil {
+			out = make([]byte, 0, len(query)+8)
+		}
+		out = append(out, query[copied:i]...)
+		copied = i
+	}
 	emit := func(arg any) {
 		n++
 		if style == bindDollar {
@@ -79,64 +95,60 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 		}
 	}
 
-	// copyTo appends the skipped-over region verbatim: quoted and commented
-	// text passes through untouched, it is only opaque to the ? scan.
-	copyTo := func(end int, from int) int {
-		out = append(out, query[from:end]...)
-		return end
-	}
-
 	i := 0
 	for i < len(query) {
 		c := query[i]
+		// Quoted and commented regions pass through untouched; they are only
+		// opaque to the ? scan, so skipping is a position move, not a copy.
 		switch c {
 		case '\'':
-			i = copyTo(skipQuoted(query, i, '\'', p.backslashEscapes), i)
+			i = skipQuoted(query, i, '\'', p.backslashEscapes)
 			continue
 		case '"':
 			// Identifier on PG/SQLite, string on MySQL; both pass whole.
-			i = copyTo(skipQuoted(query, i, '"', p.backslashEscapes && p.doubleQuoteIsString), i)
+			i = skipQuoted(query, i, '"', p.backslashEscapes && p.doubleQuoteIsString)
 			continue
 		case '`':
 			if p.backtickIdent {
-				i = copyTo(skipQuoted(query, i, '`', false), i)
+				i = skipQuoted(query, i, '`', false)
 				continue
 			}
 		case '[':
 			if p.bracketIdent {
-				i = copyTo(skipUntilByte(query, i+1, ']'), i)
+				i = skipUntilByte(query, i+1, ']')
 				continue
 			}
 		case 'E', 'e':
 			if p.eStrings && i+1 < len(query) && query[i+1] == '\'' && !identByteBefore(query, i) {
-				i = copyTo(skipQuoted(query, i+1, '\'', true), i)
+				i = skipQuoted(query, i+1, '\'', true)
 				continue
 			}
 		case '$':
 			if p.dollarQuote && !identByteBefore(query, i) {
 				if end, ok := skipDollarQuoted(query, i); ok {
-					i = copyTo(end, i)
+					i = end
 					continue
 				}
 			}
 		case '-':
 			if i+1 < len(query) && query[i+1] == '-' && (p.looseDashComment || dashCommentOK(query, i)) {
-				i = copyTo(skipLineComment(query, i), i)
+				i = skipLineComment(query, i)
 				continue
 			}
 		case '#':
 			if p.hashComment {
-				i = copyTo(skipLineComment(query, i), i)
+				i = skipLineComment(query, i)
 				continue
 			}
 		case '/':
 			if i+1 < len(query) && query[i+1] == '*' {
-				i = copyTo(skipBlockComment(query, i, p.nestedBlockComments), i)
+				i = skipBlockComment(query, i, p.nestedBlockComments)
 				continue
 			}
 		case '?':
 			if i+1 < len(query) && query[i+1] == '?' {
-				out = append(out, '?')
+				rewriteTo(i + 1) // keep the first ? ...
+				copied = i + 2   // ... and drop the second
 				i += 2
 				continue
 			}
@@ -159,6 +171,8 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 				// Expansion is flat — "IN (?)" keeps its own parentheses and
 				// becomes "IN ($1, $2)", the sqlx convention.
 				startExpanding()
+				rewriteTo(i)
+				copied = i + 1 // the single ? is replaced by the expansion
 				for j, e := range elems {
 					if j > 0 {
 						out = append(out, ", "...)
@@ -168,22 +182,39 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 				i++
 				continue
 			}
-			if expanded {
+			if style == bindDollar {
+				rewriteTo(i)
+				copied = i + 1 // the ? becomes $N
 				emit(arg)
 			} else {
-				emit(nil) // counting only; outArgs still aliases args
+				// Question style keeps the ? in place: count it, and under
+				// the expanded-args regime collect its argument.
+				n++
+				if expanded {
+					outArgs = append(outArgs, arg)
+				}
 			}
 			i++
 			continue
 		}
-		out = append(out, c)
 		i++
 	}
 
 	if argIdx != len(args) {
 		return "", nil, fmt.Errorf("rio: %d placeholder(s) but %d argument(s)", argIdx, len(args))
 	}
-	return string(out), outArgs, nil
+	if out == nil {
+		return query, outArgs, nil // nothing rewrote: reuse the input
+	}
+	out = append(out, query[copied:]...)
+	return byteString(out), outArgs, nil
+}
+
+// byteString reinterprets b as a string without copying. The caller must
+// guarantee b is never modified afterwards; rio uses it only on freshly
+// built, function-local render buffers whose last use is this conversion.
+func byteString(b []byte) string {
+	return unsafe.String(unsafe.SliceData(b), len(b))
 }
 
 // skipQuoted copies a quoted region starting at the opening quote, honoring

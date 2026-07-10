@@ -2724,3 +2724,115 @@ func TestUpsertMySQLDoNothingRendersNoAlias(t *testing.T) {
 		t.Fatalf("batch DoNothing renders the no-op assignment: %s", got)
 	}
 }
+
+// AUDIT LB1 regression: First injected LIMIT 1 unconditionally, overriding
+// the caller's Limit — Limit(0).First returned a row All would not return,
+// and disagreed with Compiled.First's ErrNotFound.
+func TestFirstRespectsCallerLimit(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+
+	f.queueRows(userCols) // LIMIT 0 matches no rows
+	if _, err := From[User]().Limit(0).First(ctx, db); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Limit(0).First: %v", err)
+	}
+	if got := f.logged()[0]; !strings.Contains(got, "LIMIT 0") {
+		t.Fatalf("caller's LIMIT 0 must reach the SQL: %s", got)
+	}
+
+	f.queueRows(userCols, userRow(1, "a@x"), userRow(2, "b@x"))
+	u, err := From[User]().Limit(5).First(ctx, db)
+	if err != nil || u.ID != 1 {
+		t.Fatalf("Limit(5).First: %v %+v", err, u)
+	}
+	if got := f.logged()[1]; !strings.Contains(got, "LIMIT 5") {
+		t.Fatalf("caller's LIMIT 5 must not be overridden: %s", got)
+	}
+
+	f.queueRows(userCols)
+	if _, err := From[User]().First(ctx, db); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("First: %v", err)
+	}
+	if got := f.logged()[2]; !strings.Contains(got, "LIMIT 1") {
+		t.Fatalf("First without a caller Limit still injects LIMIT 1: %s", got)
+	}
+}
+
+// Sole has the same contract: only inject its LIMIT 2 probe when the caller
+// set no Limit, matching Compiled.Sole running the compiled SQL as-is.
+func TestSoleRespectsCallerLimit(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+
+	f.queueRows(userCols)
+	if _, err := From[User]().Limit(0).Sole(ctx, db); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Limit(0).Sole: %v", err)
+	}
+	if got := f.logged()[0]; !strings.Contains(got, "LIMIT 0") {
+		t.Fatalf("caller's LIMIT 0 must reach the SQL: %s", got)
+	}
+
+	f.queueRows(userCols)
+	if _, err := From[User]().Sole(ctx, db); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Sole: %v", err)
+	}
+	if got := f.logged()[1]; !strings.Contains(got, "LIMIT 2") {
+		t.Fatalf("Sole without a caller Limit still probes with LIMIT 2: %s", got)
+	}
+}
+
+// AUDIT LB3 regression: placeholder/argument arity was only checked as a
+// statement-level total, so complementary mismatches across fragments
+// silently shifted bindings — Where("name = ?", "alice", 30).Where("age = ?")
+// bound 30 to the age condition. Each fragment now checks its own arity at
+// build time and the error names the offending fragment.
+func TestCondFragmentArityChecked(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+
+	_, err := From[User]().Where("name = ?", "alice", 30).Where("age = ?").All(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), `Where("name = ?")`) ||
+		!strings.Contains(err.Error(), "1 placeholder(s) but 2 argument(s)") {
+		t.Fatalf("All: %v", err)
+	}
+
+	_, err = From[User]().GroupBy("age").Having("count(*) > ?", 1, 2).All(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), `Having("count(*) > ?")`) {
+		t.Fatalf("Having: %v", err)
+	}
+
+	// The set-based writes render through the same WHERE path.
+	_, err = From[User]().Where("age = ?", 1, 2).UpdateAll(ctx, db, Set{"age": 3})
+	if err == nil || !strings.Contains(err.Error(), `Where("age = ?")`) {
+		t.Fatalf("UpdateAll: %v", err)
+	}
+
+	// Compile surfaces the fragment error at the declaration site.
+	if _, err := Compile[User](From[User]().Where("name = ?", "alice", 30)); err == nil ||
+		!strings.Contains(err.Error(), "1 placeholder(s) but 2 argument(s)") {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	// A slice argument counts as one: it expands inside IN (?) at render.
+	f.queueRows(userCols)
+	if _, err := From[User]().Where("id IN (?)", []int64{1, 2, 3}).All(ctx, db); err != nil {
+		t.Fatalf("slice expansion: %v", err)
+	}
+
+	// Correctly paired multi-fragment queries are untouched.
+	f.queueRows(userCols)
+	if _, err := From[User]().Where("age = ?", 30).Where("email = ?", "a@x").All(ctx, db); err != nil {
+		t.Fatalf("paired fragments: %v", err)
+	}
+
+	// Fragments with no arguments stay legal at build time — that is the
+	// compiled exec-parameterized shape; uncompiled they still fail loudly
+	// at the statement-level render check.
+	_, err = From[User]().Where("age = ?").All(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "has no argument") {
+		t.Fatalf("zero-arg fragment: %v", err)
+	}
+}
