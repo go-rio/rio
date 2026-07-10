@@ -32,7 +32,7 @@ func (l *loopDB) raw() *sql.DB {
 
 type loopConnector struct{ l *loopDB }
 
-func (c loopConnector) Connect(context.Context) (driver.Conn, error) { return loopConn{c.l}, nil }
+func (c loopConnector) Connect(context.Context) (driver.Conn, error) { return loopConn(c), nil }
 func (c loopConnector) Driver() driver.Driver                        { return fakeDriver{} }
 
 type loopConn struct{ l *loopDB }

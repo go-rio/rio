@@ -609,7 +609,8 @@ func isScalarType(t reflect.Type) bool {
 // happen once per call instead of once per stamped column — batch paths
 // would otherwise re-render the identical instant on every row. Callers
 // build it on the stack; zero now (no stamps in play) still memoizes
-// correctly because the memo is keyed by value equality.
+// correctly because the memo is keyed by instant equality — every time rio
+// binds is already normalized, so Equal here is exact.
 type binder struct {
 	d       Dialect
 	now     time.Time // normalized clock instant, zero when the call stamps nothing
@@ -617,7 +618,7 @@ type binder struct {
 }
 
 func (b *binder) time(nt time.Time) any {
-	if nt == b.now {
+	if nt.Equal(b.now) {
 		if b.nowBind == nil {
 			b.nowBind = b.d.bindTime(nt)
 		}
