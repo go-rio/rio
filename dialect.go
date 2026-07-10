@@ -186,14 +186,25 @@ func (sqliteDialect) translate(err error) error {
 
 // chTimeFormat is rio's canonical time encoding for ClickHouse: wall-clock
 // text with a fixed six-digit fraction and an explicit UTC offset. The offset
-// overrides the column's timezone attribute during parsing, so the same
-// instant lands in DateTime64(6) and DateTime64(6, 'Asia/Shanghai') alike —
-// unlike bare wall-clock text (read in the column's zone) or fractional
-// epoch strings (which cannot express pre-1970 instants). Text at all
-// because clickhouse-go's client-side binder truncates a time.Time argument
-// to whole seconds; the fixed fraction keeps the behavior uniform per column
-// type instead of per value.
+// pins the instant regardless of any column timezone attribute — unlike bare
+// wall-clock text (read in the column's zone) or fractional epoch strings
+// (which cannot express pre-1970 instants, and lose microseconds past 2^53
+// through the server's Float64 literal path). Text at all because
+// clickhouse-go's client-side binder truncates a time.Time argument to whole
+// seconds.
 const chTimeFormat = "2006-01-02 15:04:05.000000+00:00"
+
+// chTimeText is what the ClickHouse dialect's bindTime produces: chTimeFormat
+// text tagged for execution-time inlining. The rebinder rewrites each
+// matching ? into parseDateTime64BestEffort('<text>', 6, 'UTC') and drops the
+// argument (inlineTimeArgs). The explicit parse function is the only channel
+// that works on every supported server: the implicit String→DateTime64 cast
+// in comparisons rejects offset text before 26.x (TYPE_MISMATCH, immune to
+// every session setting), and basic-format INSERT parsing rejects it too.
+// The text's character set is closed ([0-9 :.+-] from time.Format), so the
+// inlined literal has zero injection surface. SQL templates and compiled
+// queries stay parameterized — only the executed statement text changes.
+type chTimeText string
 
 // ClickHouse's DateTime64 range. The server silently clamps values outside
 // it to the boundary — even on INSERT — so rio's bind funnels reject them
@@ -222,7 +233,7 @@ func (clickhouseDialect) name() string      { return "clickhouse" }
 func (clickhouseDialect) lexer() lexProfile { return chLex }
 func (clickhouseDialect) style() bindStyle  { return bindQuestionEsc }
 
-func (clickhouseDialect) bindTime(t time.Time) any { return t.Format(chTimeFormat) }
+func (clickhouseDialect) bindTime(t time.Time) any { return chTimeText(t.Format(chTimeFormat)) }
 
 func (clickhouseDialect) caps() dialectCaps {
 	// ClickHouse is an append-only OLAP dialect: UPDATE/DELETE are

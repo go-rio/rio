@@ -240,8 +240,24 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 					if j > 0 {
 						out = append(out, ", "...)
 					}
+					if tt, ok := e.(chTimeText); ok && style == bindQuestionEsc {
+						out = appendCHTimeLiteral(out, tt)
+						continue
+					}
 					emit(e)
 				}
+				i++
+				continue
+			}
+			if tt, ok := arg.(chTimeText); ok && style == bindQuestionEsc {
+				// ClickHouse time arguments inline as an explicit parse call:
+				// the implicit String→DateTime64 comparison cast rejects
+				// offset text before 26.x, the function accepts it on every
+				// version. The argument is consumed, not bound.
+				startExpanding()
+				rewriteTo(i)
+				copied = i + 1 // the ? becomes the literal
+				out = appendCHTimeLiteral(out, tt)
 				i++
 				continue
 			}
@@ -278,6 +294,40 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 // built, function-local render buffers whose last use is this conversion.
 func byteString(b []byte) string {
 	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+// appendCHTimeLiteral renders one inlined ClickHouse time argument. The text
+// between the quotes is normalizeTime output under chTimeFormat — its
+// character set is closed ([0-9 :.+-]), so no escaping is needed and the
+// literal has zero injection surface.
+func appendCHTimeLiteral(out []byte, tt chTimeText) []byte {
+	out = append(out, "parseDateTime64BestEffort('"...)
+	out = append(out, string(tt)...)
+	return append(out, "', 6, 'UTC')"...)
+}
+
+// inlineTimeArgs is the ClickHouse execution-time pass: when the bound
+// arguments carry chTimeText values — produced by bindTime on entity binds
+// and by normalizeArgs on user arguments — the statement is rebound once
+// more so each matching ? becomes an inlined parseDateTime64BestEffort
+// literal and the argument list shrinks accordingly. Cached SQL (entity CRUD
+// templates, compiled queries) stays parameterized; only the executed text
+// changes, which also means query hooks and logs see the full literal.
+// Rebinding rio's own rebound output is safe: ?? is already folded to the
+// driver's \? escape (skipped), protected regions skip identically, and live
+// ? placeholders match the argument list by construction. Other dialects
+// return their inputs untouched after one name comparison — chTimeText
+// cannot exist in their argument lists.
+func inlineTimeArgs(d Dialect, sqlText string, args []any) (string, []any, error) {
+	if len(args) == 0 || d.name() != "clickhouse" {
+		return sqlText, args, nil
+	}
+	for _, a := range args {
+		if _, ok := a.(chTimeText); ok {
+			return rebind(chLex, bindQuestionEsc, sqlText, args)
+		}
+	}
+	return sqlText, args, nil
 }
 
 // skipQuoted copies a quoted region starting at the opening quote, honoring

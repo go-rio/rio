@@ -298,13 +298,18 @@ lookalike that silently means something weaker.
   implemented, not merely "is awkward").
 - **Every argument is interpolated client-side** — the driver's
   `database/sql` path has no parameter binding. Two dialect rules follow:
-  times bind as fixed-format text (`2006-01-02 15:04:05.000000+00:00` — the
-  driver would silently truncate a `time.Time` to whole seconds; the
-  explicit offset overrides column timezones, and the out-of-range values
-  ClickHouse would silently *clamp* are rejected client-side, zero
-  `time.Time` included), and `[]byte` binds as `String` (the driver renders
-  it as an `Array(UInt8)` literal otherwise — a String column then stores
-  the literal's text form, silently).
+  times inline at execution as
+  `parseDateTime64BestEffort('2006-01-02 15:04:05.000000+00:00', 6, 'UTC')`
+  literals (the driver would silently truncate a `time.Time` to whole
+  seconds, and the implicit String→DateTime64 comparison cast rejects
+  offset-carrying text before 26.x regardless of session settings — the
+  explicit parse function is the one channel every supported server accepts
+  with microseconds intact; cached SQL stays parameterized, only the
+  executed text carries the literal, and the out-of-range values ClickHouse
+  would silently *clamp* are rejected client-side, zero `time.Time`
+  included), and `[]byte` binds as `String` (the driver renders it as an
+  `Array(UInt8)` literal otherwise — a String column then stores the
+  literal's text form, silently).
 - **The lexer is pinned to the server's Lexer.cpp** (heredocs with empty and
   digit-leading tags where unterminated ones do not lex, `//` comments, the
   `# ` space rule, backslash escapes in every quote flavor), and `??` emits
@@ -352,7 +357,9 @@ it is missing plan caches and sloppy string assembly.
   Update +2, Delete +1 — asserted with testing.AllocsPerRun
   (TestCRUDAllocBudget). Upsert adds its conflict-shape machinery on top:
   +5 (PostgreSQL) / +5 (MySQL), asserted at those budgets. ClickHouse rides
-  the same paths (Find +1, Insert +1): its capability checks are early-exit
+  the same paths (Find +1; Insert +5 — the execution-time inline rewrite of
+  stamped time columns, measured against a hand-written equivalent that
+  interpolates the same literals); its capability checks are early-exit
   branches, so the three older dialects' budgets did not move when it landed.
 - Benchmarks in-repo against hand-written database/sql (fake driver in
   perf_test.go isolates rio's own overhead; bench/ adds real SQLite and a
