@@ -183,37 +183,11 @@ func (s *colScanner) nextCell() unsafe.Pointer {
 }
 
 func (s *colScanner) Scan(src any) error {
+	if src == nil {
+		return s.scanNull()
+	}
 	f := s.f
 	p := unsafe.Add(s.base, f.offset)
-
-	if src == nil {
-		switch f.code.kind {
-		case scanScanner:
-			return s.slowScanner(nil)
-		case scanPtr:
-			reflect.NewAt(f.typ, p).Elem().SetZero()
-			return nil
-		case scanBytes:
-			*(*[]byte)(p) = nil
-			return nil
-		case scanJSON:
-			// The write side stores SQL NULL for a nil *T json field; the
-			// round trip must come back as nil, not as an error.
-			if f.typ.Kind() == reflect.Pointer {
-				reflect.NewAt(f.typ, p).Elem().SetZero()
-				return nil
-			}
-		case scanTime:
-			if f.isSoftDelete {
-				// NULL means "not deleted": the softdelete tag opts this
-				// column into the zero-time exception.
-				*(*time.Time)(p) = time.Time{}
-				return nil
-			}
-		}
-		return fmt.Errorf("rio: column %q is NULL but field %s is %s; use a pointer, sql.Null, or a Scanner",
-			f.column, f.name, f.typ)
-	}
 
 	// publish is the scanPtr hand-off: the case below allocates the element
 	// cell, retargets p at it, swaps in the plan-time elem codec, and jumps
@@ -231,49 +205,24 @@ scan:
 		if err != nil {
 			return err
 		}
-		if bits < 64 && (n > int64(1)<<(bits-1)-1 || n < -int64(1)<<(bits-1)) {
-			return fmt.Errorf("rio: column %q value %d overflows %s", f.column, n, f.typ)
-		}
-		switch bits {
-		case 8:
-			*(*int8)(p) = int8(n)
-		case 16:
-			*(*int16)(p) = int16(n)
-		case 32:
-			*(*int32)(p) = int32(n)
-		default:
-			*(*int64)(p) = n // int is 64-bit on every supported platform
+		if err := storeInt(f, p, bits, n); err != nil {
+			return err
 		}
 	case scanUint:
 		n, err := srcUint(src, f)
 		if err != nil {
 			return err
 		}
-		if bits < 64 && n > uint64(1)<<bits-1 {
-			return fmt.Errorf("rio: column %q value %d overflows %s", f.column, n, f.typ)
-		}
-		switch bits {
-		case 8:
-			*(*uint8)(p) = uint8(n)
-		case 16:
-			*(*uint16)(p) = uint16(n)
-		case 32:
-			*(*uint32)(p) = uint32(n)
-		default:
-			*(*uint64)(p) = n
+		if err := storeUint(f, p, bits, n); err != nil {
+			return err
 		}
 	case scanFloat:
 		fl, err := srcFloat(src, f)
 		if err != nil {
 			return err
 		}
-		if bits == 32 {
-			if !math.IsInf(fl, 0) && (fl > math.MaxFloat32 || fl < -math.MaxFloat32) {
-				return fmt.Errorf("rio: column %q value overflows float32", f.column)
-			}
-			*(*float32)(p) = float32(fl)
-		} else {
-			*(*float64)(p) = fl
+		if err := storeFloat(f, p, bits, fl); err != nil {
+			return err
 		}
 	case scanBool:
 		b, err := srcBool(src, f)
@@ -293,9 +242,7 @@ scan:
 	case scanBytes:
 		switch v := src.(type) {
 		case []byte:
-			cp := make([]byte, len(v))
-			copy(cp, v) // driver buffers are reused after the next Next()
-			*(*[]byte)(p) = cp
+			storeBytes(p, v)
 		case string:
 			*(*[]byte)(p) = []byte(v)
 		default:
@@ -317,9 +264,8 @@ scan:
 		default:
 			return convErr(f, src)
 		}
-		dst := reflect.NewAt(f.typ, p)
-		if err := json.Unmarshal(data, dst.Interface()); err != nil {
-			return fmt.Errorf("rio: column %q: decoding JSON into %s: %w", f.column, f.typ, err)
+		if err := storeJSON(f, p, data); err != nil {
+			return err
 		}
 	case scanScanner:
 		return s.slowScanner(src)
@@ -340,6 +286,145 @@ scan:
 		*(*unsafe.Pointer)(publish) = p
 	}
 	return nil
+}
+
+// scanNull applies the NULL rules for one cell. Scan(nil) and SetNull are
+// both this function, so the two channels' NULL semantics — pointer nil-out,
+// bytes nil, nil *T for json, the softdelete zero-time exception, and the
+// error text everything else gets — cannot drift.
+func (s *colScanner) scanNull() error {
+	f := s.f
+	p := unsafe.Add(s.base, f.offset)
+	switch f.code.kind {
+	case scanScanner:
+		return s.slowScanner(nil)
+	case scanPtr:
+		reflect.NewAt(f.typ, p).Elem().SetZero()
+		return nil
+	case scanBytes:
+		*(*[]byte)(p) = nil
+		return nil
+	case scanJSON:
+		// The write side stores SQL NULL for a nil *T json field; the
+		// round trip must come back as nil, not as an error.
+		if f.typ.Kind() == reflect.Pointer {
+			reflect.NewAt(f.typ, p).Elem().SetZero()
+			return nil
+		}
+	case scanTime:
+		if f.isSoftDelete {
+			// NULL means "not deleted": the softdelete tag opts this
+			// column into the zero-time exception.
+			*(*time.Time)(p) = time.Time{}
+			return nil
+		}
+	}
+	return fmt.Errorf("rio: column %q is NULL but field %s is %s; use a pointer, sql.Null, or a Scanner",
+		f.column, f.name, f.typ)
+}
+
+// The store helpers below write one decoded value into a field slot, with
+// the width and overflow rules attached. Scan (fed by the src converters)
+// and the NativeCell typed sinks both run these same functions, so the two
+// channels' storage semantics are equal by construction, not by test alone.
+// Error construction lives in out-of-line funcs to keep the helpers within
+// the inlining budget — the hot path stays call-free, as before the split.
+
+func storeInt(f *field, p unsafe.Pointer, bits int, n int64) error {
+	if bits == 64 { // int64 and int, the dominant widths: stays inlined
+		*(*int64)(p) = n
+		return nil
+	}
+	return storeIntNarrow(f, p, bits, n)
+}
+
+func storeIntNarrow(f *field, p unsafe.Pointer, bits int, n int64) error {
+	if n > int64(1)<<(bits-1)-1 || n < -int64(1)<<(bits-1) {
+		return intOverflowErr(f, n)
+	}
+	switch bits {
+	case 8:
+		*(*int8)(p) = int8(n)
+	case 16:
+		*(*int16)(p) = int16(n)
+	default:
+		*(*int32)(p) = int32(n)
+	}
+	return nil
+}
+
+func storeUint(f *field, p unsafe.Pointer, bits int, n uint64) error {
+	if bits == 64 {
+		*(*uint64)(p) = n
+		return nil
+	}
+	return storeUintNarrow(f, p, bits, n)
+}
+
+func storeUintNarrow(f *field, p unsafe.Pointer, bits int, n uint64) error {
+	if n > uint64(1)<<bits-1 {
+		return uintOverflowErr(f, n)
+	}
+	switch bits {
+	case 8:
+		*(*uint8)(p) = uint8(n)
+	case 16:
+		*(*uint16)(p) = uint16(n)
+	default:
+		*(*uint32)(p) = uint32(n)
+	}
+	return nil
+}
+
+func storeFloat(f *field, p unsafe.Pointer, bits int, fl float64) error {
+	if bits == 64 {
+		*(*float64)(p) = fl
+		return nil
+	}
+	return storeFloat32(f, p, fl)
+}
+
+func storeFloat32(f *field, p unsafe.Pointer, fl float64) error {
+	if !math.IsInf(fl, 0) && (fl > math.MaxFloat32 || fl < -math.MaxFloat32) {
+		return fmt.Errorf("rio: column %q value overflows float32", f.column)
+	}
+	*(*float32)(p) = float32(fl)
+	return nil
+}
+
+func storeBytes(p unsafe.Pointer, v []byte) {
+	cp := make([]byte, len(v))
+	copy(cp, v) // driver buffers are reused after the next Next()
+	*(*[]byte)(p) = cp
+}
+
+func storeJSON(f *field, p unsafe.Pointer, data []byte) error {
+	dst := reflect.NewAt(f.typ, p)
+	if err := json.Unmarshal(data, dst.Interface()); err != nil {
+		return fmt.Errorf("rio: column %q: decoding JSON into %s: %w", f.column, f.typ, err)
+	}
+	return nil
+}
+
+func intOverflowErr(f *field, n int64) error {
+	return fmt.Errorf("rio: column %q value %d overflows %s", f.column, n, f.typ)
+}
+
+func uintOverflowErr(f *field, n uint64) error {
+	return fmt.Errorf("rio: column %q value %d overflows %s", f.column, n, f.typ)
+}
+
+// uintFromInt64 is the negative-value gate shared by srcUint's int64 arm and
+// SetInt64's unsigned arm.
+func uintFromInt64(f *field, v int64) (uint64, error) {
+	if v < 0 {
+		return 0, negativeUintErr(f, v)
+	}
+	return uint64(v), nil
+}
+
+func negativeUintErr(f *field, v int64) error {
+	return fmt.Errorf("rio: column %q value %d is negative but field %s is unsigned", f.column, v, f.name)
 }
 
 func (s *colScanner) slowScanner(src any) error {
@@ -376,6 +461,230 @@ func (s *colScanner) slowScanner(src any) error {
 func convErr(f *field, src any) error {
 	return fmt.Errorf("rio: column %q: cannot convert %T into field %s (%s)", f.column, src, f.name, f.typ)
 }
+
+// --- NativeCell: the typed sinks of the native channel ---
+//
+// Each Set method is its Scan(any) equivalent with the interface boxing
+// removed: SetInt64(v) ≡ Scan(int64(v)), SetNull() ≡ Scan(nil) — the same
+// conversion rules through the same store helpers, so equivalence holds by
+// construction. Only the arms a native driver actually routes (matching kind,
+// or the text forms of the numeric kinds) are boxing-free; mismatched kinds
+// and Scanner fields fall back through boxed slow paths, exactly the calls
+// that are slow or failing on the stdlib channel too.
+
+var _ NativeCell = (*colScanner)(nil)
+
+// ScanKind reports the cell's plan-time scan strategy so a NativeRows
+// implementation can pick its typed decode path per column. Pointer fields
+// report the element's kind: the sinks allocate and publish the *T cell
+// internally, and SetNull stores nil — pointer-ness never crosses the SPI.
+func (s *colScanner) ScanKind() NativeScanKind {
+	k := s.f.code.kind
+	if k == scanPtr {
+		k = s.f.code.elemKind
+	}
+	switch k {
+	case scanInt:
+		return NativeKindInt
+	case scanUint:
+		return NativeKindUint
+	case scanFloat:
+		return NativeKindFloat
+	case scanBool:
+		return NativeKindBool
+	case scanString:
+		return NativeKindString
+	case scanBytes:
+		return NativeKindBytes
+	case scanTime:
+		return NativeKindTime
+	case scanJSON:
+		return NativeKindJSON
+	default:
+		return NativeKindScanner
+	}
+}
+
+// sinkTarget resolves one typed store's destination: the field slot, or —
+// for pointer fields — a fresh cell from the column's chunk, with the field
+// slot returned as the publish target. Callers publish only after a clean
+// store; a conversion error leaves the struct untouched (Scan's discipline,
+// including the consumed cell).
+func (s *colScanner) sinkTarget() (p, publish unsafe.Pointer, kind scanKind, bits int) {
+	f := s.f
+	p = unsafe.Add(s.base, f.offset)
+	kind, bits = f.code.kind, f.code.bits
+	if kind == scanPtr {
+		publish, p = p, s.nextCell()
+		kind, bits = f.code.elemKind, f.code.elemBits
+	}
+	return p, publish, kind, bits
+}
+
+// sinkSlow is the boxed tail of the typed sinks: Scanner fields delegate the
+// value exactly as Scan would, and every impossible conversion reports the
+// same error the stdlib channel does.
+func (s *colScanner) sinkSlow(src any) error {
+	if s.f.code.kind == scanScanner {
+		return s.slowScanner(src)
+	}
+	return convErr(s.f, src)
+}
+
+func (s *colScanner) SetInt64(v int64) error {
+	p, publish, kind, bits := s.sinkTarget()
+	var err error
+	switch kind {
+	case scanInt:
+		err = storeInt(s.f, p, bits, v)
+	case scanUint:
+		var n uint64
+		if n, err = uintFromInt64(s.f, v); err == nil {
+			err = storeUint(s.f, p, bits, n)
+		}
+	case scanFloat:
+		err = storeFloat(s.f, p, bits, float64(v))
+	case scanBool:
+		*(*bool)(p) = v != 0
+	default:
+		return s.sinkSlow(v)
+	}
+	if err != nil || publish == nil {
+		return err
+	}
+	*(*unsafe.Pointer)(publish) = p
+	return nil
+}
+
+func (s *colScanner) SetFloat64(v float64) error {
+	p, publish, kind, bits := s.sinkTarget()
+	if kind != scanFloat {
+		return s.sinkSlow(v)
+	}
+	if err := storeFloat(s.f, p, bits, v); err != nil {
+		return err
+	}
+	if publish != nil {
+		*(*unsafe.Pointer)(publish) = p
+	}
+	return nil
+}
+
+func (s *colScanner) SetBool(v bool) error {
+	p, publish, kind, _ := s.sinkTarget()
+	if kind != scanBool {
+		return s.sinkSlow(v)
+	}
+	*(*bool)(p) = v
+	if publish != nil {
+		*(*unsafe.Pointer)(publish) = p
+	}
+	return nil
+}
+
+func (s *colScanner) SetString(v string) error {
+	p, publish, kind, bits := s.sinkTarget()
+	var err error
+	switch kind {
+	case scanString:
+		*(*string)(p) = v
+	case scanBytes:
+		*(*[]byte)(p) = []byte(v)
+	case scanJSON:
+		err = storeJSON(s.f, p, []byte(v))
+	case scanInt:
+		var n int64
+		if n, err = srcInt(v, s.f); err == nil {
+			err = storeInt(s.f, p, bits, n)
+		}
+	case scanUint:
+		var n uint64
+		if n, err = srcUint(v, s.f); err == nil {
+			err = storeUint(s.f, p, bits, n)
+		}
+	case scanFloat:
+		var fl float64
+		if fl, err = srcFloat(v, s.f); err == nil {
+			err = storeFloat(s.f, p, bits, fl)
+		}
+	case scanBool:
+		var b bool
+		if b, err = srcBool(v, s.f); err == nil {
+			*(*bool)(p) = b
+		}
+	case scanTime:
+		var t time.Time
+		if t, err = srcTime(v, s.f); err == nil {
+			*(*time.Time)(p) = t
+		}
+	default:
+		return s.sinkSlow(v)
+	}
+	if err != nil || publish == nil {
+		return err
+	}
+	*(*unsafe.Pointer)(publish) = p
+	return nil
+}
+
+func (s *colScanner) SetBytes(v []byte) error {
+	p, publish, kind, bits := s.sinkTarget()
+	var err error
+	switch kind {
+	case scanBytes:
+		storeBytes(p, v) // copies: v is driver memory
+	case scanString:
+		*(*string)(p) = string(v)
+	case scanJSON:
+		err = storeJSON(s.f, p, v) // Unmarshal never retains its input
+	case scanInt:
+		var n int64
+		if n, err = srcInt(v, s.f); err == nil {
+			err = storeInt(s.f, p, bits, n)
+		}
+	case scanUint:
+		var n uint64
+		if n, err = srcUint(v, s.f); err == nil {
+			err = storeUint(s.f, p, bits, n)
+		}
+	case scanFloat:
+		var fl float64
+		if fl, err = srcFloat(v, s.f); err == nil {
+			err = storeFloat(s.f, p, bits, fl)
+		}
+	case scanBool:
+		var b bool
+		if b, err = srcBool(v, s.f); err == nil {
+			*(*bool)(p) = b
+		}
+	case scanTime:
+		var t time.Time
+		if t, err = srcTime(v, s.f); err == nil {
+			*(*time.Time)(p) = t
+		}
+	default:
+		return s.sinkSlow(v)
+	}
+	if err != nil || publish == nil {
+		return err
+	}
+	*(*unsafe.Pointer)(publish) = p
+	return nil
+}
+
+func (s *colScanner) SetTime(v time.Time) error {
+	p, publish, kind, _ := s.sinkTarget()
+	if kind != scanTime {
+		return s.sinkSlow(v)
+	}
+	*(*time.Time)(p) = v
+	if publish != nil {
+		*(*unsafe.Pointer)(publish) = p
+	}
+	return nil
+}
+
+func (s *colScanner) SetNull() error { return s.scanNull() }
 
 // The src* converters accept, beyond database/sql's canonical driver values,
 // the natively typed values clickhouse-go delivers (it bypasses the canonical
@@ -425,10 +734,7 @@ func srcInt(src any, f *field) (int64, error) {
 func srcUint(src any, f *field) (uint64, error) {
 	switch v := src.(type) {
 	case int64:
-		if v < 0 {
-			return 0, fmt.Errorf("rio: column %q value %d is negative but field %s is unsigned", f.column, v, f.name)
-		}
-		return uint64(v), nil
+		return uintFromInt64(f, v)
 	case uint64:
 		return v, nil
 	case uint:

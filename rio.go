@@ -27,10 +27,11 @@ type Queryer interface {
 // DB wraps a *sql.DB with a dialect. rio never replaces or tunes the
 // connection pool — configure pooling on the *sql.DB you pass in.
 type DB struct {
-	db  *sql.DB
-	e   dbEngine
-	g   *grammar
-	cfg *config
+	db     *sql.DB
+	e      dbEngine
+	g      *grammar
+	cfg    *config
+	native any // driver-native pool handle (NativeConfig.Handle); nil on database/sql
 }
 
 // New wraps an existing *sql.DB. Driver modules (go-rio/postgres, go-rio/mysql,
@@ -61,8 +62,19 @@ func New(db *sql.DB, dialect Dialect, opts ...Option) *DB {
 	return &DB{db: db, e: e, g: newGrammar(dialect, cfg), cfg: cfg}
 }
 
-// Unwrap returns the underlying *sql.DB for anything rio does not cover.
+// Unwrap returns the underlying *sql.DB for anything rio does not cover. On
+// the native channel it returns the database/sql view the driver module
+// supplied over the same pool (NativeConfig.SQLView; go-rio/postgres always
+// provides one), or nil when the driver module supplied none. Never tune
+// pooling on a native view — the pool belongs to the driver's configuration.
 func (d *DB) Unwrap() *sql.DB { return d.db }
+
+// Native returns the driver-native pool handle behind the native channel —
+// NativeConfig.Handle, a *pgxpool.Pool under go-rio/postgres — and nil on
+// the database/sql channel. Application code goes through the driver
+// module's typed accessor (postgres.PoolOf); this is the raw door those
+// accessors are built on.
+func (d *DB) Native() any { return d.native }
 
 // Close closes the prepared-statement cache (if enabled) and the underlying
 // *sql.DB.
@@ -121,12 +133,16 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 }
 
 // finishTx rolls the transaction back. Unlike the savepoint statements below,
-// a canceled ctx cannot suppress this cleanup: database/sql's Tx.Rollback
-// takes no context and always reaches the driver, and BeginTx's own watcher
-// already rolls back automatically when the begin context dies (Rollback then
-// reports ErrTxDone, tolerated here).
+// a canceled ctx cannot suppress this cleanup: the rollback runs on a
+// cancellation-decoupled context — the caller-owned WithoutCancel discipline
+// the engine seam documents. database/sql's Tx.Rollback ignores the context
+// anyway; a native engine's rollback honors it, and a dead one there would
+// strand the transaction (pgx fails fast and tears down the connection).
+// Either channel reports a transaction the driver already finished — a begin
+// context that died, for one — as sql.ErrTxDone, tolerated here.
 func (d *DB) finishTx(ctx context.Context, te txEngine, cause error) error {
-	err := observe(ctx, d.cfg, d.g.d, "rollback", "ROLLBACK", func() error { return te.rollback(ctx) })
+	cleanup := context.WithoutCancel(ctx)
+	err := observe(ctx, d.cfg, d.g.d, "rollback", "ROLLBACK", func() error { return te.rollback(cleanup) })
 	if err != nil && !errors.Is(err, sql.ErrTxDone) {
 		return fmt.Errorf("rio: rollback after %q failed: %w", cause, err)
 	}
@@ -163,8 +179,22 @@ type Tx struct {
 	spSeq *int
 }
 
-// Unwrap returns the underlying *sql.Tx.
+// Unwrap returns the underlying *sql.Tx — and nil on the native channel,
+// which has no *sql.Tx to give (the one Unwrap the native channel cannot
+// keep). Use the driver module's typed accessor there: postgres.TxOf returns
+// the pgx.Tx this transaction runs on.
 func (t *Tx) Unwrap() *sql.Tx { return t.tx }
+
+// NativeTx returns the NativeTx value the native channel runs this
+// transaction on, and nil on the database/sql channel. Like (*DB).Native it
+// is the raw door: application code uses the driver module's typed accessor
+// (postgres.TxOf) instead.
+func (t *Tx) NativeTx() any {
+	if ne, ok := t.e.(nativeTxEngine); ok {
+		return ne.nt
+	}
+	return nil
+}
 
 func (t *Tx) eng() engine    { return t.e }
 func (t *Tx) gram() *grammar { return t.g }

@@ -49,6 +49,59 @@ func (c loopConn) ExecContext(context.Context, string, []driver.NamedValue) (dri
 	return fakeExecResult{fakeResult{lastID: 1, affected: 1}}, nil
 }
 
+// loopNative is loopDB's counterpart on the native channel: a NativeDB that
+// serves the same scripted typed rows for every query and a fixed count for
+// every exec, with no log and no locking, so AllocsPerRun measures the
+// channel itself.
+type loopNative struct {
+	cols []string
+	rows [][]any
+}
+
+func (l *loopNative) open(d Dialect, opts ...Option) *DB {
+	return NewNative(NativeConfig{DB: l}, d, append([]Option{WithClock(fixedClock)}, opts...)...)
+}
+
+func (l *loopNative) Query(context.Context, string, []any) (NativeRows, error) {
+	return &loopNativeRows{l: l}, nil
+}
+
+func (l *loopNative) Exec(context.Context, string, []any) (int64, error) { return 1, nil }
+
+func (l *loopNative) Begin(context.Context, *sql.TxOptions) (NativeTx, error) {
+	return nil, errors.New("loopnative: no tx")
+}
+
+func (l *loopNative) Close() error { return nil }
+
+type loopNativeRows struct {
+	l   *loopNative
+	pos int
+}
+
+func (r *loopNativeRows) Columns() []string { return r.l.cols }
+
+func (r *loopNativeRows) Next() bool {
+	if r.pos >= len(r.l.rows) {
+		return false
+	}
+	r.pos++
+	return true
+}
+
+func (r *loopNativeRows) Scan(dest ...any) error {
+	row := r.l.rows[r.pos-1]
+	for i, d := range dest {
+		if err := assignNativeDest(d, row[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *loopNativeRows) Err() error { return nil }
+func (r *loopNativeRows) Close()     {}
+
 // perfUser is the entity-CRUD measurement model: five plain columns, the
 // shape of the audit's isolated fake-driver runs.
 type perfUser struct {
@@ -63,6 +116,10 @@ var perfUserCols = []string{"id", "email", "age", "created_at", "updated_at"}
 
 func perfUserRow() []driver.Value {
 	return []driver.Value{int64(1), "u@example.com", int64(30), testNow, testNow}
+}
+
+func perfUserNativeRow() []any {
+	return []any{int64(1), "u@example.com", int64(30), testNow, testNow}
 }
 
 // perfPlain and perfPtr share one column shape; only nullability differs, so
@@ -299,6 +356,132 @@ func TestCRUDAllocBudget(t *testing.T) {
 			t.Errorf("%s: %.0f allocs/op vs %.0f hand-written — %+.0f extra exceeds the %+.0f budget",
 				name, rio, std, extra, budget)
 		}
+	}
+}
+
+// TestNativeAllocBudget pins the native channel's allocation counts on the
+// deterministic fake-native stack — the whole stack is rio's own code, so
+// absolute counts are stable, unlike the stdlib pairs whose driver half
+// shifts with Go releases — plus the channel-vs-channel invariant the design
+// promises: for the same call on the same data, the native channel never
+// allocates more than the database/sql channel.
+func TestNativeAllocBudget(t *testing.T) {
+	ctx := context.Background()
+	fatal := func(err error) {
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	type leg struct {
+		budget      float64 // absolute native allocs/op, pinned at measurement
+		native, std func()
+	}
+	legs := map[string]leg{}
+
+	{ // Find: the 30→18 story of the real-network bench, isolated.
+		ln := &loopNative{cols: perfUserCols, rows: [][]any{perfUserNativeRow()}}
+		ls := &loopDB{cols: perfUserCols, rows: [][]driver.Value{perfUserRow()}}
+		ndb, sdb := ln.open(Postgres), ls.open(Postgres)
+		legs["find"] = leg{
+			budget: 4,
+			native: func() { _, err := Find[perfUser](ctx, ndb, int64(1)); fatal(err) },
+			std:    func() { _, err := Find[perfUser](ctx, sdb, int64(1)); fatal(err) },
+		}
+	}
+
+	{ // All over 100 rows: the flagship read shape (433→124 on the wire).
+		rows := make([][]any, 100)
+		drows := make([][]driver.Value, 100)
+		for i := range rows {
+			rows[i] = perfUserNativeRow()
+			drows[i] = perfUserRow()
+		}
+		ln := &loopNative{cols: perfUserCols, rows: rows}
+		ls := &loopDB{cols: perfUserCols, rows: drows}
+		ndb, sdb := ln.open(Postgres), ls.open(Postgres)
+		legs["all100"] = leg{
+			budget: 11,
+			native: func() {
+				out, err := From[perfUser]().All(ctx, ndb)
+				fatal(err)
+				if len(out) != 100 {
+					panic("short read")
+				}
+			},
+			std: func() {
+				out, err := From[perfUser]().All(ctx, sdb)
+				fatal(err)
+				if len(out) != 100 {
+					panic("short read")
+				}
+			},
+		}
+	}
+
+	{ // Insert, RETURNING path.
+		ln := &loopNative{cols: []string{"id"}, rows: [][]any{{int64(1)}}}
+		ls := &loopDB{cols: []string{"id"}, rows: [][]driver.Value{{int64(1)}}}
+		ndb, sdb := ln.open(Postgres), ls.open(Postgres)
+		nu := &perfUser{Email: "u@example.com", Age: 30}
+		su := &perfUser{Email: "u@example.com", Age: 30}
+		legs["insert"] = leg{
+			budget: 5,
+			native: func() {
+				nu.ID, nu.CreatedAt, nu.UpdatedAt = 0, time.Time{}, time.Time{}
+				fatal(Insert(ctx, ndb, nu))
+			},
+			std: func() {
+				su.ID, su.CreatedAt, su.UpdatedAt = 0, time.Time{}, time.Time{}
+				fatal(Insert(ctx, sdb, su))
+			},
+		}
+	}
+
+	{ // Update and Delete, exec paths.
+		ln := &loopNative{}
+		ls := &loopDB{}
+		ndb, sdb := ln.open(Postgres), ls.open(Postgres)
+		nu := &perfUser{ID: 1, Email: "u@example.com", Age: 30, CreatedAt: testNow, UpdatedAt: testNow}
+		su := &perfUser{ID: 1, Email: "u@example.com", Age: 30, CreatedAt: testNow, UpdatedAt: testNow}
+		legs["update"] = leg{
+			budget: 3,
+			native: func() { fatal(Update(ctx, ndb, nu)) },
+			std:    func() { fatal(Update(ctx, sdb, su)) },
+		}
+		nd := &perfUser{ID: 1}
+		sd := &perfUser{ID: 1}
+		legs["delete"] = leg{
+			budget: 1,
+			native: func() { fatal(Delete(ctx, ndb, nd)) },
+			std:    func() { fatal(Delete(ctx, sdb, sd)) },
+		}
+	}
+
+	{ // Upsert, RETURNING the full row.
+		ln := &loopNative{cols: perfUserCols, rows: [][]any{perfUserNativeRow()}}
+		ls := &loopDB{cols: perfUserCols, rows: [][]driver.Value{perfUserRow()}}
+		ndb, sdb := ln.open(Postgres), ls.open(Postgres)
+		nu := &perfUser{ID: 1, Email: "u@example.com", Age: 30, CreatedAt: testNow, UpdatedAt: testNow}
+		su := &perfUser{ID: 1, Email: "u@example.com", Age: 30, CreatedAt: testNow, UpdatedAt: testNow}
+		opts := []UpsertOption{OnConflict("email"), DoUpdate("age")}
+		legs["upsert"] = leg{
+			budget: 10,
+			native: func() { fatal(Upsert(ctx, ndb, nu, opts...)) },
+			std:    func() { fatal(Upsert(ctx, sdb, su, opts...)) },
+		}
+	}
+
+	for name, l := range legs {
+		nat := testing.AllocsPerRun(300, l.native)
+		std := testing.AllocsPerRun(300, l.std)
+		if nat > l.budget {
+			t.Errorf("%s: native %.0f allocs/op exceeds the pinned %.0f budget", name, nat, l.budget)
+		}
+		if nat > std {
+			t.Errorf("%s: native %.0f allocs/op exceeds the stdlib channel's %.0f — the channel exists to cost less", name, nat, std)
+		}
+		t.Logf("%-8s native=%.0f stdlib=%.0f", name, nat, std)
 	}
 }
 

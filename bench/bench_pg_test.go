@@ -88,10 +88,38 @@ func benchPGGorm(b *testing.B) *gorm.DB {
 	return gdb
 }
 
+// benchPGNative opens the third tier — the pgx-native channel — over the
+// same schema the stdlib legs use (benchPGRaw owns DDL and seeding).
+func benchPGNative(b *testing.B, raw *sql.DB) *rio.DB {
+	b.Helper()
+	_ = raw // schema owner; queries below run natively over their own pool
+	db, err := riopostgres.OpenNative(context.Background(), pgDSN(b))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
 func BenchmarkPGReadOne_Rio(b *testing.B) {
 	raw := benchPGRaw(b)
 	seedPG(b, raw, 100)
 	db := riopostgres.New(raw)
+	ctx := context.Background()
+	q := rio.MustCompile[BenchUser](rio.From[BenchUser]().Where("id = ?").Limit(1))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := q.First(ctx, db, int64(i%100+1)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkPGReadOne_RioNative(b *testing.B) {
+	raw := benchPGRaw(b)
+	seedPG(b, raw, 100)
+	db := benchPGNative(b, raw)
 	ctx := context.Background()
 	q := rio.MustCompile[BenchUser](rio.From[BenchUser]().Where("id = ?").Limit(1))
 	b.ReportAllocs()
@@ -197,6 +225,22 @@ func BenchmarkPGReadHundred_Rio(b *testing.B) {
 	}
 }
 
+func BenchmarkPGReadHundred_RioNative(b *testing.B) {
+	raw := benchPGRaw(b)
+	seedPG(b, raw, 100)
+	db := benchPGNative(b, raw)
+	ctx := context.Background()
+	q := rio.MustCompile[BenchUser](rio.From[BenchUser]().Where("age >= ?"))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rows, err := q.All(ctx, db, 0)
+		if err != nil || len(rows) != 100 {
+			b.Fatalf("%v %d", err, len(rows))
+		}
+	}
+}
+
 func BenchmarkPGReadHundred_Stdlib(b *testing.B) {
 	raw := benchPGRaw(b)
 	seedPG(b, raw, 100)
@@ -239,6 +283,20 @@ func BenchmarkPGReadHundred_Gorm(b *testing.B) {
 func BenchmarkPGInsert_Rio(b *testing.B) {
 	raw := benchPGRaw(b)
 	db := riopostgres.New(raw)
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		u := BenchUser{Email: "x@example.com", Age: 30}
+		if err := rio.Insert(ctx, db, &u); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkPGInsert_RioNative(b *testing.B) {
+	raw := benchPGRaw(b)
+	db := benchPGNative(b, raw)
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -297,6 +355,25 @@ func BenchmarkPGUpdate_Rio(b *testing.B) {
 	}
 }
 
+func BenchmarkPGUpdate_RioNative(b *testing.B) {
+	raw := benchPGRaw(b)
+	seedPG(b, raw, 100)
+	db := benchPGNative(b, raw)
+	ctx := context.Background()
+	u, err := rio.Find[BenchUser](ctx, db, 1)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		u.Age = 20 + i%50
+		if err := rio.Update(ctx, db, u); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkPGUpdate_Stdlib(b *testing.B) {
 	raw := benchPGRaw(b)
 	seedPG(b, raw, 100)
@@ -333,6 +410,23 @@ func BenchmarkPGUpdate_Gorm(b *testing.B) {
 func BenchmarkPGInsertBatch100_Rio(b *testing.B) {
 	raw := benchPGRaw(b)
 	db := riopostgres.New(raw)
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rows := make([]BenchUser, 100)
+		for j := range rows {
+			rows[j] = BenchUser{Email: "x@example.com", Age: j}
+		}
+		if err := rio.InsertAll(ctx, db, rows); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkPGInsertBatch100_RioNative(b *testing.B) {
+	raw := benchPGRaw(b)
+	db := benchPGNative(b, raw)
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()

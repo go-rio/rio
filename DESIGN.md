@@ -42,11 +42,19 @@ One pipeline with an explicit cache key per stage:
 
 Four layers inside `github.com/go-rio/rio`:
 
-1. **Execution kernel** — wraps `database/sql`. `*rio.DB`, `*rio.Tx`, and the
-   `rio.Queryer` interface both implement (DAO code works inside and outside
-   transactions unchanged). `Unwrap()` on both exposes the underlying handle;
-   rio never wraps or replaces the connection pool (Prisma spent 2025 undoing
-   its self-built engine and pool).
+1. **Execution kernel** — two engines behind one opaque `Queryer`: the
+   default engine wraps `database/sql`; the PostgreSQL driver module can
+   supply a pgx-native engine (`postgres.OpenNative`) that keeps every rio
+   semantic and drops the `driver.Value` boxing tax. `*rio.DB`, `*rio.Tx`,
+   and the `rio.Queryer` interface both implement (DAO code works inside and
+   outside transactions unchanged, on either engine). `Unwrap()` exposes the
+   underlying `*sql.DB` on both — the native engine carries a `database/sql`
+   view of the same pool. rio still never *builds* a connection pool of its
+   own: pooling always belongs to the platform layer, `database/sql`'s pool
+   or pgx's `pgxpool` (Prisma spent 2025 undoing its self-built engine and
+   pool; adopting the driver's own pool is the opposite move — less machinery
+   in the ORM, not more). And rio never *tunes* either pool — configure the
+   one you constructed.
 2. **SQL layer** — per-statement renderers, dialect grammars, the `?`
    placeholder rebinder with per-dialect lexer profiles, `IN (?)` slice
    expansion (expand first, renumber second). Dialects are an *opaque*
@@ -154,7 +162,10 @@ Most application SQL is fixed in shape; only parameters vary. Three tiers:
    not change result type") evict and propagate — never auto-retry. Off by
    default because of PgBouncer transaction pooling (GORM #5908's lesson);
    independent of MustCompile so compiled queries never smuggle prepared
-   statements past a pooler.
+   statements past a pooler. On the native channel it panics at
+   construction: there are no `database/sql` prepared statements there —
+   statement caching belongs to pgx's query exec mode (the DSN parameter
+   `default_query_exec_mode`, caching by default).
 
 ## Model mapping
 
@@ -362,6 +373,17 @@ it is missing plan caches and sloppy string assembly.
   +5 (PostgreSQL) / +5 (MySQL), asserted at those budgets. ClickHouse rides
   the same paths (Find +1, Insert +1): its capability checks are early-exit
   branches, so the three older dialects' budgets did not move when it landed.
+- The pgx-native channel (`postgres.OpenNative`) removes the `driver.Value`
+  boxing layer entirely: decoded values flow from pgtype's typed scanner
+  interfaces into typed sinks on the same cells (`NativeCell`), sharing the
+  stdlib channel's store helpers so the two channels cannot drift. Measured
+  on loopback PostgreSQL (bench/bench_pg_test.go, median of 3): the 100-row
+  read drops from 433 to 124 allocs/op (−71%, B/op −20%), single-row Find
+  30→18, Insert 19→14, Update 9→6 — while pgx's own `CollectRows` idiom
+  costs ~316 allocs on the same shape. Channel-only counts are pinned on a
+  deterministic fake driver (TestNativeAllocBudget: Find 4, 100-row All 11,
+  Insert 5, Update 3, Delete 1, Upsert 10), with the invariant that native
+  never allocates more than stdlib for the same call.
 - Benchmarks in-repo against hand-written database/sql (fake driver in
   perf_test.go isolates rio's own overhead; bench/ adds real SQLite and a
   GORM comparison, the source of the README numbers). Honest methodology or

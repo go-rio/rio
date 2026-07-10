@@ -18,7 +18,10 @@
 // (go-rio/postgres, go-rio/mysql, go-rio/sqlite) or by rio.New, and equally
 // the *rio.Tx inside DB.Tx, so data-access code runs unchanged in and out of
 // transactions (nested Tx calls become savepoints). Placeholders are always
-// ?, rebound per dialect; IN (?) expands slices.
+// ?, rebound per dialect; IN (?) expands slices. On PostgreSQL the driver
+// module offers three execution tiers behind this same API — database/sql
+// (Open), pgxpool with database/sql queries (OpenPool), and fully pgx-native
+// (OpenNative, the fastest read path); see go-rio/postgres for the table.
 //
 // Reading starts at From, Find, and the builder's All, First, Sole, Count,
 // and Exists. Writes are immediate and explicit: Insert, InsertAll, Update
