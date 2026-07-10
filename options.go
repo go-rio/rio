@@ -31,13 +31,21 @@ type Option func(*config)
 // executes — entity CRUD, builder queries, compiled queries, Raw, and
 // transaction control — and cannot alter them.
 func WithQueryHook(h QueryHook) Option {
-	return func(c *config) { c.hooks = append(c.hooks, h) }
+	return func(c *config) {
+		if h != nil {
+			c.hooks = append(c.hooks, h)
+		}
+	}
 }
 
 // WithClock replaces the time source used for CreatedAt/UpdatedAt and soft
 // deletes. Intended for tests.
 func WithClock(now func() time.Time) Option {
-	return func(c *config) { c.clock = now }
+	return func(c *config) {
+		if now != nil {
+			c.clock = now
+		}
+	}
 }
 
 // WithErrorTranslator installs a driver-specific error translator, mapping

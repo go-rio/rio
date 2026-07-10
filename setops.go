@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 )
 
@@ -102,6 +103,10 @@ func (q Query[T]) UpdateAll(ctx context.Context, db Queryer, set Set) (int64, er
 		}
 		b = append(b, '?')
 		if f.jsonCol {
+			if v == nil || (reflect.TypeOf(v).Kind() == reflect.Pointer && reflect.ValueOf(v).IsNil()) {
+				args = append(args, nil)
+				continue
+			}
 			// JSON columns take Go values and marshal like entity writes.
 			data, err := json.Marshal(v)
 			if err != nil {

@@ -352,6 +352,29 @@ func TestInsertAllMixedIDsRefused(t *testing.T) {
 	}
 }
 
+func TestUpsertAllMySQLUsesRowAlias(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(MySQL)
+	f.queueExec(0, 2)
+
+	rows := []User{{ID: 1, Email: "a@x"}, {ID: 2, Email: "b@x"}}
+	if err := UpsertAll(context.Background(), db, rows, OnConflict("email"), DoUpdate("age")); err != nil {
+		t.Fatalf("UpsertAll: %v", err)
+	}
+	got := f.logged()[0]
+	for _, frag := range []string{
+		"VALUES (?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?) AS _rio_new ON DUPLICATE KEY UPDATE",
+		"`age` = _rio_new.`age`",
+	} {
+		if !strings.Contains(got, frag) {
+			t.Fatalf("missing %q in:\n%s", frag, got)
+		}
+	}
+	if strings.Contains(got, "VALUES(`") {
+		t.Fatalf("mysql upsert must not use deprecated VALUES(col): %s", got)
+	}
+}
+
 func TestUpsertRestoresSoftDeleted(t *testing.T) {
 	f := newFakeDB()
 	db := f.open(SQLite)
@@ -397,8 +420,8 @@ func TestUpsertMySQLForm(t *testing.T) {
 		t.Fatalf("mysql renders ON DUPLICATE KEY: %s", got)
 	}
 	for _, frag := range []string{
-		"ON DUPLICATE KEY UPDATE `age` = VALUES(`age`)",
-		"`version` = `version` + 1",
+		"AS _rio_new ON DUPLICATE KEY UPDATE `age` = _rio_new.`age`",
+		"`version` = `users`.`version` + 1",
 		"`deleted_at` = NULL",
 	} {
 		if !strings.Contains(got, frag) {
@@ -407,6 +430,41 @@ func TestUpsertMySQLForm(t *testing.T) {
 	}
 	if u.ID != 5 {
 		t.Fatalf("insert path backfills LastInsertId: %d", u.ID)
+	}
+}
+
+func TestUpsertClearsSoftDeleteBeforeInsertValues(t *testing.T) {
+	ctx := context.Background()
+	deleted := testNow.Add(-time.Hour)
+
+	f := newFakeDB()
+	db := f.open(MySQL)
+	f.queueExec(5, 1)
+	row := &User{Email: "a@x", DeletedAt: &deleted}
+	if err := Upsert(ctx, db, row, OnConflict("email"), DoUpdate("age")); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if row.DeletedAt != nil && !row.DeletedAt.IsZero() {
+		t.Fatalf("non-KeepTrashed upsert must clear in-memory deleted_at before bind, got %v", row.DeletedAt)
+	}
+	args := f.loggedContaining("INSERT")[0].args
+	if args[4] != nil {
+		t.Fatalf("non-KeepTrashed upsert must bind deleted_at as NULL, got %#v", args[4])
+	}
+
+	f = newFakeDB()
+	db = f.open(MySQL)
+	f.queueExec(5, 1)
+	row = &User{Email: "a@x", DeletedAt: &deleted}
+	if err := Upsert(ctx, db, row, OnConflict("email"), DoUpdate("age"), KeepTrashed()); err != nil {
+		t.Fatalf("Upsert KeepTrashed: %v", err)
+	}
+	if row.DeletedAt == nil || row.DeletedAt.IsZero() {
+		t.Fatal("KeepTrashed upsert must preserve in-memory deleted_at")
+	}
+	args = f.loggedContaining("INSERT")[0].args
+	if args[4] == nil {
+		t.Fatal("KeepTrashed upsert must bind the deleted_at value")
 	}
 }
 

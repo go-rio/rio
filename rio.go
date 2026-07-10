@@ -44,6 +44,12 @@ type DB struct {
 // go-rio/sqlite) call this for you and add driver-specific error translation;
 // use New directly when you bring your own driver.
 func New(db *sql.DB, dialect Dialect, opts ...Option) *DB {
+	if db == nil {
+		panic("rio: New: db must not be nil")
+	}
+	if dialect == nil {
+		panic("rio: New: dialect must not be nil")
+	}
 	cfg := defaultConfig()
 	for _, opt := range opts {
 		opt(cfg)

@@ -45,6 +45,8 @@ type QueryHook interface {
 func (c *config) beforeQuery(ctx context.Context, e *QueryEvent) context.Context {
 	if !c.logArgs {
 		e.Args = nil
+	} else {
+		e.Args = cloneEventArgs(e.Args)
 	}
 	for _, h := range c.hooks {
 		ctx = h.BeforeQuery(ctx, e)
@@ -62,4 +64,18 @@ func (c *config) afterQuery(ctx context.Context, e *QueryEvent, start time.Time,
 	for i := len(c.hooks) - 1; i >= 0; i-- {
 		c.hooks[i].AfterQuery(ctx, e)
 	}
+}
+
+func cloneEventArgs(args []any) []any {
+	if len(args) == 0 {
+		return nil
+	}
+	out := append([]any(nil), args...)
+	for i, a := range out {
+		if b, ok := a.([]byte); ok && b != nil {
+			cp := append([]byte(nil), b...)
+			out[i] = cp
+		}
+	}
+	return out
 }

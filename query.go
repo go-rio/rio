@@ -501,7 +501,10 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 	}
 	switch shape {
 	case selectRows:
-		b = appendLimitOffset(b, d, s)
+		b, err = appendLimitOffset(b, d, s)
+		if err != nil {
+			return "", nil, err
+		}
 	case selectExists:
 		// Existence needs exactly one probe row; user LIMIT/OFFSET would be
 		// meaningless here and doubling LIMIT clauses is invalid SQL.
@@ -520,7 +523,13 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 // appendLimitOffset renders LIMIT/OFFSET. PostgreSQL accepts a bare OFFSET;
 // MySQL and SQLite require a LIMIT before it, so one is synthesized with the
 // dialect's "no limit" spelling.
-func appendLimitOffset(b []byte, d Dialect, s *queryState) []byte {
+func appendLimitOffset(b []byte, d Dialect, s *queryState) ([]byte, error) {
+	if s.limitSet && s.limit < 0 {
+		return nil, fmt.Errorf("rio: Limit requires a non-negative value, got %d", s.limit)
+	}
+	if s.offsetSet && s.offset < 0 {
+		return nil, fmt.Errorf("rio: Offset requires a non-negative value, got %d", s.offset)
+	}
 	if s.limitSet {
 		b = append(b, " LIMIT "...)
 		b = strconv.AppendInt(b, int64(s.limit), 10)
@@ -536,7 +545,7 @@ func appendLimitOffset(b []byte, d Dialect, s *queryState) []byte {
 		b = append(b, " OFFSET "...)
 		b = strconv.AppendInt(b, int64(s.offset), 10)
 	}
-	return b
+	return b, nil
 }
 
 // renderWhere renders user conditions, EXISTS relation filters, and the
@@ -847,7 +856,10 @@ func Pluck[V any, T any](ctx context.Context, db Queryer, q Query[T], column str
 			b = append(b, o...)
 		}
 	}
-	b = appendLimitOffset(b, d, &q.s)
+	b, err = appendLimitOffset(b, d, &q.s)
+	if err != nil {
+		return nil, err
+	}
 	if q.s.forUpdate && d.caps().forUpdate {
 		b = append(b, " FOR UPDATE"...)
 	}

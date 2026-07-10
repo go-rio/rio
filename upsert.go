@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"time"
 	"unsafe"
 )
 
@@ -41,7 +42,8 @@ func DoNothing() UpsertOption {
 
 // KeepTrashed opts out of the restore-on-upsert invariant: with it, an
 // upsert hitting a soft-deleted row updates the tombstone without clearing
-// deleted_at — and the row stays invisible to default queries.
+// deleted_at — and the row stays invisible to default queries. On an insert
+// path, KeepTrashed also preserves an explicitly set deleted_at value.
 func KeepTrashed() UpsertOption {
 	return func(s *upsertSpec) { s.keepTrashed = true }
 }
@@ -64,10 +66,11 @@ func KeepTrashed() UpsertOption {
 // PostgreSQL/SQLite.
 //
 // Soft-delete invariant: a successful DoUpdate upsert leaves the row visible
-// — deleted_at is cleared unless KeepTrashed is given. The explicit
-// softdelete tag opted the model into deletion semantics; resurrect-on-upsert
-// is its consistent extension (the alternative is Eloquent's famous trap:
-// "upsert succeeded but the row is invisible").
+// — deleted_at is cleared on the inserted values and conflict update unless
+// KeepTrashed is given. The explicit softdelete tag opted the model into
+// deletion semantics; resurrect-on-upsert is its consistent extension (the
+// alternative is Eloquent's famous trap: "upsert succeeded but the row is
+// invisible").
 func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption) error {
 	var spec upsertSpec
 	for _, opt := range opts {
@@ -88,9 +91,12 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 		return errors.New("rio: Upsert with DoUpdate needs OnConflict(columns...) naming the unique index")
 	}
 
-	rv := reflect.ValueOf(row).Elem()
+	rv, err := rowValue("Upsert", row)
+	if err != nil {
+		return err
+	}
 	now := normalizeTime(db.conf().clock())
-	stampForInsert(p, rv, now)
+	prepareUpsertRow(p, rv, &spec, now)
 	cols, back, args, _, _, err := insertColumns(p, rv, d, now)
 	if err != nil {
 		return err
@@ -170,8 +176,9 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 		return err
 	}
 
-	// MySQL: ON DUPLICATE KEY UPDATE. VALUES(col) refers to the would-be
-	// inserted value; a bare column name refers to the existing row.
+	// MySQL: ON DUPLICATE KEY UPDATE. The VALUES() function for referring to
+	// the would-be inserted row is deprecated, so rio always names that row.
+	b = appendMySQLUpsertAlias(b)
 	b = append(b, " ON DUPLICATE KEY UPDATE "...)
 	if spec.doNothing {
 		// A no-op assignment needs some column; models without a PK still
@@ -184,7 +191,7 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 		b = append(b, " = "...)
 		b = d.quote(b, col)
 	} else {
-		b = appendConflictSets(b, d, table, p, update, &spec, "")
+		b = appendConflictSets(b, d, table, p, update, &spec, mysqlUpsertAlias)
 	}
 	sqlText, outArgs, err := finishSQL(d, b, args)
 	if err != nil {
@@ -194,18 +201,25 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 	if err != nil {
 		return err
 	}
-	// MySQL reports 1 row affected for a fresh insert, 2 for an update.
+	// MySQL reports 1 row affected for a fresh insert, 2 for a changed
+	// conflict update, and 0 for an unchanged conflict update.
 	if n, aerr := res.RowsAffected(); aerr == nil && n == 1 {
 		return fillLastInsertID(p, rv, res.LastInsertId)
-	} else if aerr == nil && n != 1 && !spec.doNothing && p.softDel != nil && !spec.keepTrashed {
-		// The conflict path ran ON DUPLICATE KEY UPDATE ... deleted_at = NULL,
-		// so the row is visible now; reconcile the in-memory value rio knows
-		// it wrote (the version, incremented server-side, it cannot know —
-		// see the doc). Keeps the restore-on-upsert invariant true in memory
-		// on MySQL, matching the RETURNING dialects.
-		clearTime(p.softDel, rv)
 	}
 	return nil
+}
+
+const mysqlUpsertAlias = "_rio_new"
+
+func appendMySQLUpsertAlias(b []byte) []byte {
+	return append(b, " AS "+mysqlUpsertAlias...)
+}
+
+func prepareUpsertRow(p *plan, rv reflect.Value, spec *upsertSpec, now time.Time) {
+	stampForInsert(p, rv, now)
+	if p.softDel != nil && !spec.doNothing && !spec.keepTrashed {
+		clearTime(p.softDel, rv)
+	}
 }
 
 // upsertUpdateSet resolves the DoUpdate whitelist (or derives the default:
@@ -268,8 +282,8 @@ func appendConflictClause(b []byte, d Dialect, spec *upsertSpec) []byte {
 	return append(b, ") "...)
 }
 
-// appendConflictSets renders the DO UPDATE SET list. newRow is "excluded"
-// for PG/SQLite; empty selects MySQL's VALUES(col) form.
+// appendConflictSets renders the DO UPDATE SET list. newRow is "excluded" for
+// PG/SQLite and mysqlUpsertAlias for MySQL.
 func appendConflictSets(b []byte, d Dialect, table string, p *plan, update []*field, spec *upsertSpec, newRow string) []byte {
 	first := true
 	sep := func() {
@@ -279,15 +293,9 @@ func appendConflictSets(b []byte, d Dialect, table string, p *plan, update []*fi
 		first = false
 	}
 	newVal := func(col string) {
-		if newRow != "" {
-			b = append(b, newRow...)
-			b = append(b, '.')
-			b = d.quote(b, col)
-		} else {
-			b = append(b, "VALUES("...)
-			b = d.quote(b, col)
-			b = append(b, ')')
-		}
+		b = append(b, newRow...)
+		b = append(b, '.')
+		b = d.quote(b, col)
 	}
 	for _, f := range update {
 		sep()

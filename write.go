@@ -22,7 +22,10 @@ func Insert[T any](ctx context.Context, db Queryer, row *T) error {
 	if err != nil {
 		return err
 	}
-	rv := reflect.ValueOf(row).Elem()
+	rv, err := rowValue("Insert", row)
+	if err != nil {
+		return err
+	}
 	g := db.gram()
 	d := g.d
 	now := normalizeTime(db.conf().clock())
@@ -80,7 +83,10 @@ func Update[T any](ctx context.Context, db Queryer, row *T, cols ...string) erro
 	if len(p.pks) == 0 {
 		return fmt.Errorf("%w: %s", ErrNoPrimaryKey, p.structName)
 	}
-	rv := reflect.ValueOf(row).Elem()
+	rv, err := rowValue("Update", row)
+	if err != nil {
+		return err
+	}
 	g := db.gram()
 	d := g.d
 	now := normalizeTime(db.conf().clock())
@@ -174,7 +180,10 @@ func ForceDelete[T any](ctx context.Context, db Queryer, row *T) error {
 }
 
 func softDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
-	rv := reflect.ValueOf(row).Elem()
+	rv, err := rowValue("Delete", row)
+	if err != nil {
+		return err
+	}
 	if len(p.pks) == 0 {
 		return fmt.Errorf("%w: %s", ErrNoPrimaryKey, p.structName)
 	}
@@ -246,7 +255,10 @@ func softDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 }
 
 func hardDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
-	rv := reflect.ValueOf(row).Elem()
+	rv, err := rowValue("Delete", row)
+	if err != nil {
+		return err
+	}
 	if len(p.pks) == 0 {
 		return fmt.Errorf("%w: %s", ErrNoPrimaryKey, p.structName)
 	}
@@ -326,10 +338,10 @@ func updateSet(p *plan, cols []string) ([]*field, error) {
 // stampForInsert fills zero timestamps and a zero version before binding.
 func stampForInsert(p *plan, rv reflect.Value, now time.Time) {
 	base := rv.Addr().UnsafePointer()
-	if p.created != nil && fieldIsZero(p.created, base, rv) {
+	if p.created != nil && stampFieldIsZero(p.created, base, rv) {
 		setTime(p.created, rv, now)
 	}
-	if p.updated != nil && fieldIsZero(p.updated, base, rv) {
+	if p.updated != nil && stampFieldIsZero(p.updated, base, rv) {
 		setTime(p.updated, rv, now)
 	}
 	if p.version != nil {
@@ -342,6 +354,14 @@ func stampForInsert(p *plan, rv reflect.Value, now time.Time) {
 			}
 		}
 	}
+}
+
+func stampFieldIsZero(f *field, base unsafe.Pointer, rv reflect.Value) bool {
+	if f.typ == timePtrType {
+		v := rv.FieldByIndex(f.index)
+		return v.IsNil() || v.Elem().IsZero()
+	}
+	return fieldIsZero(f, base, rv)
 }
 
 func setTime(f *field, rv reflect.Value, now time.Time) {
@@ -370,6 +390,13 @@ func isUintKind(k reflect.Kind) bool {
 		return true
 	}
 	return false
+}
+
+func rowValue[T any](op string, row *T) (reflect.Value, error) {
+	if row == nil {
+		return reflect.Value{}, fmt.Errorf("rio: %s: row must not be nil", op)
+	}
+	return reflect.ValueOf(row).Elem(), nil
 }
 
 // insertColumns picks the columns for one row's INSERT and binds their
@@ -561,11 +588,11 @@ func appendPKWhereSQL(b []byte, d Dialect, p *plan) []byte {
 
 // zeroAffectedMeansMissing resolves the n==0 ambiguity for versionless
 // UPDATE-shaped writes. PostgreSQL and SQLite count matched rows, so zero
-// means the row is gone. MySQL counts changed rows (and rio must not flip
-// CLIENT_FOUND_ROWS: Upsert's insert/update discrimination depends on the
-// default ON DUPLICATE KEY counts), so an idempotent UPDATE also reports 0 —
-// one extra primary-key probe, only on this ambiguous path, keeps the
-// ErrNotFound contract identical on all three dialects.
+// means the row is gone. MySQL normally counts changed rows, so an idempotent
+// UPDATE can also report 0; one extra primary-key probe, only on this
+// ambiguous path, keeps the ErrNotFound contract identical on all three
+// dialects. If the connection uses CLIENT_FOUND_ROWS, matched idempotent
+// updates report nonzero and simply skip this probe.
 func zeroAffectedMeansMissing(ctx context.Context, db Queryer, p *plan, rv reflect.Value) (bool, error) {
 	g := db.gram()
 	if g.d.name() != "mysql" {
@@ -663,7 +690,10 @@ func Restore[T any](ctx context.Context, db Queryer, row *T) error {
 	if len(p.pks) == 0 {
 		return fmt.Errorf("%w: %s", ErrNoPrimaryKey, p.structName)
 	}
-	rv := reflect.ValueOf(row).Elem()
+	rv, err := rowValue("Restore", row)
+	if err != nil {
+		return err
+	}
 	g := db.gram()
 	d := g.d
 	now := normalizeTime(db.conf().clock())

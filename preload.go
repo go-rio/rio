@@ -287,10 +287,12 @@ func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, r
 				}
 			}
 		}
-		chunk := db.gram().d.caps().maxBindParams - relArgs
-		if chunk < 1 {
-			chunk = 1
+		limit := db.gram().d.caps().maxBindParams
+		if relArgs >= limit {
+			return fmt.Errorf("rio: preload relation %s.%s uses %d bind parameter(s) in RelWhere, leaving none for parent keys (dialect limit %d)",
+				owner.structName, rel.name, relArgs, limit)
 		}
+		chunk := limit - relArgs
 		for start := 0; start < len(keys); start += chunk {
 			end := min(start+chunk, len(keys))
 			sqlText, args, keyed, err := renderRelSelect(db.gram(), res, rel.kind, keys[start:end], &rq)
@@ -719,6 +721,9 @@ func scanCounts(rows *sql.Rows, keyType reflect.Type, byKey map[any]int64) error
 // partition, the outer one keeps the first N and projects exactly the entity
 // columns (plus the join key) — the row number never leaves the subquery.
 func renderRelSelectLimited(g *grammar, res *resolvedRel, kind relKind, keys []any, rq *relQuery) (string, []any, bool, error) {
+	if rq.limit < 0 {
+		return "", nil, false, fmt.Errorf("rio: RelLimit requires a non-negative value, got %d", rq.limit)
+	}
 	d := g.d
 	target := res.target
 	table := g.table(target)

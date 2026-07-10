@@ -15,9 +15,10 @@ import (
 // fieldCodec is the per-field scan/bind strategy, decided once at plan time
 // so row scanning does zero classification work.
 type fieldCodec struct {
-	kind       scanKind
-	bits       int  // integer/float width for overflow checks
-	bindValuer bool // basic kind that also implements driver.Valuer: bind through Value()
+	kind          scanKind
+	bits          int  // integer/float width for overflow checks
+	bindValuer    bool // bind the field value itself so Value() runs
+	bindPtrValuer bool // bind the field address so pointer-receiver Value() runs
 }
 
 type scanKind uint8
@@ -57,7 +58,7 @@ func codecFor(f *field) (fieldCodec, error) {
 		if _, err := basicCodec(elem, f); err != nil {
 			return fieldCodec{}, fmt.Errorf("field %s: unsupported pointer type %s", f.name, t)
 		}
-		return fieldCodec{kind: scanPtr}, nil
+		return fieldCodec{kind: scanPtr, bindValuer: t.Implements(valuerType)}, nil
 	}
 	c, err := basicCodec(t, f)
 	if err != nil {
@@ -70,6 +71,8 @@ func codecFor(f *field) (fieldCodec, error) {
 	// form. (Scanner types are handled above and bind correctly via reflect.)
 	if t.Implements(valuerType) {
 		c.bindValuer = true
+	} else if reflect.PointerTo(t).Implements(valuerType) {
+		c.bindPtrValuer = true
 	}
 	return c, nil
 }
@@ -483,6 +486,9 @@ func namedFields(rows *sql.Rows, p *plan) ([]*field, error) {
 		if !ok {
 			return nil, fmt.Errorf("rio: no field of %s maps to result column %q", p.structName, c)
 		}
+		if seen[c] {
+			return nil, fmt.Errorf("rio: result column %q appears more than once for %s; use distinct aliases", c, p.structName)
+		}
 		fields[i] = f
 		seen[c] = true
 	}
@@ -680,7 +686,7 @@ func zeroFast(f *field, base unsafe.Pointer) (isZero, ok bool) {
 // skips the fast path so bindArg hands the driver the value itself, letting
 // Value() run.
 func fieldValue(f *field, base unsafe.Pointer, rv reflect.Value, d Dialect) (any, error) {
-	if !f.code.bindValuer {
+	if !f.code.bindValuer && !f.code.bindPtrValuer {
 		if a, ok, err := bindArgFast(f, base, d); ok {
 			return a, err
 		}
@@ -732,7 +738,13 @@ func bindArg(f *field, v reflect.Value, d Dialect) (any, error) {
 	if f.code.bindValuer {
 		// Hand the driver the value itself so its Value() runs; skip the
 		// numeric/time normalization below, which would strip the type.
+		if v.Kind() == reflect.Pointer && v.IsNil() {
+			return nil, nil
+		}
 		return v.Interface(), nil
+	}
+	if f.code.bindPtrValuer && v.CanAddr() {
+		return v.Addr().Interface(), nil
 	}
 	if v.Kind() == reflect.Pointer {
 		if v.IsNil() {

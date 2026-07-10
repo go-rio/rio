@@ -185,6 +185,86 @@ func TestQueryHookArgRedaction(t *testing.T) {
 	}
 }
 
+type mutatingHook struct{}
+
+func (mutatingHook) BeforeQuery(ctx context.Context, e *QueryEvent) context.Context {
+	e.Args[0] = "mutated"
+	e.Args[1].([]byte)[0] = 'z'
+	return ctx
+}
+
+func (mutatingHook) AfterQuery(context.Context, *QueryEvent) {}
+
+func TestQueryHookCannotMutateExecutedArgs(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.openWith(SQLite, WithQueryHook(mutatingHook{}))
+
+	payload := []byte("abc")
+	if _, err := Exec(ctx, db, "INSERT INTO audit VALUES (?, ?)", "original", payload); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	args := f.logged()[0]
+	stmt := f.loggedContaining("INSERT")[0]
+	if stmt.args[0] != "original" {
+		t.Fatalf("hook mutation reached executed scalar arg: %#v", stmt.args[0])
+	}
+	if got := string(stmt.args[1].([]byte)); got != "abc" {
+		t.Fatalf("hook mutation reached executed []byte arg: %q", got)
+	}
+	if args == "" {
+		t.Fatal("statement was not logged")
+	}
+}
+
+func TestNilHookAndClockOptionsAreIgnored(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.openWith(SQLite, WithQueryHook(nil), WithClock(nil))
+
+	f.queueRows(userCols)
+	if _, err := From[User]().All(ctx, db); err != nil {
+		t.Fatalf("nil options must not poison later queries: %v", err)
+	}
+}
+
+func TestNewRejectsNilInputs(t *testing.T) {
+	mustPanic := func(name string, fn func()) {
+		t.Helper()
+		defer func() {
+			if recover() == nil {
+				t.Fatalf("%s: expected panic", name)
+			}
+		}()
+		fn()
+	}
+	mustPanic("nil db", func() { New(nil, SQLite) })
+	mustPanic("nil dialect", func() { New(sql.OpenDB(fakeConnector{newFakeDB()}), nil) })
+}
+
+func TestNilRowsReturnErrors(t *testing.T) {
+	ctx := context.Background()
+	db := newFakeDB().open()
+	var user *User
+	var account *Account
+
+	for name, err := range map[string]error{
+		"Insert":       Insert(ctx, db, user),
+		"Update":       Update(ctx, db, user),
+		"Delete":       Delete(ctx, db, user),
+		"ForceDelete":  ForceDelete(ctx, db, user),
+		"Restore":      Restore(ctx, db, user),
+		"Upsert":       Upsert(ctx, db, user, OnConflict("email")),
+		"Attach":       Attach[Account, int64](ctx, db, account, "Tags", 1),
+		"Detach":       Detach[Account, int64](ctx, db, account, "Tags", 1),
+		"SyncRelation": SyncRelation[Account, int64](ctx, db, account, "Tags", []int64{1}),
+	} {
+		if err == nil || !strings.Contains(err.Error(), "nil") {
+			t.Fatalf("%s must return a nil-row error, got %v", name, err)
+		}
+	}
+}
+
 type hookFunc func(context.Context, *QueryEvent)
 
 func (hookFunc) BeforeQuery(ctx context.Context, _ *QueryEvent) context.Context { return ctx }
@@ -433,6 +513,47 @@ func TestOffsetWithoutLimit(t *testing.T) {
 	}
 }
 
+func TestNegativeLimitOffsetRejected(t *testing.T) {
+	ctx := context.Background()
+	db := newFakeDB().open(SQLite)
+
+	if _, err := From[User]().Limit(-1).All(ctx, db); err == nil || !strings.Contains(err.Error(), "Limit") {
+		t.Fatalf("negative Limit must be refused: %v", err)
+	}
+	if _, err := From[User]().Offset(-1).All(ctx, db); err == nil || !strings.Contains(err.Error(), "Offset") {
+		t.Fatalf("negative Offset must be refused: %v", err)
+	}
+	if _, err := Pluck[string](ctx, db, From[User]().Limit(-2), "email"); err == nil || !strings.Contains(err.Error(), "Limit") {
+		t.Fatalf("negative Limit in Pluck must be refused: %v", err)
+	}
+
+	f := newFakeDB()
+	db = f.open(SQLite)
+	f.queueRows(userCols, userRow(1, "a@x"))
+	if _, err := From[User]().With("Posts", RelLimit(-1)).All(ctx, db); err == nil || !strings.Contains(err.Error(), "RelLimit") {
+		t.Fatalf("negative RelLimit must be refused: %v", err)
+	}
+}
+
+func TestPreloadRelWhereBindLimit(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueRows(userCols, userRow(1, "a@x"))
+	titles := make([]string, 999)
+	for i := range titles {
+		titles[i] = "x"
+	}
+
+	_, err := From[User]().With("Posts", RelWhere("title IN (?)", titles)).All(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "leaving none for parent keys") {
+		t.Fatalf("RelWhere exhausting bind limit must fail clearly: %v", err)
+	}
+	if len(f.logged()) != 1 {
+		t.Fatalf("relation query must not execute after bind-limit error: %v", f.logged())
+	}
+}
+
 // Audit: Exists on a query that already had LIMIT/OFFSET doubled the LIMIT.
 func TestExistsIgnoresUserLimit(t *testing.T) {
 	ctx := context.Background()
@@ -525,6 +646,22 @@ func TestRawPartialEntityRefused(t *testing.T) {
 	_, err := Raw[User]("SELECT id, email FROM users").All(ctx, db)
 	if err == nil || !strings.Contains(err.Error(), "DTO") {
 		t.Fatalf("partial entity scan must error with guidance: %v", err)
+	}
+}
+
+type RawDuplicateColumn struct {
+	Email string
+}
+
+func TestRawDuplicateColumnsRefused(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"email", "email"}, []driver.Value{"first", "second"})
+
+	_, err := Raw[RawDuplicateColumn]("SELECT a AS email, b AS email FROM users").All(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "appears more than once") {
+		t.Fatalf("duplicate Raw result column must be refused: %v", err)
 	}
 }
 
@@ -1064,6 +1201,24 @@ func TestCompileRejectsBareWhereHasPlaceholder(t *testing.T) {
 	}
 }
 
+func TestCompileValidatesWhereHasAndWithCountPaths(t *testing.T) {
+	if _, err := Compile[User](From[User]().WhereHas("Nope")); err == nil || !strings.Contains(err.Error(), "Nope") {
+		t.Fatalf("unknown WhereHas path must fail at compile: %v", err)
+	}
+	if _, err := Compile[Board](From[Board]().WithCount("Nope")); err == nil || !strings.Contains(err.Error(), "Nope") {
+		t.Fatalf("unknown WithCount relation must fail at compile: %v", err)
+	}
+	type PostWithAuthorCount struct {
+		ID          int64
+		UserID      int64
+		Author      BelongsTo[User] `rio:",fk:user_id"`
+		AuthorCount int64           `rio:",countof:Author"`
+	}
+	if _, err := Compile[PostWithAuthorCount](From[PostWithAuthorCount]().WithCount("Author")); err == nil || !strings.Contains(err.Error(), "meaningless") {
+		t.Fatalf("non-aggregate WithCount relation must fail at compile: %v", err)
+	}
+}
+
 // Two models sharing a struct name would emit colliding declarations.
 func TestWriteColumnsRefusesDuplicateModelNames(t *testing.T) {
 	var buf strings.Builder
@@ -1542,6 +1697,16 @@ func TestPointerTimestampsStamped(t *testing.T) {
 	if row.CreatedAt == nil || row.CreatedAt.IsZero() {
 		t.Fatal("*time.Time CreatedAt not stamped")
 	}
+
+	zero := time.Time{}
+	row = PtrStamped{Name: "zero", CreatedAt: &zero, UpdatedAt: &zero}
+	f.queueExec(1, 1)
+	if err := Insert(ctx, db, &row); err != nil {
+		t.Fatalf("insert zero pointer: %v", err)
+	}
+	if row.CreatedAt == nil || row.CreatedAt.IsZero() || row.UpdatedAt == nil || row.UpdatedAt.IsZero() {
+		t.Fatal("*time.Time fields pointing at zero time must be stamped")
+	}
 }
 
 // Two fields both claiming the CreatedAt role (reachable via embedding + a
@@ -1633,6 +1798,31 @@ func TestUpdateAllRefusesSliceSetValue(t *testing.T) {
 	_, err := From[User]().Where("id = ?", 1).UpdateAll(ctx, db, Set{"email": []string{"a", "b"}})
 	if err == nil || !strings.Contains(err.Error(), "slice") {
 		t.Fatalf("slice Set value must be refused: %v", err)
+	}
+}
+
+func TestUpdateAllJSONNilBindsSQLNull(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueExec(0, 1)
+
+	if _, err := From[Doc]().Where("id = ?", 1).UpdateAll(ctx, db, Set{"config": nil}); err != nil {
+		t.Fatalf("UpdateAll json nil: %v", err)
+	}
+	stmt := f.loggedContaining("UPDATE")[0]
+	if stmt.args[0] != nil {
+		t.Fatalf("nil JSON Set value must bind SQL NULL, got %#v", stmt.args[0])
+	}
+
+	f.queueExec(0, 1)
+	var cfg *Prefs
+	if _, err := From[Doc]().Where("id = ?", 1).UpdateAll(ctx, db, Set{"config": cfg}); err != nil {
+		t.Fatalf("UpdateAll typed nil json pointer: %v", err)
+	}
+	stmt = f.loggedContaining("UPDATE")[1]
+	if stmt.args[0] != nil {
+		t.Fatalf("typed nil JSON pointer must bind SQL NULL, got %#v", stmt.args[0])
 	}
 }
 
@@ -1733,6 +1923,48 @@ func TestValuerBasicFieldBindsThroughValue(t *testing.T) {
 	args := f.loggedContaining("INSERT")[0].args
 	if args[1] != "mixedcase" {
 		t.Fatalf("Valuer must lowercase on write, got %#v", args[1])
+	}
+}
+
+type pointerSecret string
+
+func (s *pointerSecret) Value() (driver.Value, error) {
+	if s == nil {
+		return nil, nil
+	}
+	return "encoded:" + strings.ToLower(string(*s)), nil
+}
+
+type PointerValuerRow struct {
+	ID     int64
+	Secret pointerSecret
+	Maybe  *pointerSecret
+}
+
+func TestPointerReceiverValuerBindsThroughValue(t *testing.T) {
+	p, err := planOf[PointerValuerRow]()
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if !p.byColumn["secret"].code.bindPtrValuer {
+		t.Fatal("value field with pointer-receiver Valuer must be flagged bindPtrValuer")
+	}
+	if !p.byColumn["maybe"].code.bindValuer {
+		t.Fatal("pointer field implementing Valuer must be flagged bindValuer")
+	}
+
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(MySQL)
+	f.queueExec(1, 1)
+	maybe := pointerSecret("Maybe")
+	row := PointerValuerRow{ID: 1, Secret: "Secret", Maybe: &maybe}
+	if err := Insert(ctx, db, &row); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	args := f.loggedContaining("INSERT")[0].args
+	if args[1] != "encoded:secret" || args[2] != "encoded:maybe" {
+		t.Fatalf("pointer receiver Valuer must encode both fields, got %#v", args)
 	}
 }
 

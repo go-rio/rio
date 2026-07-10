@@ -3,7 +3,6 @@ package rio
 import (
 	"context"
 	"fmt"
-	"reflect"
 )
 
 // Attach links rows to a ManyToMany relation by inserting join-table rows —
@@ -187,7 +186,10 @@ func joinWriteTarget[T any](db Queryer, row *T, relation string) (*plan, *relFie
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	rv := reflect.ValueOf(row).Elem()
+	rv, err := rowValue("Attach/Detach", row)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
 	kv := rv.FieldByIndex(res.ref.index)
 	if kv.IsZero() {
 		return nil, nil, nil, nil, fmt.Errorf("rio: Attach/Detach need %s's primary key to be set", p.structName)

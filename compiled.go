@@ -56,6 +56,12 @@ func Compile[T any](q Query[T]) (*Compiled[T], error) {
 	if err := validatePaths(p, q.s.withs); err != nil {
 		return nil, err
 	}
+	if err := validateHasPaths(p, q.s.hasConds); err != nil {
+		return nil, err
+	}
+	if err := validateCounts(p, q.s.counts); err != nil {
+		return nil, err
+	}
 
 	if err := checkHasCondArity(p, &q.s); err != nil {
 		return nil, err
@@ -151,19 +157,51 @@ func hasArgsInHasConds(s *queryState) bool {
 // database, no key resolution (that stays lazy).
 func validatePaths(p *plan, specs []preloadSpec) error {
 	for _, s := range specs {
-		cur := p
-		path := s.path
-		for path != "" {
-			head, tail := splitPath(path)
-			rel, ok := cur.rels[head]
-			if !ok {
-				return fmt.Errorf("rio: %s has no relation %q (path %q)", cur.structName, head, s.path)
-			}
-			next, err := planFor(rel.target)
-			if err != nil {
-				return err
-			}
-			cur, path = next, tail
+		if err := validateRelationPath(p, s.path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateHasPaths(p *plan, conds []hasCond) error {
+	for _, hc := range conds {
+		if err := validateRelationPath(p, hc.path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateRelationPath(p *plan, path string) error {
+	cur := p
+	full := path
+	for path != "" {
+		head, tail := splitPath(path)
+		rel, ok := cur.rels[head]
+		if !ok {
+			return fmt.Errorf("rio: %s has no relation %q (path %q)", cur.structName, head, full)
+		}
+		next, err := planFor(rel.target)
+		if err != nil {
+			return err
+		}
+		cur, path = next, tail
+	}
+	return nil
+}
+
+func validateCounts(p *plan, counts []string) error {
+	for _, name := range counts {
+		rel, ok := p.rels[name]
+		if !ok {
+			return fmt.Errorf("rio: %s has no relation %q", p.structName, name)
+		}
+		if _, ok := p.counts[name]; !ok {
+			return fmt.Errorf("rio: %s has no count target for %q; declare a field tagged `rio:\",countof:%s\"`", p.structName, name, name)
+		}
+		if rel.kind != relHasMany && rel.kind != relManyToMany {
+			return fmt.Errorf("rio: WithCount(%q): counting a %s relation is meaningless (0 or 1); load it instead", name, rel.kind)
 		}
 	}
 	return nil
@@ -500,7 +538,10 @@ func renderSelectRaw(g *grammar, p *plan, s *queryState) (string, []any, error) 
 			b = append(b, o...)
 		}
 	}
-	b = appendLimitOffset(b, d, s)
+	b, err = appendLimitOffset(b, d, s)
+	if err != nil {
+		return "", nil, err
+	}
 	if s.forUpdate && d.caps().forUpdate {
 		b = append(b, " FOR UPDATE"...)
 	}

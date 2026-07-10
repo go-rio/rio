@@ -197,7 +197,7 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 	}
 	now := normalizeTime(db.conf().clock())
 	for i := range rows {
-		stampForInsert(p, reflect.ValueOf(&rows[i]).Elem(), now)
+		prepareUpsertRow(p, reflect.ValueOf(&rows[i]).Elem(), &spec, now)
 	}
 	cols, _, err := batchColumns(p, rows)
 	if err != nil {
@@ -253,6 +253,7 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 				b = appendConflictSets(b, d, table, p, update, &spec, "excluded")
 			}
 		} else {
+			b = appendMySQLUpsertAlias(b)
 			b = append(b, " ON DUPLICATE KEY UPDATE "...)
 			if spec.doNothing {
 				col := p.fields[0].column
@@ -263,7 +264,7 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 				b = append(b, " = "...)
 				b = d.quote(b, col)
 			} else {
-				b = appendConflictSets(b, d, table, p, update, &spec, "")
+				b = appendConflictSets(b, d, table, p, update, &spec, mysqlUpsertAlias)
 			}
 		}
 
