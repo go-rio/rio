@@ -276,8 +276,10 @@ func TestAllocDiagnostics(t *testing.T) {
 func TestCRUDAllocBudget(t *testing.T) {
 	budgets := map[string]float64{
 		"find/pg":           1,
+		"find/clickhouse":   1, // same read path; caps checks are branch-only
 		"insert/sqlite":     0, // RETURNING path
 		"insert/mysql":      1, // exec + LastInsertId path
+		"insert/clickhouse": 1, // exec path; chTimeFormat binds text like sqlite's
 		"update/pg":         2,
 		"delete/pg":         1,
 		"upsert/pg":         5, // conflict shape: spec, option appends, update set, cache key
@@ -381,6 +383,49 @@ func allocMeasurements(ctx context.Context) map[string]allocPair {
 				id, err := res.LastInsertId()
 				fatal(err)
 				_ = id
+			},
+		}
+	}
+
+	{ // Insert, ClickHouse exec path: explicit ID (nothing generates or
+		// backfills there), stamps bound as chTimeFormat text.
+		l := &loopDB{}
+		db, raw := l.open(ClickHouse), l.raw()
+		u := &perfUser{ID: 1, Email: "u@example.com", Age: 30}
+		const q = "INSERT INTO `perf_users` (`id`, `email`, `age`, `created_at`, `updated_at`) VALUES (?, ?, ?, ?, ?)"
+		pairs["insert/clickhouse"] = allocPair{
+			rio: func() {
+				u.CreatedAt, u.UpdatedAt = time.Time{}, time.Time{}
+				fatal(Insert(ctx, db, u))
+			},
+			std: func() {
+				now := time.Now().UTC().Truncate(time.Microsecond)
+				ts := now.Format(chTimeFormat)
+				res, err := raw.ExecContext(ctx, q, int64(1), "u@example.com", int64(30), ts, ts)
+				fatal(err)
+				_ = res
+			},
+		}
+	}
+
+	{ // Find, ClickHouse
+		l := &loopDB{cols: perfUserCols, rows: [][]driver.Value{perfUserRow()}}
+		db, raw := l.open(ClickHouse), l.raw()
+		const q = "SELECT `perf_users`.`id`, `perf_users`.`email`, `perf_users`.`age`, `perf_users`.`created_at`, `perf_users`.`updated_at` FROM `perf_users` WHERE `perf_users`.`id` = ?"
+		pairs["find/clickhouse"] = allocPair{
+			rio: func() {
+				_, err := Find[perfUser](ctx, db, int64(1))
+				fatal(err)
+			},
+			std: func() {
+				rows, err := raw.QueryContext(ctx, q, int64(1))
+				fatal(err)
+				var u perfUser
+				if !rows.Next() {
+					panic("no row")
+				}
+				fatal(rows.Scan(&u.ID, &u.Email, &u.Age, &u.CreatedAt, &u.UpdatedAt))
+				fatal(rows.Close())
 			},
 		}
 	}

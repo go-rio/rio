@@ -27,6 +27,12 @@ func Attach[T any, K any](ctx context.Context, db Queryer, row *T, relation stri
 	if err != nil {
 		return err
 	}
+	if d := db.gram().d; !d.caps().uniqueKeys {
+		// The rendered INSERT leans on ON CONFLICT DO NOTHING (a no-op
+		// assignment on MySQL) over the join table's composite unique key for
+		// its idempotency promise; without unique keys, reruns duplicate.
+		return fmt.Errorf("rio: Attach is not supported on %s (idempotency needs a unique key over the join table); insert join rows with rio.Exec or InsertAll on a ReplacingMergeTree join table", d.name())
+	}
 	return insertJoinRows(ctx, db, p, res, ownerKey, anySlice(ids))
 }
 
@@ -93,6 +99,9 @@ func Detach[T any, K any](ctx context.Context, db Queryer, row *T, relation stri
 	p, _, res, ownerKey, err := joinWriteTarget(db, row, relation)
 	if err != nil {
 		return err
+	}
+	if d := db.gram().d; !d.caps().mutations {
+		return fmt.Errorf("rio: Detach is not supported on %s (join-table DELETE is an asynchronous mutation); use rio.Exec", d.name())
 	}
 	// Pass the ids as []any, not []K: a byte-kind id type would make []K a
 	// []byte that IN (?) expansion treats as one BLOB (rebind.sliceElems),
@@ -167,9 +176,15 @@ func SyncRelation[T any, K any](ctx context.Context, db Queryer, row *T, relatio
 	if err != nil {
 		return err
 	}
+	if d := db.gram().d; !d.caps().transactions {
+		// The transactions door is the first of three this convergence needs
+		// (transaction, owner row lock, join-table DELETE); one honest error
+		// beats reporting them piecemeal.
+		return fmt.Errorf("rio: SyncRelation is not supported on %s (needs a transaction and row locks)", d.name())
+	}
 	return db.Tx(ctx, func(tx *Tx) error {
 		d := tx.gram().d
-		if d.caps().forUpdate {
+		if d.caps().forUpdate == forUpdateRender {
 			g := tx.gram()
 			lb := make([]byte, 0, 96)
 			lb = append(lb, "SELECT "...)
@@ -253,7 +268,7 @@ func selectJoinRefs(ctx context.Context, tx *Tx, p *plan, res *resolvedRel, owne
 	b = append(b, " WHERE "...)
 	b = d.quote(b, res.joinFK)
 	b = append(b, " = ?"...)
-	if d.caps().forUpdate {
+	if d.caps().forUpdate == forUpdateRender {
 		b = append(b, " FOR UPDATE"...)
 	}
 	sqlText, outArgs, err := finishSQL(d, b, []any{ownerKey})

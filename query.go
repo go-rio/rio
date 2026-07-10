@@ -44,6 +44,7 @@ type queryState struct {
 	limitSet, offsetSet bool
 
 	forUpdate bool
+	final     bool
 	trashed   trashMode
 	allRows   bool
 
@@ -127,7 +128,7 @@ func (q Query[T]) Having(expr string, args ...any) Query[T] {
 // for itself. A slice argument counts as one — it expands inside IN (?) at
 // render. Fragments with no arguments stay legal: that is the compiled
 // exec-parameterized shape, and uncompiled they still fail loudly at the
-// statement level. When the three dialect lexers disagree on the count the
+// statement level. When the dialect lexers disagree on the count the
 // fragment is dialect-sensitive and the decision defers to render, which
 // knows the real lexer.
 func (s *queryState) noteCondArity(clause, expr string, argc int) {
@@ -135,18 +136,19 @@ func (s *queryState) noteCondArity(clause, expr string, argc int) {
 		return
 	}
 	// One lexer pass decides the happy path: when the sqlite count matches,
-	// the full three-lexer comparison could only end in agreement (pass) or
-	// disagreement (defer) — never an error — so the other two passes are
+	// the full four-lexer comparison could only end in agreement (pass) or
+	// disagreement (defer) — never an error — so the other three passes are
 	// skipped.
 	lite := 0
 	_, _, _ = rebindCount(sqliteLex, expr, &lite)
 	if lite == argc {
 		return
 	}
-	pg, my := 0, 0
+	pg, my, chn := 0, 0, 0
 	_, _, _ = rebindCount(pgLex, expr, &pg)
 	_, _, _ = rebindCount(mysqlLex, expr, &my)
-	if pg != my || my != lite {
+	_, _, _ = rebindCount(chLex, expr, &chn)
+	if pg != my || my != lite || lite != chn {
 		return
 	}
 	s.err = fmt.Errorf("rio: %s(%q) has %d placeholder(s) but %d argument(s)", clause, expr, pg, argc)
@@ -174,8 +176,23 @@ func (q Query[T]) Offset(n int) Query[T] {
 
 // ForUpdate renders SELECT ... FOR UPDATE for read-modify-write inside a
 // transaction. SQLite locks the whole database anyway; there it is a no-op.
+// ClickHouse has no row locks at all and rejects it at render.
 func (q Query[T]) ForUpdate() Query[T] {
 	q.s.forUpdate = true
+	return q
+}
+
+// Final reads through ClickHouse's FINAL table modifier, merging row
+// versions at query time — the read-side companion of ReplacingMergeTree
+// deduplication (the Upsert replacement on that dialect). It applies to this
+// query's own SELECT only: preloads, WithCount, and WhereHas subqueries read
+// without FINAL. Every other dialect rejects it at render, and ClickHouse
+// itself rejects it on table engines without versioned merges
+// (ILLEGAL_FINAL). A blanket alternative is the final=1 setting on the
+// connection's DSN or profile, which applies FINAL server-side to every
+// table in every query.
+func (q Query[T]) Final() Query[T] {
+	q.s.final = true
 	return q
 }
 
@@ -454,7 +471,11 @@ func Find[T any](ctx context.Context, db Queryer, key ...any) (*T, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, normalizeArgs(d, key))
+	keyArgs, err := normalizeArgs(d, key)
+	if err != nil {
+		return nil, err
+	}
+	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, keyArgs)
 	if err != nil {
 		return nil, err
 	}
@@ -489,6 +510,9 @@ const (
 // golden SQL stays stable.
 func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string, []any, error) {
 	d := g.d
+	if err := checkFinal(d, s); err != nil {
+		return "", nil, err
+	}
 	table := g.table(p)
 	b := make([]byte, 0, 192)
 	var args []any
@@ -522,6 +546,9 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 			return "", nil, err
 		}
 		b = append(b, head...)
+	}
+	if s.final {
+		b = append(b, " FINAL"...) // table modifier: before joins and WHERE
 	}
 
 	for _, j := range s.joins {
@@ -577,11 +604,36 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 	// FOR UPDATE never reaches the count shape: PostgreSQL rejects row locks
 	// on aggregates, and counting locks nothing meaningful anyway. Exists
 	// keeps it — locking the probe row is well-defined.
-	if s.forUpdate && d.caps().forUpdate && shape != selectCount {
-		b = append(b, " FOR UPDATE"...)
+	if s.forUpdate && shape != selectCount {
+		var err error
+		if b, err = appendForUpdate(b, d); err != nil {
+			return "", nil, err
+		}
 	}
 
 	return finishSQL(d, b, args)
+}
+
+// appendForUpdate renders the FOR UPDATE tail per the dialect's mode:
+// rendered, elided (SQLite's whole-db locking is the documented equivalent),
+// or rejected — ClickHouse has no row locks, and silently dropping a
+// requested lock would degrade instead of fail.
+func appendForUpdate(b []byte, d Dialect) ([]byte, error) {
+	switch d.caps().forUpdate {
+	case forUpdateRender:
+		return append(b, " FOR UPDATE"...), nil
+	case forUpdateReject:
+		return nil, fmt.Errorf("rio: ForUpdate is not supported on %s (no row locks); remove it — reads there are lock-free snapshots", d.name())
+	}
+	return b, nil // forUpdateElide
+}
+
+// checkFinal rejects Final() on dialects without the FINAL table modifier.
+func checkFinal(d Dialect, s *queryState) error {
+	if s.final && !d.caps().finalTable {
+		return fmt.Errorf("rio: Final() requires a dialect with the FINAL table modifier (clickhouse); remove it on %s", d.name())
+	}
+	return nil
 }
 
 // appendLimitOffset renders LIMIT/OFFSET. PostgreSQL accepts a bare OFFSET;
@@ -767,29 +819,44 @@ func finishSQL(d Dialect, b []byte, args []any) (string, []any, error) {
 	if err != nil {
 		return "", nil, err
 	}
-	return sqlText, normalizeArgs(d, outArgs), nil
+	outArgs, err = normalizeArgs(d, outArgs)
+	if err != nil {
+		return "", nil, err
+	}
+	return sqlText, outArgs, nil
 }
 
 // normalizeArgs applies the write-side time rule to user-supplied arguments
 // (Where, Having, Set, Raw, compiled binds): UTC, microsecond precision,
 // dialect encoding. Without it a time compared on SQLite would use the
-// driver's own text format and silently miss rio's stored values.
+// driver's own text format and silently miss rio's stored values. On
+// ClickHouse it additionally rejects times outside the DateTime64 range
+// (silently clamped server-side otherwise) and binds byte payloads as
+// strings (interpolated as Array literals otherwise).
 // Copy-on-write: the input is caller-owned (Find keys, compiled exec args,
 // a RawQuery's stored args shared across concurrent executions) and is
 // never mutated; with no time values the pass allocates nothing.
-func normalizeArgs(d Dialect, args []any) []any {
+func normalizeArgs(d Dialect, args []any) ([]any, error) {
 	out := args
 	cloned := false
 	for i, a := range args {
 		var v any
 		switch t := a.(type) {
 		case time.Time:
-			v = d.bindTime(normalizeTime(t))
+			nt := normalizeTime(t)
+			if err := checkBindTime(d, nt); err != nil {
+				return nil, err
+			}
+			v = d.bindTime(nt)
 		case *time.Time:
 			if t == nil {
 				v = nil
 			} else {
-				v = d.bindTime(normalizeTime(*t))
+				nt := normalizeTime(*t)
+				if err := checkBindTime(d, nt); err != nil {
+					return nil, err
+				}
+				v = d.bindTime(nt)
 			}
 		case sql.NullTime:
 			// Left alone, the driver's Valuer path would encode the inner
@@ -797,13 +864,21 @@ func normalizeArgs(d Dialect, args []any) []any {
 			if !t.Valid {
 				v = nil
 			} else {
-				v = d.bindTime(normalizeTime(t.Time))
+				nt := normalizeTime(t.Time)
+				if err := checkBindTime(d, nt); err != nil {
+					return nil, err
+				}
+				v = d.bindTime(nt)
 			}
 		case sql.Null[time.Time]:
 			if !t.Valid {
 				v = nil
 			} else {
-				v = d.bindTime(normalizeTime(t.V))
+				nt := normalizeTime(t.V)
+				if err := checkBindTime(d, nt); err != nil {
+					return nil, err
+				}
+				v = d.bindTime(nt)
 			}
 		case uint64:
 			if t <= math.MaxInt64 {
@@ -817,8 +892,26 @@ func normalizeArgs(d Dialect, args []any) []any {
 				continue
 			}
 			v = strconv.FormatUint(uint64(t), 10)
+		case []byte:
+			if d.name() != "clickhouse" {
+				continue
+			}
+			// clickhouse-go interpolates []byte as an Array(UInt8) literal;
+			// String is ClickHouse's byte container (mirrors bindArg).
+			if t == nil {
+				v = nil
+			} else {
+				v = string(t)
+			}
 		default:
-			continue
+			if d.name() != "clickhouse" {
+				continue
+			}
+			nv, ok := chByteArg(a)
+			if !ok {
+				continue
+			}
+			v = nv
 		}
 		if !cloned {
 			out = append([]any(nil), args...)
@@ -826,7 +919,7 @@ func normalizeArgs(d Dialect, args []any) []any {
 		}
 		out[i] = v
 	}
-	return out
+	return out, nil
 }
 
 // Rows streams the result without materializing it, for result sets too
@@ -903,6 +996,9 @@ func Pluck[V any, T any](ctx context.Context, db Queryer, q Query[T], column str
 	}
 	g := db.gram()
 	d := g.d
+	if err := checkFinal(d, &q.s); err != nil {
+		return nil, err
+	}
 	table := g.table(p)
 
 	b := make([]byte, 0, 128)
@@ -912,6 +1008,9 @@ func Pluck[V any, T any](ctx context.Context, db Queryer, q Query[T], column str
 	b = d.quote(b, f.column)
 	b = append(b, " FROM "...)
 	b = d.quote(b, table)
+	if q.s.final {
+		b = append(b, " FINAL"...)
+	}
 	for _, j := range q.s.joins {
 		b = append(b, ' ')
 		b = append(b, j...)
@@ -934,8 +1033,10 @@ func Pluck[V any, T any](ctx context.Context, db Queryer, q Query[T], column str
 	if err != nil {
 		return nil, err
 	}
-	if q.s.forUpdate && d.caps().forUpdate {
-		b = append(b, " FOR UPDATE"...)
+	if q.s.forUpdate {
+		if b, err = appendForUpdate(b, d); err != nil {
+			return nil, err
+		}
 	}
 
 	sqlText, outArgs, err := finishSQL(d, b, args)

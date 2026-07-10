@@ -54,6 +54,13 @@ func New(db *sql.DB, dialect Dialect, opts ...Option) *DB {
 	for _, opt := range opts {
 		opt(cfg)
 	}
+	if cfg.stmtCache && !dialect.caps().stmtPrepare {
+		// Construction-time misuse, like a nil db: clickhouse-go implements
+		// Prepare only for INSERT batching, so every cached SELECT would fail
+		// on first use — there is no configuration under which this works.
+		panic("rio: WithStmtCache is not supported on " + dialect.name() +
+			" (clickhouse-go implements Prepare only for INSERT batching; a prepared SELECT fails on first use)")
+	}
 	d := &DB{db: db, g: newGrammar(dialect, cfg), cfg: cfg}
 	if cfg.stmtCache {
 		d.stmts = newStmtCache(db, cfg.stmtCap)
@@ -96,6 +103,12 @@ func (d *DB) Tx(ctx context.Context, fn func(tx *Tx) error) error {
 // TxWith runs fn in a transaction with the given options (isolation level,
 // read-only).
 func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) error) (err error) {
+	if !d.g.d.caps().transactions {
+		// clickhouse-go's Begin returns the connection itself and opens
+		// nothing: fn would run with every statement committing independently
+		// while looking transactional — the heaviest silent surprise there is.
+		return fmt.Errorf("rio: transactions are not supported on %s (the driver's Begin is a no-op and statements would commit independently); group rows into one InsertAll for per-statement atomicity, or use db.Unwrap() with clickhouse-go's native batch API", d.g.d.name())
+	}
 	// Armed before BEGIN: its AfterQuery hook can panic with the transaction
 	// already open, and the connection must be rolled back before the panic
 	// continues. tx is nil until BeginTx succeeds — nothing to clean up then.

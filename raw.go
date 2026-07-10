@@ -30,7 +30,10 @@ func (r RawQuery[T]) All(ctx context.Context, db Queryer) ([]T, error) {
 	if err != nil {
 		return nil, err
 	}
-	args = normalizeArgs(d, args)
+	args, err = normalizeArgs(d, args)
+	if err != nil {
+		return nil, err
+	}
 	rows, finish, err := runQuery(ctx, db, "raw", "", sqlText, args)
 	if err != nil {
 		return nil, err
@@ -88,6 +91,9 @@ func Exec(ctx context.Context, db Queryer, sqlText string, args ...any) (sql.Res
 	if err != nil {
 		return nil, err
 	}
-	outArgs = normalizeArgs(d, outArgs)
+	outArgs, err = normalizeArgs(d, outArgs)
+	if err != nil {
+		return nil, err
+	}
 	return run(ctx, db, "exec", "", rebound, outArgs)
 }

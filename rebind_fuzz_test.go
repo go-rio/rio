@@ -84,22 +84,54 @@ func naiveRebind(p lexProfile, style bindStyle, query string, args []any) (strin
 					out = append(out, c)
 					i++
 				}
+			case c == '$' && p.heredoc && !naiveIdentByte(query, i) && naiveHeredocEnd(query, i) > 0:
+				// ClickHouse heredoc, consumed whole: unlike PG's dollar quote
+				// the tag may be empty or start with a digit, and without a
+				// closing delimiter no heredoc exists at all (the guard above
+				// then falls through to the plain-byte default).
+				end := naiveHeredocEnd(query, i)
+				if style == bindQuestionEsc && len(args) > 0 && strings.ContainsRune(query[i:end], '?') {
+					return "", nil, fmt.Errorf("naive: ? inside heredoc at byte %d with arguments", i)
+				}
+				out = append(out, query[i:end]...)
+				i = end
 			case c == '-' && i+1 < len(query) && query[i+1] == '-' && naiveDashComment(p, query, i):
 				out = append(out, '-', '-')
 				i += 2
 				state = nvLine
-			case c == '#' && p.hashComment:
+			case c == '#' && (p.hashComment || (p.hashSpaceComment && i+1 < len(query) && (query[i+1] == ' ' || query[i+1] == '!'))):
 				out = append(out, c)
 				i++
 				state = nvLine
+			case c == '/' && p.slashSlashComment && i+1 < len(query) && query[i+1] == '/':
+				// ClickHouse // line comment, consumed whole so the driver
+				// blind spot check can see its region.
+				end := i
+				for end < len(query) && query[end] != '\n' {
+					end++
+				}
+				if style == bindQuestionEsc && len(args) > 0 && strings.ContainsRune(query[i:end], '?') {
+					return "", nil, fmt.Errorf("naive: ? inside // comment at byte %d with arguments", i)
+				}
+				out = append(out, query[i:end]...)
+				i = end
 			case c == '/' && i+1 < len(query) && query[i+1] == '*':
 				out = append(out, '/', '*')
 				i += 2
 				depth = 1
 				state = nvBlock
+			case c == '\\' && p.backslashQuestion && i+1 < len(query) && query[i+1] == '?':
+				// The client-side binder's own literal-? escape: pass it
+				// through, bind nothing.
+				out = append(out, '\\', '?')
+				i += 2
 			case c == '?':
 				if i+1 < len(query) && query[i+1] == '?' {
-					out = append(out, '?')
+					if style == bindQuestionEsc {
+						out = append(out, '\\', '?')
+					} else {
+						out = append(out, '?')
+					}
 					i += 2
 					continue
 				}
@@ -157,7 +189,7 @@ func naiveRebind(p lexProfile, style bindStyle, query string, args []any) (strin
 				i++
 			}
 		case nvDouble:
-			backslash := p.backslashEscapes && p.doubleQuoteIsString
+			backslash := (p.backslashEscapes && p.doubleQuoteIsString) || p.quotedIdentBackslash
 			switch {
 			case backslash && c == '\\':
 				out = append(out, c)
@@ -179,6 +211,13 @@ func naiveRebind(p lexProfile, style bindStyle, query string, args []any) (strin
 			}
 		case nvBacktick:
 			switch {
+			case p.quotedIdentBackslash && c == '\\':
+				out = append(out, c)
+				i++
+				if i < len(query) {
+					out = append(out, query[i])
+					i++
+				}
 			case c == '`' && i+1 < len(query) && query[i+1] == '`':
 				out = append(out, '`', '`')
 				i += 2
@@ -258,6 +297,32 @@ func naiveRebind(p lexProfile, style bindStyle, query string, args []any) (strin
 		return string(out), flat, nil
 	}
 	return string(out), args, nil
+}
+
+// naiveHeredocEnd finds the index after a ClickHouse heredoc's closing
+// delimiter, or 0 when the $ opens no heredoc (no opening tag shape, or no
+// closing delimiter anywhere — ClickHouse then lexes the $ as an ordinary
+// byte, unlike PG's swallow-to-end dollar quote).
+func naiveHeredocEnd(s string, start int) int {
+	j := start + 1
+	for j < len(s) {
+		cj := s[j]
+		if cj == '_' || (cj >= '0' && cj <= '9') || (cj >= 'a' && cj <= 'z') || (cj >= 'A' && cj <= 'Z') {
+			j++
+			continue
+		}
+		break
+	}
+	if j >= len(s) || s[j] != '$' {
+		return 0
+	}
+	delim := s[start : j+1]
+	for k := j + 1; k+len(delim) <= len(s); k++ {
+		if s[k] == '$' && s[k:k+len(delim)] == delim {
+			return k + len(delim)
+		}
+	}
+	return 0
 }
 
 func naiveIdentByte(s string, i int) bool {
@@ -410,10 +475,38 @@ func FuzzRebind(f *testing.F) {
 		// CI fuzz regression: a UTF-8 continuation byte before e' is
 		// identifier material, so no E-string opens and the ? stays live.
 		"\xa0e'\\'?",
+		// ClickHouse: heredocs (empty and digit-leading tags, unterminated
+		// ones are not heredocs), // comments, the # space rule, the driver's
+		// \? literal escape, and backslash-escaped quotes in all three quote
+		// flavors.
+		"SELECT $$he?llo$$",
+		"SELECT $$a?b$$, ?",
+		"SELECT $1a$ ? $1a$ , ?",
+		"SELECT $1a$ ? $1a",
+		"$$$",
+		"$$$$",
+		"$$?$$",
+		"$_1$?$_1$",
+		"SELECT 1 // c ?",
+		"SELECT 1 // c ?\n , ?",
+		"//?",
+		"SELECT 1 # ?",
+		"SELECT 1 #! ?",
+		"SELECT 1 #x ?",
+		"#",
+		`\?`,
+		`SELECT \? , ?`,
+		`\\?`,
+		`\??`,
+		`?\?`,
+		`SELECT '\?' , ?`,
+		"SELECT `a\\` ?` , ?",
+		`SELECT "a\" ?" , ?`,
+		"SELECT /* /* ? */ ? */ ?",
 	}
 	for _, q := range seeds {
-		for prof := uint8(0); prof < 3; prof++ {
-			for style := uint8(0); style < 2; style++ {
+		for prof := uint8(0); prof < 4; prof++ {
+			for style := uint8(0); style < 3; style++ {
 				for _, n := range []uint8{0, 1, 2, 3} {
 					f.Add(q, n, prof, style, uint8(0))
 				}
@@ -432,8 +525,8 @@ func FuzzRebind(f *testing.F) {
 		"? ? ? ? ?",
 	}
 	for _, q := range sliceSeeds {
-		for prof := uint8(0); prof < 3; prof++ {
-			for style := uint8(0); style < 2; style++ {
+		for prof := uint8(0); prof < 4; prof++ {
+			for style := uint8(0); style < 3; style++ {
 				for _, n := range []uint8{1, 2, 3, 5} {
 					for _, sb := range []uint8{1, 2, 3, 0b101, 0b1000, 0xff} {
 						f.Add(q, n, prof, style, sb)
@@ -444,8 +537,8 @@ func FuzzRebind(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, query string, nArgs, profileIdx, styleIdx, sliceBits uint8) {
-		profiles := [...]lexProfile{pgLex, mysqlLex, sqliteLex}
-		styles := [...]bindStyle{bindQuestion, bindDollar}
+		profiles := [...]lexProfile{pgLex, mysqlLex, sqliteLex, chLex}
+		styles := [...]bindStyle{bindQuestion, bindDollar, bindQuestionEsc}
 		p := profiles[int(profileIdx)%len(profiles)]
 		style := styles[int(styleIdx)%len(styles)]
 
@@ -515,6 +608,15 @@ func FuzzRebind(f *testing.F) {
 			}
 		case bindQuestion:
 			if !strings.Contains(query, "??") {
+				if live := naiveLiveCount(t, p, gotSQL); live != len(gotArgs) {
+					t.Fatalf("rebind(%q) = %q: %d live placeholder(s) in output, want %d", query, gotSQL, live, len(gotArgs))
+				}
+			}
+		case bindQuestionEsc:
+			// Backslashes are excluded too: an emitted \? escape (from ??) or
+			// a pre-existing one reads as a live ? under profiles without the
+			// backslashQuestion rule, which this invariant is not about.
+			if !strings.Contains(query, "??") && !strings.Contains(query, `\`) {
 				if live := naiveLiveCount(t, p, gotSQL); live != len(gotArgs) {
 					t.Fatalf("rebind(%q) = %q: %d live placeholder(s) in output, want %d", query, gotSQL, live, len(gotArgs))
 				}

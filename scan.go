@@ -361,10 +361,35 @@ func convErr(f *field, src any) error {
 	return fmt.Errorf("rio: column %q: cannot convert %T into field %s (%s)", f.column, src, f.name, f.typ)
 }
 
+// The src* converters accept, beyond database/sql's canonical driver values,
+// the natively typed values clickhouse-go delivers (it bypasses the canonical
+// set via its NamedValueChecker, so UInt64 columns arrive as uint64, Int32 as
+// int32, Float32 as float32, and so on). Pure additions: the canonical arms
+// are untouched, so the other drivers' behavior cannot move.
+
 func srcInt(src any, f *field) (int64, error) {
 	switch v := src.(type) {
 	case int64:
 		return v, nil
+	case int:
+		return int64(v), nil
+	case int32:
+		return int64(v), nil
+	case int16:
+		return int64(v), nil
+	case int8:
+		return int64(v), nil
+	case uint8:
+		return int64(v), nil
+	case uint16:
+		return int64(v), nil
+	case uint32:
+		return int64(v), nil
+	case uint64:
+		if v > math.MaxInt64 {
+			return 0, fmt.Errorf("rio: column %q value %d overflows %s", f.column, v, f.typ)
+		}
+		return int64(v), nil
 	case []byte:
 		n, err := strconv.ParseInt(string(v), 10, 64)
 		if err != nil {
@@ -388,6 +413,16 @@ func srcUint(src any, f *field) (uint64, error) {
 			return 0, fmt.Errorf("rio: column %q value %d is negative but field %s is unsigned", f.column, v, f.name)
 		}
 		return uint64(v), nil
+	case uint64:
+		return v, nil
+	case uint:
+		return uint64(v), nil
+	case uint32:
+		return uint64(v), nil
+	case uint16:
+		return uint64(v), nil
+	case uint8:
+		return uint64(v), nil
 	case []byte:
 		// MySQL delivers BIGINT UNSIGNED above MaxInt64 as bytes.
 		n, err := strconv.ParseUint(string(v), 10, 64)
@@ -409,6 +444,8 @@ func srcFloat(src any, f *field) (float64, error) {
 	switch v := src.(type) {
 	case float64:
 		return v, nil
+	case float32:
+		return float64(v), nil
 	case int64:
 		return float64(v), nil
 	case []byte:
@@ -722,11 +759,17 @@ func bindArgFast(f *field, base unsafe.Pointer, b *binder) (any, bool, error) {
 	case scanString:
 		return *(*string)(p), true, nil
 	case scanBytes:
-		b := *(*[]byte)(p)
-		if b == nil {
+		bs := *(*[]byte)(p)
+		if bs == nil {
 			return nil, true, nil
 		}
-		return b, true, nil
+		if b.d.name() == "clickhouse" {
+			// clickhouse-go interpolates a []byte argument as an Array(UInt8)
+			// literal; String is ClickHouse's byte container, so byte
+			// payloads bind as strings there.
+			return string(bs), true, nil
+		}
+		return bs, true, nil
 	case scanTime:
 		t := *(*time.Time)(p)
 		if t.IsZero() && f.isSoftDelete {
@@ -739,6 +782,9 @@ func bindArgFast(f *field, base unsafe.Pointer, b *binder) (any, bool, error) {
 			// database stores, so insert-then-reload compares Equal even for
 			// caller-provided nanosecond or zoned times.
 			*(*time.Time)(p) = nt
+		}
+		if err := checkBindTime(b.d, nt); err != nil {
+			return nil, true, err
 		}
 		return b.time(nt), true, nil
 	}
@@ -841,6 +887,11 @@ func bindArg(f *field, v reflect.Value, b *binder) (any, error) {
 		if err != nil {
 			return nil, fmt.Errorf("rio: field %s: encoding JSON: %w", f.name, err)
 		}
+		if b.d.name() == "clickhouse" {
+			// clickhouse-go interpolates []byte as an Array(UInt8) literal;
+			// JSON is UTF-8 text and must land in a String column as a string.
+			return string(data), nil
+		}
 		return data, nil
 	}
 	if f.code.bindValuer {
@@ -871,6 +922,9 @@ func bindArg(f *field, v reflect.Value, b *binder) (any, error) {
 			if nt != nv.Time && v.CanSet() {
 				v.Set(reflect.ValueOf(sql.NullTime{Time: nt, Valid: true}))
 			}
+			if err := checkBindTime(b.d, nt); err != nil {
+				return nil, err
+			}
 			return b.time(nt), nil
 		}
 		return nil, nil
@@ -880,6 +934,9 @@ func bindArg(f *field, v reflect.Value, b *binder) (any, error) {
 			nt := normalizeTime(nv.V)
 			if nt != nv.V && v.CanSet() {
 				v.Set(reflect.ValueOf(sql.Null[time.Time]{V: nt, Valid: true}))
+			}
+			if err := checkBindTime(b.d, nt); err != nil {
+				return nil, err
 			}
 			return b.time(nt), nil
 		}
@@ -894,6 +951,9 @@ func bindArg(f *field, v reflect.Value, b *binder) (any, error) {
 		if nt != t && v.CanSet() {
 			v.Set(reflect.ValueOf(nt))
 		}
+		if err := checkBindTime(b.d, nt); err != nil {
+			return nil, err
+		}
 		return b.time(nt), nil
 	}
 	if isUintKind(v.Kind()) {
@@ -901,7 +961,28 @@ func bindArg(f *field, v reflect.Value, b *binder) (any, error) {
 			return bindOverflowUint(b.d, n)
 		}
 	}
+	if b.d.name() == "clickhouse" && v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
+		// Byte payloads bind as strings on ClickHouse, as on the fast path.
+		return string(v.Bytes()), nil
+	}
 	return v.Interface(), nil
+}
+
+// chByteArg converts a byte-slice argument — named types like
+// json.RawMessage included — into the string form ClickHouse needs
+// (normalizeArgs' slow case; the exact []byte case is handled inline).
+// driver.Valuer implementers are left alone so their Value() runs, and a
+// typed nil slice stays SQL NULL.
+func chByteArg(a any) (any, bool) {
+	t := reflect.TypeOf(a)
+	if t == nil || t.Kind() != reflect.Slice || t.Elem().Kind() != reflect.Uint8 || t.Implements(valuerType) {
+		return nil, false
+	}
+	v := reflect.ValueOf(a)
+	if v.IsNil() {
+		return nil, true
+	}
+	return string(v.Bytes()), true
 }
 
 // bindOverflowUint binds a uint64 whose high bit is set. database/sql refuses

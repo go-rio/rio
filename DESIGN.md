@@ -27,7 +27,8 @@ Twenty years of ORM evolution across every ecosystem converge on one direction:
   immutable, connection-free values; execution points take the `Queryer`.
   Every execution signature reads `(ctx, db, ...)`.
 - **Zero dependencies** in the core. Drivers live in separate modules
-  (`github.com/go-rio/sqlite|mysql|postgres`) and carry the real driver deps.
+  (`github.com/go-rio/sqlite|mysql|postgres|clickhouse`) and carry the real
+  driver deps.
 
 ## Architecture
 
@@ -49,10 +50,12 @@ Four layers inside `github.com/go-rio/rio`:
 2. **SQL layer** — per-statement renderers, dialect grammars, the `?`
    placeholder rebinder with per-dialect lexer profiles, `IN (?)` slice
    expansion (expand first, renumber second). Dialects are an *opaque*
-   interface built into the core (`rio.Postgres`, `rio.MySQL`, `rio.SQLite`);
-   capability flags (returning, conflict target, max bind params, FOR UPDATE)
-   instead of type switches. Cross-module dialect implementations would freeze
-   the interface — the same argument, validated repeatedly, in go-rio/migrate.
+   interface built into the core (`rio.Postgres`, `rio.MySQL`, `rio.SQLite`,
+   `rio.ClickHouse`); capability flags (returning, conflict target, max bind
+   params, FOR UPDATE render/elide/reject, mutations, transactions, unique
+   keys, generated PKs, statement prepare, FINAL) instead of type switches.
+   Cross-module dialect implementations would freeze the interface — the same
+   argument, validated repeatedly, in go-rio/migrate.
 3. **Mapping layer** — reflection-based struct↔table plans, computed once per
    type and cached forever (plans are immutable once published). Scanning has
    a reflect slow path and an unsafe fast path (see Performance).
@@ -254,6 +257,7 @@ returns a clear error in v1.
 | NULL into non-pointer field | error naming the column — sole exception: the `softdelete` column reads NULL as zero time |
 | MySQL insert | fills auto-increment ID only; rio never issues a hidden second SELECT (`SupportsReturning` capability, Ecto's honest route) |
 | Batch backfill | InsertAll backfills auto-inc PKs only (PG by position; SQLite sorted-by-PK since RETURNING order is documented as undefined; MySQL none — interleaved autoinc); UpsertAll never backfills (DoNothing shrinks the row set) |
+| ClickHouse writes | **never backfilled** — no RETURNING, no generated IDs, the driver's LastInsertId always errors: after Insert/InsertAll the struct holds exactly what you set. The flip side: a zero conventional `ID` errors loudly instead of silently storing constraint-less `0` duplicates; `rio:",noautoincr"` stays the "zero is a real value" escape hatch |
 | Soft-deleted model queries | filtered by default *because the tag is explicit*; `WithTrashed()` / `OnlyTrashed()`; `Delete` becomes UPDATE, `ForceDelete` is real |
 | Upsert on a soft-deleted row | **invariant: a successful Upsert leaves the row visible** — DoUpdate automatically sets `deleted_at = NULL` (+updated_at); `rio.KeepTrashed()` opts out; DoNothing never revives |
 | Upsert `updated_at` | reset to the clock on every non-DoNothing upsert, even when nonzero — the conflict branch applies the would-be inserted row's stamp, so it must be this call's now (entity Update's unconditional rule) |
@@ -264,6 +268,58 @@ returns a clear error in v1.
 | Scan priority | `rio:"-"` → `json` tag (beats Scanner, documented) → `sql.Scanner` (NULL handed to Scan(nil), no second-guessing) → pointer fields (NULL→nil) → `[]byte` (NULL→nil) → basic conversions (overflow-checked; MySQL unsigned BIGINT > MaxInt64 arrives as bytes and is parsed) → NULL into anything else errors with the column name |
 | Times | written as UTC, monotonic-stripped, truncated to microseconds (PG/MySQL precision — otherwise reload-and-Equal never holds), and the normalized value is written back to the struct as it binds, so the struct holds exactly what the database stores; trigger-rewritten columns are not read back; SQLite text format is rio's own, not the driver's |
 | Partial scans | `Raw[T]` into an entity requires the result to cover every mapped column — a partial scan errors (naming the missing columns and pointing at a DTO) rather than letting a later `rio.Update` write zeros to the unscanned ones (mirror image of GORM #6860) |
+
+### ClickHouse: the read + append dialect
+
+ClickHouse is the fourth built-in dialect and the first that does not speak
+the full surface — deliberately. It is an honest subset, not a degraded port:
+the supported half is exactly OLAP's real usage shape (analytical reads +
+batched appends), and every rejected API returns an error naming the
+ClickHouse-native way out. "If rio can't compile it, it returns an error"
+applies to semantics too: an API whose contract cannot hold does not get a
+lookalike that silently means something weaker.
+
+- **Reads are complete**: the whole query builder, all four relation
+  preloads, `WithCount`, window-function `RelLimit`, `WhereHas` (server ≥
+  25.8), soft-delete read filtering, `Raw`/`Exec`/compiled queries. Plus one
+  dialect-gated addition, `Query.Final()` — reads through the `FINAL` table
+  modifier, the read-side companion of ReplacingMergeTree deduplication.
+  It exists because the Upsert/Update rejection messages point at
+  ReplacingMergeTree: pointing there without a read-side closure would send
+  users straight back out to Raw.
+- **Writes are Insert/InsertAll (+ `rio.Exec` mutations)**. The
+  UPDATE/DELETE/Upsert families, transactions, `ForUpdate`, and the stmt
+  cache are rejected at the render/execution layer — each on a double
+  ground: server semantics (asynchronous mutations, no unique constraints,
+  no row locks) *and* driver fact (clickhouse-go's `Begin` is a no-op, its
+  `RowsAffected` is unconditionally 0 — the count `ErrNotFound`,
+  `ErrStaleObject`, and the idempotence probe are built on cannot be
+  implemented, not merely "is awkward").
+- **Every argument is interpolated client-side** — the driver's
+  `database/sql` path has no parameter binding. Two dialect rules follow:
+  times bind as fixed-format text (`2006-01-02 15:04:05.000000+00:00` — the
+  driver would silently truncate a `time.Time` to whole seconds; the
+  explicit offset overrides column timezones, and the out-of-range values
+  ClickHouse would silently *clamp* are rejected client-side, zero
+  `time.Time` included), and `[]byte` binds as `String` (the driver renders
+  it as an `Array(UInt8)` literal otherwise — a String column then stores
+  the literal's text form, silently).
+- **The lexer is pinned to the server's Lexer.cpp** (heredocs with empty and
+  digit-leading tags where unterminated ones do not lex, `//` comments, the
+  `# ` space rule, backslash escapes in every quote flavor), and `??` emits
+  the driver's `\?` escape so a literal `?` (ClickHouse's ternary operator)
+  survives the driver's own rewriting. The two regions the driver's scanner
+  cannot see — heredocs and `//` comments — are rejected on
+  argument-carrying statements instead of silently corrupted; a bare `\?`
+  passes through as the driver's literal-? escape, consuming nothing.
+- **`ErrDuplicateKey` and `ErrForeignKeyViolated` never fire** — ClickHouse
+  has no constraints to violate. The go-rio/clickhouse module accordingly
+  installs no error translator: this is a documented dialect fact, not a gap.
+- The upstream behaviors all of this leans on (quote-aware binding —
+  clickhouse-go ≥ v2.47.0, enforced in the driver module's go.mod — the
+  second-truncation, the Array rendering, RowsAffected 0, the fake Begin,
+  INSERT-only Prepare) are each pinned by a named integration probe: if
+  upstream changes one, the matching probe fails before any user does.
 
 ## Performance
 
@@ -294,7 +350,9 @@ it is missing plan caches and sloppy string assembly.
   same driver — measured Find +1, Insert +0 (RETURNING) / +1 (exec),
   Update +2, Delete +1 — asserted with testing.AllocsPerRun
   (TestCRUDAllocBudget). Upsert adds its conflict-shape machinery on top:
-  +5 (PostgreSQL) / +5 (MySQL), asserted at those budgets.
+  +5 (PostgreSQL) / +5 (MySQL), asserted at those budgets. ClickHouse rides
+  the same paths (Find +1, Insert +1): its capability checks are early-exit
+  branches, so the three older dialects' budgets did not move when it landed.
 - Benchmarks in-repo against hand-written database/sql (fake driver in
   perf_test.go isolates rio's own overhead; bench/ adds real SQLite and a
   GORM comparison, the source of the README numbers). Honest methodology or
@@ -349,22 +407,25 @@ Each of these is a decision, not a gap:
 - Core: fake `database/sql` driver asserting exact SQL sequences, args, and
   transaction boundaries (the go-rio/migrate pattern) + golden SQL tests per
   dialect. Inflector goldens freeze before model.go exists.
-- Differential fuzz on the rebind lexer (fast vs naive-correct, three dialect
-  profiles, scalar and slice-expansion arguments), a per-kind scan-path test
-  matrix (fast stores and the reflect slow paths), concurrent query derivation
-  under -race, savepoint failure paths (PG aborted state; MySQL 1213 kills
-  all savepoints — tolerate ROLLBACK TO failing via errors.Join).
+- Differential fuzz on the rebind lexer (fast vs naive-correct, four dialect
+  profiles × three bind styles, scalar and slice-expansion arguments), a
+  per-kind scan-path test matrix (fast stores and the reflect slow paths),
+  concurrent query derivation under -race, savepoint failure paths (PG
+  aborted state; MySQL 1213 kills all savepoints — tolerate ROLLBACK TO
+  failing via errors.Join).
 - `integration/` sub-module drives real databases through the core only
   (modernc SQLite always — including a probe test pinning the driver's
-  time/type behavior; PG/MySQL gated by env DSNs, provided as CI services).
-  Driver modules carry their own small suites.
+  time/type behavior; PG/MySQL/ClickHouse gated by env DSNs, provided as CI
+  services or local docker; the ClickHouse leg adds named probes pinning
+  every clickhouse-go behavior the dialect design depends on). Driver
+  modules carry their own small suites.
 - Family conventions: MIT (TreeNewBee), zero-dependency core, go 1.25,
   functional options, CI matrix (oldstable/stable × linux/macos/windows),
   never move a published tag.
 
 ## Shipped scope
 
-Core + three drivers: full mapping/tags, From/Find/First/Sole/Count/Exists,
+Core + four drivers: full mapping/tags, From/Find/First/Sole/Count/Exists,
 immutable connection-free builder (Where/OrderBy/Limit/Offset/GroupBy/Having/
 Join-for-filtering/ForUpdate), Insert/InsertAll/Update/Delete/Upsert/UpsertAll,
 set-based UpdateAll/DeleteAll with rio.Expr, FirstOrCreate/CreateOrFirst
@@ -374,7 +435,9 @@ preloads, explicit relation write helpers (Attach/Detach/SyncRelation),
 optimistic locking, soft delete, timestamps, Raw[T]/Exec with strict
 column-completeness checks for Raw-into-entity, MustCompile/Compile,
 column-constant generation (WriteColumns), opt-in stmt cache, transactions
-with savepoints, QueryHook, error translation, composite PKs.
+with savepoints, QueryHook, error translation, composite PKs. ClickHouse
+speaks the read + append subset of all of this plus `Query.Final()` (see the
+dialect section above).
 
 Not shipped yet: cursor pagination (the README documents the keyset WHERE
 pattern instead of an API), schema-drift lint.

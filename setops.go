@@ -62,6 +62,9 @@ func (q Query[T]) UpdateAll(ctx context.Context, db Queryer, set Set) (int64, er
 	}
 	g := db.gram()
 	d := g.d
+	if err := checkUpdateWrite(d, "UpdateAll", g.table(p)); err != nil {
+		return 0, err
+	}
 	now := normalizeTime(db.conf().clock())
 	table := g.table(p)
 
@@ -154,6 +157,11 @@ func (q Query[T]) DeleteAll(ctx context.Context, db Queryer) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	// Checked here, not left to the delegates: the soft path would otherwise
+	// reject under UpdateAll's name.
+	if d := db.gram().d; !d.caps().mutations {
+		return 0, checkDeleteWrite(d, "DeleteAll", db.gram().table(p))
+	}
 	if p.softDel != nil {
 		set := Set{p.softDel.column: db.gram().d.bindTime(normalizeTime(db.conf().clock()))}
 		return q.UpdateAll(ctx, db, set)
@@ -176,6 +184,9 @@ func (q Query[T]) ForceDeleteAll(ctx context.Context, db Queryer) (int64, error)
 	p, err := planOf[T]()
 	if err != nil {
 		return 0, err
+	}
+	if d := db.gram().d; !d.caps().mutations {
+		return 0, checkDeleteWrite(d, "ForceDeleteAll", db.gram().table(p))
 	}
 	return q.forceDeleteAll(ctx, db, p)
 }
@@ -217,6 +228,9 @@ func (q Query[T]) RestoreAll(ctx context.Context, db Queryer) (int64, error) {
 	}
 	if p.softDel == nil {
 		return 0, fmt.Errorf("rio: RestoreAll: %s has no softdelete column", p.structName)
+	}
+	if err := checkRestoreWrite(db.gram().d, "RestoreAll"); err != nil {
+		return 0, err
 	}
 	if err := checkSetOpShape("RestoreAll", &q.s); err != nil {
 		return 0, err

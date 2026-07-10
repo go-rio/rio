@@ -31,6 +31,16 @@ func InsertAll[T any](ctx context.Context, db Queryer, rows []T) error {
 	d := g.d
 	now := normalizeTime(db.conf().clock())
 
+	if !d.caps().autoIncrPK && p.autoIncr != nil {
+		// Any zero conventional ID errors — covering batchColumns's
+		// mixed-batch arbitration and its all-zero backfill branch in one
+		// rule, since neither generating nor backfilling exists here.
+		for i := range rows {
+			if err := checkGeneratedID(d, "InsertAll", p, reflect.ValueOf(&rows[i]).Elem()); err != nil {
+				return err
+			}
+		}
+	}
 	for i := range rows {
 		stampForInsert(p, reflect.ValueOf(&rows[i]).Elem(), now)
 	}
@@ -203,6 +213,9 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 	}
 	g := db.gram()
 	d := g.d
+	if err := checkUpsertWrite(d, "UpsertAll"); err != nil {
+		return err
+	}
 	if !spec.doNothing && len(spec.conflict) == 0 && d.caps().conflictTarget {
 		return errors.New("rio: UpsertAll with DoUpdate needs OnConflict(columns...) naming the unique index")
 	}

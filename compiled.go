@@ -121,7 +121,7 @@ func Compile[T any](q Query[T]) (*Compiled[T], error) {
 func checkNoArgClauses(p *plan, s *queryState) error {
 	check := func(clause, expr string) error {
 		holes := 0
-		for _, lex := range [...]lexProfile{pgLex, mysqlLex, sqliteLex} {
+		for _, lex := range [...]lexProfile{pgLex, mysqlLex, sqliteLex, chLex} {
 			n := 0
 			_, _, _ = rebindCount(lex, expr, &n)
 			holes = max(holes, n)
@@ -165,11 +165,12 @@ func checkHasCondArity(p *plan, s *queryState) error {
 		}
 		for _, w := range rq.wheres {
 			args += len(w.args)
-			pg, my, lite := 0, 0, 0
+			pg, my, lite, chn := 0, 0, 0, 0
 			_, _, _ = rebindCount(pgLex, w.expr, &pg)
 			_, _, _ = rebindCount(mysqlLex, w.expr, &my)
 			_, _, _ = rebindCount(sqliteLex, w.expr, &lite)
-			if pg != my || my != lite {
+			_, _, _ = rebindCount(chLex, w.expr, &chn)
+			if pg != my || my != lite || lite != chn {
 				ambiguous = true
 			}
 			holes += pg
@@ -269,7 +270,7 @@ func validateCounts(p *plan, counts []string) error {
 	return nil
 }
 
-// approxPlaceholders counts ? holes in user conditions. When the three
+// approxPlaceholders counts ? holes in user conditions. When the four
 // dialect lexers agree the count is exact; otherwise the caller falls back
 // to the conservative rule.
 func approxPlaceholders(s *queryState) (n int, exact bool) {
@@ -287,8 +288,8 @@ func approxPlaceholders(s *queryState) (n int, exact bool) {
 		}
 		return total
 	}
-	pg, my, lite := count(pgLex), count(mysqlLex), count(sqliteLex)
-	if pg == my && my == lite {
+	pg, my, lite, chn := count(pgLex), count(mysqlLex), count(sqliteLex), count(chLex)
+	if pg == my && my == lite && lite == chn {
 		return pg, true
 	}
 	return pg, false
@@ -553,13 +554,16 @@ func (c *Compiled[T]) bind(d Dialect, cs *compiledSQL, args []any) ([]any, error
 			return nil, fmt.Errorf("rio: compiled queries cannot expand slice argument %d; IN (?) needs inline values", i+1)
 		}
 	}
-	return normalizeArgs(d, args), nil
+	return normalizeArgs(d, args)
 }
 
 // renderSelectRaw renders the row-SELECT with unified ? placeholders and no
 // rebinding, for exec-mode compilation.
 func renderSelectRaw(g *grammar, p *plan, s *queryState) (string, []any, error) {
 	d := g.d
+	if err := checkFinal(d, s); err != nil {
+		return "", nil, err
+	}
 	table := g.table(p)
 	b := make([]byte, 0, 192)
 	b = append(b, "SELECT "...)
@@ -573,6 +577,9 @@ func renderSelectRaw(g *grammar, p *plan, s *queryState) (string, []any, error) 
 	}
 	b = append(b, " FROM "...)
 	b = d.quote(b, table)
+	if s.final {
+		b = append(b, " FINAL"...)
+	}
 	for _, j := range s.joins {
 		b = append(b, ' ')
 		b = append(b, j...)
@@ -613,8 +620,10 @@ func renderSelectRaw(g *grammar, p *plan, s *queryState) (string, []any, error) 
 	if err != nil {
 		return "", nil, err
 	}
-	if s.forUpdate && d.caps().forUpdate {
-		b = append(b, " FOR UPDATE"...)
+	if s.forUpdate {
+		if b, err = appendForUpdate(b, d); err != nil {
+			return "", nil, err
+		}
 	}
 	return string(b), nil, nil
 }

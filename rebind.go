@@ -10,24 +10,47 @@ import (
 
 // lexProfile is the per-dialect lexical grammar the rebinder needs to walk a
 // statement without misreading string, identifier, and comment contents.
-// Getting any of these wrong silently corrupts user SQL, so the three
-// profiles are pinned by differential fuzzing against a naive reference.
+// Getting any of these wrong silently corrupts user SQL, so the profiles are
+// pinned by differential fuzzing against a naive reference.
 type lexProfile struct {
-	backslashEscapes    bool // MySQL default: '\'' does not close the string
+	backslashEscapes    bool // MySQL/ClickHouse: '\'' does not close the string
 	dollarQuote         bool // PostgreSQL: $$...$$ and $tag$...$tag$
-	nestedBlockComments bool // PostgreSQL: /* /* */ */ nests
+	nestedBlockComments bool // PostgreSQL/ClickHouse: /* /* */ */ nests
 	hashComment         bool // MySQL: # line comment
 	bracketIdent        bool // SQLite: [identifier]
 	doubleQuoteIsString bool // MySQL: "..." is a string (still skipped whole)
-	backtickIdent       bool // MySQL/SQLite: `identifier`
+	backtickIdent       bool // MySQL/SQLite/ClickHouse: `identifier`
 	eStrings            bool // PostgreSQL: E'...' escape strings
-	looseDashComment    bool // PG/SQLite: -- always comments; MySQL needs whitespace after
+	looseDashComment    bool // PG/SQLite/ClickHouse: -- always comments; MySQL needs whitespace after
+
+	// ClickHouse-only rules, pinned against the server's Lexer.cpp: one
+	// quotedString routine serves ', " and ` (backslash and doubled-quote
+	// escapes work in all three); // opens a line comment; # comments only
+	// before a space or '!' (#x is a lexer error); $tag$...$tag$ heredocs
+	// allow empty and digit-leading tags, and an unterminated heredoc is
+	// not a heredoc at all.
+	quotedIdentBackslash bool // backslashes escape inside "..." and `...` identifiers
+	slashSlashComment    bool // // line comment
+	hashSpaceComment     bool // # comments only when followed by ' ' or '!'
+	heredoc              bool // $tag$...$tag$ string literals
+
+	// backslashQuestion is clickhouse-go's, not the server's: the client-side
+	// binder reads a bare \? as an escaped literal ? and consumes no argument
+	// (rio's ?? escape renders it, but hand-written SQL may carry it too).
+	// Counting that ? as a placeholder would shift every later argument one
+	// position — the driver's accounting is the only correct one to mirror.
+	backslashQuestion bool
 }
 
 var (
 	pgLex     = lexProfile{dollarQuote: true, nestedBlockComments: true, eStrings: true, looseDashComment: true}
 	mysqlLex  = lexProfile{backslashEscapes: true, hashComment: true, doubleQuoteIsString: true, backtickIdent: true}
 	sqliteLex = lexProfile{bracketIdent: true, backtickIdent: true, looseDashComment: true}
+	chLex     = lexProfile{
+		backslashEscapes: true, nestedBlockComments: true, backtickIdent: true, looseDashComment: true,
+		quotedIdentBackslash: true, slashSlashComment: true, hashSpaceComment: true, heredoc: true,
+		backslashQuestion: true,
+	}
 )
 
 // bindStyle selects the output placeholder form.
@@ -36,6 +59,13 @@ type bindStyle int
 const (
 	bindQuestion bindStyle = iota // ? as-is (MySQL, SQLite)
 	bindDollar                    // $1, $2, ... (PostgreSQL)
+	// bindQuestionEsc is bindQuestion for a driver that rewrites ? itself,
+	// client-side (ClickHouse): ?? emits \? — the driver's escape for a
+	// literal ?, unescaped again before the server sees it (its ternary
+	// operator needs one) — and a ? inside a region that driver's scanner
+	// cannot see (heredocs, // comments) is rejected on argument-carrying
+	// statements rather than silently corrupted.
+	bindQuestionEsc
 )
 
 // rebind rewrites unified ? placeholders into the dialect's form and expands
@@ -105,12 +135,13 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 			i = skipQuoted(query, i, '\'', p.backslashEscapes)
 			continue
 		case '"':
-			// Identifier on PG/SQLite, string on MySQL; both pass whole.
-			i = skipQuoted(query, i, '"', p.backslashEscapes && p.doubleQuoteIsString)
+			// Identifier on PG/SQLite/ClickHouse, string on MySQL; both pass
+			// whole. ClickHouse identifiers honor backslash escapes.
+			i = skipQuoted(query, i, '"', (p.backslashEscapes && p.doubleQuoteIsString) || p.quotedIdentBackslash)
 			continue
 		case '`':
 			if p.backtickIdent {
-				i = skipQuoted(query, i, '`', false)
+				i = skipQuoted(query, i, '`', p.quotedIdentBackslash)
 				continue
 			}
 		case '[':
@@ -130,25 +161,57 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 					continue
 				}
 			}
+			if p.heredoc && !identByteBefore(query, i) {
+				if end, ok := skipHeredoc(query, i); ok {
+					if err := checkDriverBlindRegion(style, query, i, end, len(args),
+						"a $...$ heredoc", "use '...' string syntax or bind the value as an argument"); err != nil {
+						return "", nil, err
+					}
+					i = end
+					continue
+				}
+			}
 		case '-':
 			if i+1 < len(query) && query[i+1] == '-' && (p.looseDashComment || dashCommentOK(query, i)) {
 				i = skipLineComment(query, i)
 				continue
 			}
 		case '#':
-			if p.hashComment {
+			if p.hashComment || hashSpaceCommentAt(p, query, i) {
 				i = skipLineComment(query, i)
 				continue
 			}
 		case '/':
+			if p.slashSlashComment && i+1 < len(query) && query[i+1] == '/' {
+				end := skipLineComment(query, i)
+				if err := checkDriverBlindRegion(style, query, i, end, len(args),
+					"a // comment", "use a -- comment"); err != nil {
+					return "", nil, err
+				}
+				i = end
+				continue
+			}
 			if i+1 < len(query) && query[i+1] == '*' {
 				i = skipBlockComment(query, i, p.nestedBlockComments)
 				continue
 			}
+		case '\\':
+			if p.backslashQuestion && i+1 < len(query) && query[i+1] == '?' {
+				// Already the driver's literal-? escape: pass it through and
+				// bind nothing. The driver looks exactly one byte back, so a
+				// preceding backslash cannot re-arm this one.
+				i += 2
+				continue
+			}
 		case '?':
 			if i+1 < len(query) && query[i+1] == '?' {
-				rewriteTo(i + 1) // keep the first ? ...
-				copied = i + 2   // ... and drop the second
+				if style == bindQuestionEsc {
+					rewriteTo(i) // the ?? becomes the driver's \? escape
+					out = append(out, '\\', '?')
+				} else {
+					rewriteTo(i + 1) // keep the first ? ...
+				}
+				copied = i + 2 // ... and drop the source pair
 				i += 2
 				continue
 			}
@@ -292,6 +355,58 @@ func isTagByte(c byte, first bool) bool {
 	return !first && c >= '0' && c <= '9'
 }
 
+// skipHeredoc matches ClickHouse's $tag$...$tag$ heredoc starting at the $
+// and returns the index after the closing delimiter. Two deliberate
+// differences from skipDollarQuoted, both matching the server's Lexer.cpp:
+// tags may be empty or start with a digit, and an unterminated heredoc is
+// not a heredoc at all — the server lexes the $ as an ordinary token then,
+// so the scan must too.
+func skipHeredoc(s string, start int) (int, bool) {
+	i := start + 1
+	for i < len(s) && isWordByte(s[i]) {
+		i++
+	}
+	if i >= len(s) || s[i] != '$' {
+		return 0, false
+	}
+	delim := s[start : i+1]
+	for j := i + 1; j+len(delim) <= len(s); j++ {
+		if s[j] == '$' && s[j:j+len(delim)] == delim {
+			return j + len(delim), true
+		}
+	}
+	return 0, false
+}
+
+func isWordByte(c byte) bool {
+	return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// hashSpaceCommentAt implements ClickHouse's # rule: a comment only when
+// followed by a space or '!' — anything else (`#x`, or # at the end) is a
+// lexer error server-side, so the scan does not swallow it as a comment.
+func hashSpaceCommentAt(p lexProfile, s string, i int) bool {
+	return p.hashSpaceComment && i+1 < len(s) && (s[i+1] == ' ' || s[i+1] == '!')
+}
+
+// checkDriverBlindRegion guards regions the server lexes as literal text but
+// clickhouse-go's client-side binder does not recognize (heredocs, //
+// comments): on an argument-carrying statement the driver would substitute a
+// ? in there, so rio rejects it with the fix instead of letting the
+// statement corrupt. Argument-free statements pass — the driver skips
+// binding entirely then.
+func checkDriverBlindRegion(style bindStyle, query string, start, end, argc int, region, fix string) error {
+	if style != bindQuestionEsc || argc == 0 {
+		return nil
+	}
+	for j := start; j < end; j++ {
+		if query[j] == '?' {
+			return fmt.Errorf("rio: a ? inside %s (byte %d) would be rewritten by clickhouse-go's client-side binder; %s", region, j, fix)
+		}
+	}
+	return nil
+}
+
 // dashCommentOK implements MySQL's rule: -- comments only when followed by
 // whitespace, a control character, or the end of the statement.
 func dashCommentOK(s string, i int) bool {
@@ -378,10 +493,10 @@ func rebindCount(p lexProfile, query string, n *int) (string, []any, error) {
 		case '\'':
 			i = skipQuoted(query, i, '\'', p.backslashEscapes)
 		case '"':
-			i = skipQuoted(query, i, '"', p.backslashEscapes && p.doubleQuoteIsString)
+			i = skipQuoted(query, i, '"', (p.backslashEscapes && p.doubleQuoteIsString) || p.quotedIdentBackslash)
 		case '`':
 			if p.backtickIdent {
-				i = skipQuoted(query, i, '`', false)
+				i = skipQuoted(query, i, '`', p.quotedIdentBackslash)
 			} else {
 				i++
 			}
@@ -398,6 +513,12 @@ func rebindCount(p lexProfile, query string, n *int) (string, []any, error) {
 					continue
 				}
 			}
+			if p.heredoc && !identByteBefore(query, i) {
+				if end, ok := skipHeredoc(query, i); ok {
+					i = end
+					continue
+				}
+			}
 			i++
 		case '-':
 			if i+1 < len(query) && query[i+1] == '-' && (p.looseDashComment || dashCommentOK(query, i)) {
@@ -406,13 +527,15 @@ func rebindCount(p lexProfile, query string, n *int) (string, []any, error) {
 				i++
 			}
 		case '#':
-			if p.hashComment {
+			if p.hashComment || hashSpaceCommentAt(p, query, i) {
 				i = skipLineComment(query, i)
 			} else {
 				i++
 			}
 		case '/':
-			if i+1 < len(query) && query[i+1] == '*' {
+			if p.slashSlashComment && i+1 < len(query) && query[i+1] == '/' {
+				i = skipLineComment(query, i)
+			} else if i+1 < len(query) && query[i+1] == '*' {
 				i = skipBlockComment(query, i, p.nestedBlockComments)
 			} else {
 				i++
@@ -420,6 +543,12 @@ func rebindCount(p lexProfile, query string, n *int) (string, []any, error) {
 		case 'E', 'e':
 			if p.eStrings && i+1 < len(query) && query[i+1] == '\'' && !identByteBefore(query, i) {
 				i = skipQuoted(query, i+1, '\'', true)
+			} else {
+				i++
+			}
+		case '\\':
+			if p.backslashQuestion && i+1 < len(query) && query[i+1] == '?' {
+				i += 2
 			} else {
 				i++
 			}

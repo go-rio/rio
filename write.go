@@ -33,6 +33,9 @@ func Insert[T any](ctx context.Context, db Queryer, row *T) error {
 	}
 	g := db.gram()
 	d := g.d
+	if err := checkGeneratedID(d, "Insert", p, rv); err != nil {
+		return err
+	}
 	now := normalizeTime(db.conf().clock())
 	stampForInsert(p, rv, now)
 
@@ -40,6 +43,12 @@ func Insert[T any](ctx context.Context, db Queryer, row *T) error {
 	cols, back, args, bits, cacheable, err := insertColumns(p, rv, &bn)
 	if err != nil {
 		return err
+	}
+	if len(cols) == 0 && d.name() == "clickhouse" {
+		// Everything omitted (all omitzero columns zero on a model without a
+		// generated PK): the other dialects render their all-defaults row
+		// form, but ClickHouse has none.
+		return fmt.Errorf("rio: clickhouse has no DEFAULT VALUES statement; set at least one column on %s", p.structName)
 	}
 	returning := d.caps().returning && len(back) > 0
 	build := func() []byte {
@@ -95,6 +104,9 @@ func Update[T any](ctx context.Context, db Queryer, row *T, cols ...string) erro
 	}
 	g := db.gram()
 	d := g.d
+	if err := checkUpdateWrite(d, "Update", g.table(p)); err != nil {
+		return err
+	}
 	now := normalizeTime(db.conf().clock())
 
 	set, err := updateSet(p, cols)
@@ -196,6 +208,9 @@ func softDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 	}
 	g := db.gram()
 	d := g.d
+	if err := checkDeleteWrite(d, "Delete", g.table(p)); err != nil {
+		return err
+	}
 	now := normalizeTime(db.conf().clock())
 
 	sqlText, err := crudSQL(g, p, "softdelete", 0, true, func() []byte {
@@ -272,6 +287,9 @@ func hardDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 	}
 	g := db.gram()
 	d := g.d
+	if err := checkDeleteWrite(d, "Delete", g.table(p)); err != nil {
+		return err
+	}
 
 	sqlText, err := crudSQL(g, p, "delete", 0, true, func() []byte {
 		b := make([]byte, 0, 96)
@@ -305,6 +323,53 @@ func hardDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 }
 
 // --- shared helpers ---
+
+// checkUpdateWrite, checkDeleteWrite, and checkRestoreWrite reject the
+// UPDATE/DELETE statement family where the dialect has no synchronous
+// mutations with an honest affected-row count — rio's ErrNotFound,
+// ErrStaleObject, and idempotence probes are all built on that count, and
+// clickhouse-go reports 0 unconditionally. Each message names the
+// ClickHouse-native way out for its operation family.
+func checkUpdateWrite(d Dialect, op, table string) error {
+	if d.caps().mutations {
+		return nil
+	}
+	return fmt.Errorf("rio: %s is not supported on %s (no synchronous UPDATE with an affected-row count); ClickHouse updates are asynchronous mutations — issue one explicitly with rio.Exec(ctx, db, %q) or model updates as inserts into a ReplacingMergeTree table",
+		op, d.name(), "ALTER TABLE "+table+" UPDATE ... WHERE ...")
+}
+
+func checkDeleteWrite(d Dialect, op, table string) error {
+	if d.caps().mutations {
+		return nil
+	}
+	return fmt.Errorf("rio: %s is not supported on %s; use rio.Exec with a lightweight DELETE (%q, ClickHouse 23.3+) or ALTER TABLE ... DELETE, both asynchronous mutations",
+		op, d.name(), "DELETE FROM "+table+" WHERE ...")
+}
+
+func checkRestoreWrite(d Dialect, op string) error {
+	if d.caps().mutations {
+		return nil
+	}
+	return fmt.Errorf("rio: %s is not supported on %s (soft-delete writes are UPDATEs); use rio.Exec with ALTER TABLE ... UPDATE", op, d.name())
+}
+
+// checkGeneratedID upgrades the zero conventional ID from "let the database
+// generate it" to a loud error where the database cannot (autoIncrPK=false):
+// writing the zero as a real value instead would silently accumulate id=0
+// duplicates with no constraint to object. The `rio:",noautoincr"` tag is
+// the existing escape hatch when zero is a real value, with identical
+// semantics on every dialect (written as-is, never backfilled). Checked
+// before any stamping so a rejected row is returned untouched.
+func checkGeneratedID(d Dialect, op string, p *plan, rv reflect.Value) error {
+	if d.caps().autoIncrPK || p.autoIncr == nil {
+		return nil
+	}
+	if !fieldIsZero(p.autoIncr, rv.Addr().UnsafePointer(), rv) {
+		return nil
+	}
+	return fmt.Errorf("rio: %s on %s: %s.%s is zero and %s cannot generate it (no auto-increment); assign the ID yourself (UUID/Snowflake/etc), or tag the field `rio:\",noautoincr\"` if zero is a real value you mean to store",
+		op, d.name(), p.structName, p.autoIncr.name, d.name())
+}
 
 // updateSet resolves Update's column set. No list: every column except PKs,
 // CreatedAt, the version column (rendered separately as version+1), and the
@@ -760,6 +825,9 @@ func Restore[T any](ctx context.Context, db Queryer, row *T) error {
 	}
 	g := db.gram()
 	d := g.d
+	if err := checkRestoreWrite(d, "Restore"); err != nil {
+		return err
+	}
 	now := normalizeTime(db.conf().clock())
 
 	sqlText, err := crudSQL(g, p, "restore", 0, true, func() []byte {

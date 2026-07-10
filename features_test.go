@@ -1473,14 +1473,20 @@ func TestByteArrayArgStaysScalar(t *testing.T) {
 // SQLite the driver's format would miss every stored value.
 func TestNormalizeArgsNullTime(t *testing.T) {
 	at := time.Date(2026, 7, 9, 3, 4, 5, 0, time.UTC)
-	out := normalizeArgs(SQLite, []any{sql.NullTime{Time: at, Valid: true}, sql.NullTime{}})
+	out, err := normalizeArgs(SQLite, []any{sql.NullTime{Time: at, Valid: true}, sql.NullTime{}})
+	if err != nil {
+		t.Fatalf("normalizeArgs: %v", err)
+	}
 	if s, ok := out[0].(string); !ok || !strings.HasPrefix(s, "2026-07-09 03:04:05") {
 		t.Fatalf("valid NullTime must bind rio's text form: %#v", out[0])
 	}
 	if out[1] != nil {
 		t.Fatalf("invalid NullTime must bind NULL: %#v", out[1])
 	}
-	out = normalizeArgs(SQLite, []any{sql.Null[time.Time]{V: at, Valid: true}})
+	out, err = normalizeArgs(SQLite, []any{sql.Null[time.Time]{V: at, Valid: true}})
+	if err != nil {
+		t.Fatalf("normalizeArgs: %v", err)
+	}
 	if s, ok := out[0].(string); !ok || !strings.HasPrefix(s, "2026-07-09 03:04:05") {
 		t.Fatalf("sql.Null[time.Time] must bind rio's text form: %#v", out[0])
 	}

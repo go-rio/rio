@@ -107,6 +107,9 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 	}
 	g := db.gram()
 	d := g.d
+	if err := checkUpsertWrite(d, "Upsert"); err != nil {
+		return err
+	}
 	// MySQL has no conflict target — ON DUPLICATE KEY reacts to any unique
 	// index — so OnConflict is only required where the SQL needs it.
 	if !spec.doNothing && len(spec.conflict) == 0 && d.caps().conflictTarget {
@@ -231,6 +234,26 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 		return fillLastInsertID(p, rv, res.LastInsertId)
 	}
 	return nil
+}
+
+// checkUpsertWrite rejects the upsert family where no unique constraints
+// exist: without one there is no conflict to react to — every upsert would
+// silently insert another row.
+func checkUpsertWrite(d Dialect, op string) error {
+	if d.caps().uniqueKeys {
+		return nil
+	}
+	return fmt.Errorf("rio: %s is not supported on %s (no unique constraints, no conflict clause); insert a new row version into a ReplacingMergeTree table and read with Final() — background merges keep the latest version per sorting key", op, d.name())
+}
+
+// checkRacedCreate rejects FirstOrCreate/CreateOrFirst where no unique
+// constraint can arbitrate their race: both contracts are race-honest only
+// because the constraint decides the winner.
+func checkRacedCreate(d Dialect, op string) error {
+	if d.caps().uniqueKeys {
+		return nil
+	}
+	return fmt.Errorf("rio: %s is not supported on %s (no unique constraint to arbitrate the race — concurrent callers would both insert); use ReplacingMergeTree semantics or coordinate in the application", op, d.name())
 }
 
 // upsertSQL is crudSQLKeyed for the upsert family: the key additionally
@@ -450,6 +473,9 @@ func appendConflictSets(b []byte, d Dialect, table string, p *plan, update []*fi
 // re-read misses, a soft-deleted row is probably squatting on the unique key
 // (WithTrashed reveals it) and the duplicate-key error is returned as-is.
 func (q Query[T]) FirstOrCreate(ctx context.Context, db Queryer, row *T) error {
+	if err := checkRacedCreate(db.gram().d, "FirstOrCreate"); err != nil {
+		return err
+	}
 	found, err := q.First(ctx, db)
 	if err == nil {
 		*row = *found
@@ -480,6 +506,9 @@ func (q Query[T]) FirstOrCreate(ctx context.Context, db Queryer, row *T) error {
 // row instead — the race-honest inverse of FirstOrCreate (INSERT first, so
 // the unique constraint arbitrates instead of a racy SELECT).
 func (q Query[T]) CreateOrFirst(ctx context.Context, db Queryer, row *T) error {
+	if err := checkRacedCreate(db.gram().d, "CreateOrFirst"); err != nil {
+		return err
+	}
 	insErr := Insert(ctx, db, row)
 	if insErr == nil {
 		return nil
