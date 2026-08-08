@@ -7,8 +7,12 @@ github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkp
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
 github.com/go-rio/mysql v0.2.2 h1:plte79abQdCQ2i8nDMrl3YinhzflcihM2O68yBG1vNo=
 github.com/go-rio/mysql v0.2.2/go.mod h1:wGp5zvnp6SeepiTsi7rCh3+s1RQ4qD2E1QhJgZDXOMA=
+github.com/go-rio/mysql v0.3.0 h1:QXOJhTQ6OH/+fkMgG62JXE9HfI3K2wAkomMWaUQIGYk=
+github.com/go-rio/mysql v0.3.0/go.mod h1:SFKZcxV1zkuc5cqCi53Tjljs5MsxXtlnhVHboeY6oEU=
 github.com/go-rio/postgres v0.3.0 h1:oe6GeSPx+qaLEZVa2Dy+U7gGDeIS9+B1h2tTG7FnVes=
 github.com/go-rio/postgres v0.3.0/go.mod h1:ck2cdqSt9t4Z4G4ILIg/S/YRP+jyPPEwyJXkj4Xh3tY=
+github.com/go-rio/postgres v0.4.0 h1:W8Gpx0N1NvC1yHW7oIYbOxvDDlspDZJzMHyEs1LJMYc=
+github.com/go-rio/postgres v0.4.0/go.mod h1:io0muCvIui7aNHoIuczOPNhLGI9+RiME0aYDt1D4eoc=
 github.com/go-rio/rio v0.8.0 h1:paey1xU+1NglihZYPuMWIkXo86BoIGXFIF3j69xIxFI=
 github.com/go-rio/rio v0.8.0/go.mod h1:73ZQ/YRw/2l0DHKdlTZqhjEiICFZo4JEPp0zTFI4Ndk=
 github.com/go-sql-driver/mysql v1.10.0 h1:Q+1LV8DkHJvSYAdR83XzuhDaTykuDx0l6fkXxoWCWfw=
