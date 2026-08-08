@@ -258,6 +258,49 @@ func BenchmarkRebind(b *testing.B) {
 	})
 }
 
+func BenchmarkRebindTemplate(b *testing.B) {
+	q := `INSERT INTO "users" ("email", "age", "created_at", "updated_at") VALUES (?, ?, ?, ?)`
+	b.ReportAllocs()
+	for range b.N {
+		if _, _, err := rebindTemplate(pgLex, bindDollar, q); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestRebindTemplate(t *testing.T) {
+	tests := []struct {
+		name  string
+		lex   lexProfile
+		style bindStyle
+		in    string
+		want  string
+		n     int
+	}{
+		{"postgres", pgLex, bindDollar, `SELECT '?' AS q, a FROM t WHERE x = ? AND y = ? -- ?`, `SELECT '?' AS q, a FROM t WHERE x = $1 AND y = $2 -- ?`, 2},
+		{"sqlite unchanged", sqliteLex, bindQuestion, `SELECT * FROM t WHERE x = ?`, `SELECT * FROM t WHERE x = ?`, 1},
+		{"escaped question", sqliteLex, bindQuestion, `SELECT ??, ?`, `SELECT ?, ?`, 1},
+		{"clickhouse escaped question", chLex, bindQuestionEsc, `SELECT ??, ?`, `SELECT \?, ?`, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, n, err := rebindTemplate(tt.lex, tt.style, tt.in)
+			if err != nil {
+				t.Fatalf("rebindTemplate: %v", err)
+			}
+			if got != tt.want || n != tt.n {
+				t.Fatalf("rebindTemplate = %q, %d; want %q, %d", got, n, tt.want, tt.n)
+			}
+		})
+	}
+	if _, _, err := rebindTemplate(pgLex, bindDollar, `SELECT ?1`); err == nil {
+		t.Fatal("numbered placeholder must fail")
+	}
+	if _, _, err := rebindTemplate(chLex, bindQuestionEsc, "SELECT ? // hidden ?"); err == nil {
+		t.Fatal("clickhouse driver-blind question must fail when the statement has arguments")
+	}
+}
+
 // equalArgs compares argument lists by value, treating nil and empty as the
 // same so table entries can spell "no arguments" as nil.
 func equalArgs(a, b []any) bool {

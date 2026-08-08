@@ -25,8 +25,7 @@ const (
 	trashOnly                     // only them
 )
 
-// queryState is the non-generic body of Query[T]; renderers and the
-// preloader work on it without type parameters.
+// queryState is the non-generic body shared by renderers and preloaders.
 type queryState struct {
 	wheres  []cond
 	havings []cond
@@ -34,10 +33,7 @@ type queryState struct {
 	orders  []string
 	groups  []string
 
-	// err is the first structural error a builder call detected (a condition
-	// fragment whose own placeholder count contradicts its own arguments).
-	// Builders cannot return errors, so it surfaces at the render entry
-	// points and at Compile — before any SQL is sent.
+	// err defers the first builder error until validation or execution.
 	err error
 
 	limit, offset       int
@@ -53,43 +49,32 @@ type queryState struct {
 	counts   []string
 }
 
-// hasCond is one WhereHas/WhereHasNot: filter parents by the existence of
-// related rows, rendered as an EXISTS subquery — no row explosion, and the
-// same shape on all three dialects.
+// hasCond describes one WhereHas or WhereHasNot EXISTS predicate.
 type hasCond struct {
-	path string
-	not  bool
-	opts []RelOption
+	path      string
+	isNegated bool
+	opts      []RelOption
 }
 
-// Query is an immutable, connection-free query description. Every builder
-// method returns a derived copy; deriving several queries from one shared
-// base — including concurrently, including package-level bases — never
-// cross-contaminates. Queries hold no rendered SQL: rendering happens at the
-// execution point against the handle's grammar (Compiled caches it).
+// Query is an immutable, connection-free query description safe for
+// concurrent reuse. Builder methods return derived values. Must may attach an
+// internal SQL-shape cache, but never a database, transaction, or statement.
 type Query[T any] struct {
-	s queryState
+	s     queryState
+	cache *queryCache
 }
 
-// From starts a query for T's table: rio.From[User]().Where(...).All(ctx, db).
+type selectShape int
+
+const (
+	selectRows selectShape = iota
+	selectCount
+	selectExists
+)
+
+// From starts a query for T's table.
 func From[T any]() Query[T] {
 	return Query[T]{}
-}
-
-// copyArgs detaches variadic argument slices: callers passing slice... would
-// otherwise alias the builder's memory.
-func copyArgs(args []any) []any {
-	if len(args) == 0 {
-		return nil
-	}
-	return append([]any(nil), args...)
-}
-
-// appendOne appends onto a full-capacity view so derived queries never share
-// growth room — the immutability invariant. Every append in this file must
-// go through it (CI greps for bare appends).
-func appendOne[E any](s []E, e E) []E {
-	return append(s[:len(s):len(s)], e)
 }
 
 // Where adds an AND-ed condition written in SQL with ? placeholders.
@@ -97,6 +82,7 @@ func appendOne[E any](s []E, e E) []E {
 // never build it from untrusted input — dynamic identifiers belong in column
 // whitelists or rio.WriteColumns constants.
 func (q Query[T]) Where(expr string, args ...any) Query[T] {
+	q.cache = nil
 	q.s.wheres = appendOne(q.s.wheres, cond{expr: expr, args: copyArgs(args)})
 	q.s.noteCondArity("Where", expr, len(args))
 	return q
@@ -106,15 +92,15 @@ func (q Query[T]) Where(expr string, args ...any) Query[T] {
 // build the term from untrusted input — dynamic identifiers belong in column
 // whitelists or rio.WriteColumns constants.
 func (q Query[T]) OrderBy(expr string) Query[T] {
+	q.cache = nil
 	q.s.orders = appendOne(q.s.orders, expr)
 	return q
 }
 
-// GroupBy appends a GROUP BY term. Entity queries with GROUP BY are almost
-// always projections — prefer Raw — but filtering EXISTS-style uses remain.
-// The term is included verbatim; never build it from untrusted input — dynamic
-// identifiers belong in column whitelists or rio.WriteColumns constants.
+// GroupBy appends a verbatim GROUP BY term. Never build it from untrusted
+// input; whitelist dynamic identifiers or use WriteColumns constants.
 func (q Query[T]) GroupBy(expr string) Query[T] {
+	q.cache = nil
 	q.s.groups = appendOne(q.s.groups, expr)
 	return q
 }
@@ -123,63 +109,31 @@ func (q Query[T]) GroupBy(expr string) Query[T] {
 // never build it from untrusted input — dynamic identifiers belong in column
 // whitelists or rio.WriteColumns constants.
 func (q Query[T]) Having(expr string, args ...any) Query[T] {
+	q.cache = nil
 	q.s.havings = appendOne(q.s.havings, cond{expr: expr, args: copyArgs(args)})
 	q.s.noteCondArity("Having", expr, len(args))
 	return q
 }
 
-// noteCondArity checks one condition fragment's placeholder count against
-// its own arguments at build time. The statement-level total in rebind cannot
-// see fragment boundaries: complementary mismatches across fragments
-// (Where("name = ?", "alice", 30).Where("age = ?")) balance the total and
-// silently shift bindings, so each fragment carrying arguments must account
-// for itself. A slice argument counts as one — it expands inside IN (?) at
-// render. Fragments with no arguments stay legal: that is the compiled
-// exec-parameterized shape, and uncompiled they still fail loudly at the
-// statement level. When the dialect lexers disagree on the count the
-// fragment is dialect-sensitive and the decision defers to render, which
-// knows the real lexer.
-func (s *queryState) noteCondArity(clause, expr string, argc int) {
-	if argc == 0 || s.err != nil {
-		return
-	}
-	// One lexer pass decides the happy path: when the sqlite count matches,
-	// the full four-lexer comparison could only end in agreement (pass) or
-	// disagreement (defer) — never an error — so the other three passes are
-	// skipped.
-	lite := 0
-	_, _, _ = rebindCount(sqliteLex, expr, &lite)
-	if lite == argc {
-		return
-	}
-	pg, my, chn := 0, 0, 0
-	_, _, _ = rebindCount(pgLex, expr, &pg)
-	_, _, _ = rebindCount(mysqlLex, expr, &my)
-	_, _, _ = rebindCount(chLex, expr, &chn)
-	if pg != my || my != lite || lite != chn {
-		return
-	}
-	s.err = fmt.Errorf("rio: %s(%q) has %d placeholder(s) but %d argument(s)", clause, expr, pg, argc)
-}
-
-// Join appends a verbatim JOIN clause, for filtering through other tables:
-// Join("INNER JOIN orgs ON orgs.id = users.org_id"). Projections across
-// joins go through Raw — entity queries always select exactly T's columns.
-// Never build the clause from untrusted input — dynamic identifiers belong in
-// column whitelists or rio.WriteColumns constants.
+// Join appends a verbatim JOIN clause. Entity queries still select only T's
+// columns. Never build the clause from untrusted input; whitelist dynamic
+// identifiers or use WriteColumns constants.
 func (q Query[T]) Join(clause string) Query[T] {
+	q.cache = nil
 	q.s.joins = appendOne(q.s.joins, clause)
 	return q
 }
 
 // Limit caps the result. The value is rendered into the SQL, not bound.
 func (q Query[T]) Limit(n int) Query[T] {
+	q.cache = nil
 	q.s.limit, q.s.limitSet = n, true
 	return q
 }
 
 // Offset skips n rows.
 func (q Query[T]) Offset(n int) Query[T] {
+	q.cache = nil
 	q.s.offset, q.s.offsetSet = n, true
 	return q
 }
@@ -188,48 +142,41 @@ func (q Query[T]) Offset(n int) Query[T] {
 // transaction. SQLite locks the whole database anyway; there it is a no-op.
 // ClickHouse has no row locks at all and rejects it at render.
 func (q Query[T]) ForUpdate() Query[T] {
+	q.cache = nil
 	q.s.forUpdate = true
 	return q
 }
 
-// Final reads through ClickHouse's FINAL table modifier, merging row
-// versions at query time — the read-side companion of ReplacingMergeTree
-// deduplication (the Upsert replacement on that dialect). It applies to this
-// query's own SELECT only: preloads, WithCount, and WhereHas subqueries read
-// without FINAL. Every other dialect rejects it at render, and ClickHouse
-// itself rejects it on table engines without versioned merges
-// (ILLEGAL_FINAL). A blanket alternative is the final=1 setting on the
-// connection's DSN or profile, which applies FINAL server-side to every
-// table in every query.
+// Final applies ClickHouse's FINAL modifier to the main SELECT. It does not
+// affect preloads, WithCount, or WhereHas subqueries. Other dialects reject it.
 func (q Query[T]) Final() Query[T] {
+	q.cache = nil
 	q.s.final = true
 	return q
 }
 
 // WithTrashed includes soft-deleted rows.
 func (q Query[T]) WithTrashed() Query[T] {
+	q.cache = nil
 	q.s.trashed = trashWith
 	return q
 }
 
 // OnlyTrashed selects only soft-deleted rows.
 func (q Query[T]) OnlyTrashed() Query[T] {
+	q.cache = nil
 	q.s.trashed = trashOnly
 	return q
 }
 
 // AllRows is the explicit opt-in for UpdateAll/DeleteAll without conditions.
 func (q Query[T]) AllRows() Query[T] {
+	q.cache = nil
 	q.s.allRows = true
 	return q
 }
 
-// Scope applies reusable query functions in order, keeping the chain
-// readable — a scope is just func(Query[T]) Query[T], no registry and no
-// magic:
-//
-//	func Active(q rio.Query[User]) rio.Query[User] { return q.Where("active") }
-//	users, err := rio.From[User]().Scope(Active, Recent).All(ctx, db)
+// Scope applies reusable query functions in order.
 func (q Query[T]) Scope(fns ...func(Query[T]) Query[T]) Query[T] {
 	for _, fn := range fns {
 		q = fn(q)
@@ -237,98 +184,71 @@ func (q Query[T]) Scope(fns ...func(Query[T]) Query[T]) Query[T] {
 	return q
 }
 
-// WhereHas keeps only rows whose relation at path has at least one matching
-// row, rendered as EXISTS (...). Options constrain the related rows; nested
-// paths ("Posts.Comments") nest the EXISTS. Related soft-delete models are
-// filtered like preloading; RelWithTrashed applies to the leaf.
+// WhereHas keeps rows whose relation path has a matching row. Nested paths
+// nest EXISTS predicates, and RelWithTrashed applies to the leaf relation.
 func (q Query[T]) WhereHas(path string, opts ...RelOption) Query[T] {
+	q.cache = nil
 	q.s.hasConds = appendOne(q.s.hasConds, hasCond{path: path, opts: opts})
 	return q
 }
 
-// WhereHasNot keeps only rows whose relation at path has no matching row —
-// NOT EXISTS (...).
+// WhereHasNot keeps rows whose relation path has no matching row.
 func (q Query[T]) WhereHasNot(path string, opts ...RelOption) Query[T] {
-	q.s.hasConds = appendOne(q.s.hasConds, hasCond{path: path, not: true, opts: opts})
+	q.cache = nil
+	q.s.hasConds = appendOne(q.s.hasConds, hasCond{path: path, isNegated: true, opts: opts})
 	return q
 }
 
-// WithCount fills the relation's count target field with one GROUP BY query
-// per relation — the aggregate sibling of With. HasMany and ManyToMany only.
-// The target is an int64 field tagged countof:
-//
-//	PostsCount int64 `rio:",countof:Posts"`
+// WithCount fills the tagged int64 count target for a HasMany or ManyToMany
+// relation using one GROUP BY query.
 func (q Query[T]) WithCount(relation string) Query[T] {
+	q.cache = nil
 	q.s.counts = appendOne(q.s.counts, relation)
 	return q
 }
 
-// With preloads a relation after the main query, using one IN query per
-// relation (never JOINs — no row explosion, pagination stays correct).
-// Paths nest with dots: With("Posts.Comments"). Options customize the leaf.
+// With preloads a relation with a separate IN query. Dot-separated paths
+// preload nested relations; options apply to the leaf.
 func (q Query[T]) With(path string, opts ...RelOption) Query[T] {
+	q.cache = nil
 	q.s.withs = appendOne(q.s.withs, preloadSpec{path: path, opts: opts})
 	return q
 }
 
-// --- execution ---
-
-// All runs the query and returns every matching row.
-func (q Query[T]) All(ctx context.Context, db Queryer) ([]T, error) {
-	p, err := planOf[T]()
-	if err != nil {
-		return nil, err
-	}
-	if err := validateRelSpecs(p, &q.s); err != nil {
-		return nil, err
-	}
-	sqlText, args, err := renderSelect(db.gram(), p, &q.s, selectRows)
-	if err != nil {
-		return nil, err
-	}
-	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
-	if err != nil {
-		return nil, err
-	}
-	out, err := scanAll[T](rows, p, false)
-	finishQuery(finish, err)
-	if err != nil {
-		return nil, err
-	}
-	if err := preloadInto(ctx, db, p, out, q.s.withs); err != nil {
-		return nil, err
-	}
-	if err := countInto(ctx, db, p, out, q.s.counts); err != nil {
-		return nil, err
-	}
-	return out, nil
+// All runs the query and returns every matching row. args fill deferred
+// placeholders from Where and Having fragments in final SQL order.
+func (q Query[T]) All(ctx context.Context, db Queryer, args ...any) ([]T, error) {
+	return q.all(ctx, db, queryCacheAll, args)
 }
 
-// First returns the first matching row, or ErrNotFound. No implicit ORDER BY
-// is added: like SQL itself, order is undefined unless you ask for one.
-// Without a caller Limit, First fetches with LIMIT 1; an explicit Limit is
-// respected — Limit(0).First matches no rows and returns ErrNotFound, just
-// like All returning none.
-func (q Query[T]) First(ctx context.Context, db Queryer) (*T, error) {
-	p, err := planOf[T]()
-	if err != nil {
-		return nil, err
-	}
-	// Before the query: a miss returns ErrNotFound without reaching the
-	// preloader, which would otherwise hide a misspelled With until a row
-	// happened to match.
-	if err := validateRelSpecs(p, &q.s); err != nil {
-		return nil, err
-	}
+// First returns the first matching row or ErrNotFound. It adds LIMIT 1 only
+// when no limit was set and never adds an order.
+func (q Query[T]) First(ctx context.Context, db Queryer, args ...any) (*T, error) {
 	one := q
 	if !one.s.limitSet {
-		one = one.Limit(1)
+		one.s.limit, one.s.limitSet = 1, true
 	}
-	sqlText, args, err := renderSelect(db.gram(), p, &one.s, selectRows)
+	g := db.gram()
+	key := queryCacheKey{grammar: g, op: queryCacheFirst}
+	p, state, sqlText, bound, err := prepareCachedSelect[T](
+		one.cache,
+		key,
+		g,
+		&one.s,
+		selectRows,
+		args,
+	)
 	if err != nil {
 		return nil, err
 	}
-	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
+	rows, finish, err := runQuery(
+		ctx,
+		db,
+		"select",
+		p.structName,
+		sqlText,
+		bound,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -337,12 +257,9 @@ func (q Query[T]) First(ctx context.Context, db Queryer) (*T, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(q.s.withs) > 0 || len(q.s.counts) > 0 {
+	if len(state.withs) > 0 || len(state.counts) > 0 {
 		single := []T{*out}
-		if err := preloadInto(ctx, db, p, single, q.s.withs); err != nil {
-			return nil, err
-		}
-		if err := countInto(ctx, db, p, single, q.s.counts); err != nil {
+		if err := loadQueryRelations(ctx, db, p, single, state.withs, state.counts); err != nil {
 			return nil, err
 		}
 		*out = single[0]
@@ -350,16 +267,39 @@ func (q Query[T]) First(ctx context.Context, db Queryer) (*T, error) {
 	return out, nil
 }
 
-// Sole returns the single matching row; ErrNotFound when none match and
-// ErrMultipleRows when more than one does. Without a caller Limit it probes
-// with LIMIT 2; an explicit Limit is respected (like Compiled.Sole running
-// the compiled SQL as-is), so Limit(1) cannot detect a second row.
-func (q Query[T]) Sole(ctx context.Context, db Queryer) (*T, error) {
+// Sole returns the only matching row, ErrNotFound for none, or
+// ErrMultipleRows for more than one. It adds LIMIT 2 only when no limit is set.
+func (q Query[T]) Sole(ctx context.Context, db Queryer, args ...any) (*T, error) {
 	probe := q
 	if !probe.s.limitSet {
-		probe = probe.Limit(2)
+		probe.s.limit, probe.s.limitSet = 2, true
 	}
-	rows, err := probe.All(ctx, db)
+	g := db.gram()
+	key := queryCacheKey{grammar: g, op: queryCacheSole}
+	p, state, sqlText, bound, err := prepareCachedSelect[T](
+		probe.cache,
+		key,
+		g,
+		&probe.s,
+		selectRows,
+		args,
+	)
+	if err != nil {
+		return nil, err
+	}
+	sqlRows, finish, err := runQuery(
+		ctx,
+		db,
+		"select",
+		p.structName,
+		sqlText,
+		bound,
+	)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := scanAllN[T](sqlRows, p, false, 2)
+	finishQuery(finish, err)
 	if err != nil {
 		return nil, err
 	}
@@ -367,68 +307,219 @@ func (q Query[T]) Sole(ctx context.Context, db Queryer) (*T, error) {
 	case 0:
 		return nil, ErrNotFound
 	case 1:
+		if err := loadQueryRelations(ctx, db, p, rows, state.withs, state.counts); err != nil {
+			return nil, err
+		}
 		return &rows[0], nil
 	}
 	return nil, ErrMultipleRows
 }
 
-// Count runs SELECT count(*) with the query's conditions. Combined with
-// GroupBy or Having the intent (rows vs groups) is ambiguous, and a bare
-// HAVING would filter the single implicit aggregate group and silently
-// return 0 — both route through Raw instead.
-func (q Query[T]) Count(ctx context.Context, db Queryer) (int64, error) {
+// Count returns the number of matching rows. GroupBy and Having projections
+// are rejected; use Raw for those queries.
+func (q Query[T]) Count(ctx context.Context, db Queryer, args ...any) (int64, error) {
 	if len(q.s.groups) > 0 || len(q.s.havings) > 0 {
 		return 0, errors.New("rio: Count with GroupBy/Having is a projection (rows or groups?); use Raw")
 	}
-	p, err := planOf[T]()
+	g := db.gram()
+	key := queryCacheKey{grammar: g, op: queryCacheCount}
+	p, _, sqlText, bound, err := prepareCachedSelect[T](
+		q.cache,
+		key,
+		g,
+		&q.s,
+		selectCount,
+		args,
+	)
 	if err != nil {
 		return 0, err
 	}
-	sqlText, args, err := renderSelect(db.gram(), p, &q.s, selectCount)
+	rows, finish, err := runQuery(
+		ctx,
+		db,
+		"select",
+		p.structName,
+		sqlText,
+		bound,
+	)
 	if err != nil {
 		return 0, err
 	}
-	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
-	if err != nil {
-		return 0, err
-	}
-	ns, err := scanScalars[int64](rows)
+	n, found, err := scanScalarOne[int64](rows)
 	finishQuery(finish, err)
 	if err != nil {
 		return 0, err
 	}
-	if len(ns) == 0 {
+	if !found {
 		return 0, nil
 	}
-	return ns[0], nil
+	return n, nil
 }
 
 // Exists reports whether any row matches.
-func (q Query[T]) Exists(ctx context.Context, db Queryer) (bool, error) {
-	p, err := planOf[T]()
+func (q Query[T]) Exists(ctx context.Context, db Queryer, args ...any) (bool, error) {
+	g := db.gram()
+	key := queryCacheKey{grammar: g, op: queryCacheExists}
+	p, _, sqlText, bound, err := prepareCachedSelect[T](
+		q.cache,
+		key,
+		g,
+		&q.s,
+		selectExists,
+		args,
+	)
 	if err != nil {
 		return false, err
 	}
-	sqlText, args, err := renderSelect(db.gram(), p, &q.s, selectExists)
+	rows, finish, err := runQuery(
+		ctx,
+		db,
+		"select",
+		p.structName,
+		sqlText,
+		bound,
+	)
 	if err != nil {
 		return false, err
 	}
-	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
-	if err != nil {
-		return false, err
-	}
-	ns, err := scanScalars[int64](rows)
+	_, found, err := scanScalarOne[int64](rows)
 	finishQuery(finish, err)
 	if err != nil {
 		return false, err
 	}
-	return len(ns) > 0, nil
+	return found, nil
 }
 
-// Find fetches a row by primary key. Composite keys pass every part in
-// struct-field declaration order. The statement shape is fixed, so the SQL
-// is rendered once per grammar and cached — Find is the hottest read there
-// is.
+// Rows streams results and closes them on completion or early break. It yields
+// a zero T with the first error. With and WithCount cannot be streamed.
+func (q Query[T]) Rows(ctx context.Context, db Queryer, args ...any) iter.Seq2[T, error] {
+	execArgs := copyArgs(args)
+	return func(yield func(T, error) bool) {
+		var zero T
+		if len(q.s.withs) > 0 || len(q.s.counts) > 0 {
+			yield(zero, errors.New("rio: Rows cannot stream With/WithCount (preloading needs the full result); use All"))
+			return
+		}
+		g := db.gram()
+		key := queryCacheKey{grammar: g, op: queryCacheRows}
+		p, _, sqlText, bound, err := prepareCachedSelect[T](
+			q.cache,
+			key,
+			g,
+			&q.s,
+			selectRows,
+			execArgs,
+		)
+		if err != nil {
+			yield(zero, err)
+			return
+		}
+		rows, finish, err := runQuery(
+			ctx,
+			db,
+			"select",
+			p.structName,
+			sqlText,
+			bound,
+		)
+		if err != nil {
+			yield(zero, err)
+			return
+		}
+		finished := false
+		defer func() {
+			if !finished {
+				_ = finishRows(rows, finish, nil)
+			}
+		}()
+
+		fields, err := entityFields(rows, p, 0)
+		if err != nil {
+			finished = true
+			err = finishRows(rows, finish, err)
+			yield(zero, err)
+			return
+		}
+		rs := newRowScanner(fields, nil)
+		defer rs.release()
+		var row T
+		for rows.Next() {
+			row = zero
+			if err := rs.scan(rows, unsafe.Pointer(&row)); err != nil {
+				finished = true
+				err = finishRows(rows, finish, err)
+				yield(zero, err)
+				return
+			}
+			if !yield(row, nil) {
+				finished = true
+				_ = finishRows(rows, finish, nil)
+				return
+			}
+		}
+		err = rows.Err()
+		finished = true
+		err = finishRows(rows, finish, err)
+		if err != nil {
+			yield(zero, err)
+		}
+	}
+}
+
+// Pluck extracts a single column under the query's conditions:
+// emails, err := q.Pluck[string](ctx, db, "email", 18). The column must be one
+// of T's mapped columns — expressions go through Raw.
+func (q Query[T]) Pluck[V any](ctx context.Context, db Queryer, column string, args ...any) ([]V, error) {
+	if len(q.s.groups) > 0 || len(q.s.havings) > 0 {
+		return nil, errors.New("rio: Pluck with GroupBy/Having is a projection; use Raw")
+	}
+	g := db.gram()
+	key := queryCacheKey{grammar: g, op: queryCachePluck, column: column}
+	entry, outArgs, cached, err := q.cache.load(key, g.d, args)
+	if err != nil {
+		return nil, err
+	}
+	var p *plan
+	var sqlText string
+	if cached {
+		p, sqlText = entry.plan, entry.sql
+	} else {
+		var state queryState
+		p, state, err = prepareQueryState[T](g.d, &q.s, args)
+		if err != nil {
+			return nil, err
+		}
+		f, ok := p.byColumn[column]
+		if !ok {
+			return nil, fmt.Errorf("rio: Pluck: %s has no column %q (expressions go through Raw)", p.structName, column)
+		}
+		sqlText, outArgs, err = renderPluck(g, p, f, &state)
+		if err != nil {
+			return nil, err
+		}
+		sqlText, outArgs, err = q.cache.store(key, g.d, p, &q.s, args, sqlText, outArgs)
+		if err != nil {
+			return nil, err
+		}
+	}
+	rows, finish, err := runQuery(
+		ctx,
+		db,
+		"select",
+		p.structName,
+		sqlText,
+		outArgs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	out, err := scanScalarsCap[V](rows, 0, queryCapacity(q.s.limit, q.s.limitSet))
+	finishQuery(finish, err)
+	return out, err
+}
+
+// Find fetches a row by primary key. Pass composite key parts in struct-field
+// declaration order.
 func Find[T any](ctx context.Context, db Queryer, key ...any) (*T, error) {
 	p, err := planOf[T]()
 	if err != nil {
@@ -485,13 +576,122 @@ func Find[T any](ctx context.Context, db Queryer, key ...any) (*T, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, keyArgs)
+	rows, finish, err := runQuery(
+		ctx,
+		db,
+		"select",
+		p.structName,
+		sqlText,
+		keyArgs,
+	)
 	if err != nil {
 		return nil, err
 	}
 	out, err := scanOne[T](rows, p)
 	finishQuery(finish, err)
 	return out, err
+}
+
+func (q Query[T]) all(ctx context.Context, db Queryer, op queryCacheOp, args []any) ([]T, error) {
+	g := db.gram()
+	key := queryCacheKey{grammar: g, op: op}
+	p, state, sqlText, bound, err := prepareCachedSelect[T](
+		q.cache,
+		key,
+		g,
+		&q.s,
+		selectRows,
+		args,
+	)
+	if err != nil {
+		return nil, err
+	}
+	rows, finish, err := runQuery(
+		ctx,
+		db,
+		"select",
+		p.structName,
+		sqlText,
+		bound,
+	)
+	if err != nil {
+		return nil, err
+	}
+	out, err := scanAllCap[T](rows, p, false, 0, queryCapacity(state.limit, state.limitSet))
+	finishQuery(finish, err)
+	if err != nil {
+		return nil, err
+	}
+	if err := loadQueryRelations(ctx, db, p, out, state.withs, state.counts); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// noteCondArity records an inline-argument mismatch per fragment. Deferred and
+// dialect-sensitive fragments are checked at execution time.
+func (s *queryState) noteCondArity(clause, expr string, argc int) {
+	if argc == 0 || s.err != nil {
+		return
+	}
+	// Avoid the remaining lexer passes on the common, matching path.
+	var sqliteCount int
+	_, _, _ = rebindCount(sqliteLex, expr, &sqliteCount)
+	if sqliteCount == argc {
+		return
+	}
+	var postgresCount, mysqlCount, clickhouseCount int
+	_, _, _ = rebindCount(pgLex, expr, &postgresCount)
+	_, _, _ = rebindCount(mysqlLex, expr, &mysqlCount)
+	_, _, _ = rebindCount(chLex, expr, &clickhouseCount)
+	if postgresCount != mysqlCount || mysqlCount != sqliteCount || sqliteCount != clickhouseCount {
+		return
+	}
+	s.err = fmt.Errorf(
+		"rio: %s(%q) has %d placeholder(s) but %d argument(s)",
+		clause,
+		expr,
+		postgresCount,
+		argc,
+	)
+}
+
+// copyArgs prevents a caller's variadic slice from aliasing query state.
+func copyArgs(args []any) []any {
+	if len(args) == 0 {
+		return nil
+	}
+	return append([]any(nil), args...)
+}
+
+// appendOne preserves immutability by preventing shared growth capacity.
+func appendOne[E any](s []E, e E) []E {
+	return append(s[:len(s):len(s)], e)
+}
+
+func loadQueryRelations[T any](
+	ctx context.Context,
+	db Queryer,
+	p *plan,
+	rows []T,
+	withs []preloadSpec,
+	counts []string,
+) error {
+	if err := preloadInto(ctx, db, p, rows, withs); err != nil {
+		return err
+	}
+	remaining, err := countsNotPreloaded(p, rows, withs, counts)
+	if err != nil {
+		return err
+	}
+	return countInto(ctx, db, p, rows, remaining)
+}
+
+func queryCapacity(limit int, isSet bool) int {
+	if isSet && limit > 0 && limit <= 1024 {
+		return limit
+	}
+	return 0
 }
 
 func pkColumns(p *plan) string {
@@ -505,19 +705,7 @@ func pkColumns(p *plan) string {
 	return s
 }
 
-// --- rendering ---
-
-type selectShape int
-
-const (
-	selectRows selectShape = iota
-	selectCount
-	selectExists
-)
-
-// renderSelect renders one SELECT in the grammar's dialect. Entity column
-// lists are always table-qualified: JOINs never make them ambiguous and the
-// golden SQL stays stable.
+// renderSelect qualifies entity columns so JOINs cannot make them ambiguous.
 func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string, []any, error) {
 	d := g.d
 	if err := checkFinal(d, s); err != nil {
@@ -535,9 +723,7 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 		b = append(b, "SELECT 1 FROM "...)
 		b = d.quote(b, table)
 	default:
-		// The qualified column list never changes per plan and grammar;
-		// render it once.
-		head, err := g.cachedSQL(p, "selecthead", 0, 0, "", func() (string, error) {
+		head, err := g.cachedSQL(p, "selecthead", 0, 0, upsertCacheKey{}, func() (string, error) {
 			hb := make([]byte, 0, 128)
 			hb = append(hb, "SELECT "...)
 			for i, f := range p.fields {
@@ -607,13 +793,9 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 			return "", nil, err
 		}
 	case selectExists:
-		// Existence needs exactly one probe row; user LIMIT/OFFSET would be
-		// meaningless here and doubling LIMIT clauses is invalid SQL.
 		b = append(b, " LIMIT 1"...)
 	}
-	// FOR UPDATE never reaches the count shape: PostgreSQL rejects row locks
-	// on aggregates, and counting locks nothing meaningful anyway. Exists
-	// keeps it — locking the probe row is well-defined.
+	// PostgreSQL rejects row locks on aggregate counts.
 	if s.forUpdate && shape != selectCount {
 		var err error
 		if b, err = appendForUpdate(b, d); err != nil {
@@ -624,16 +806,16 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 	return finishSQL(d, b, args)
 }
 
-// appendForUpdate renders the FOR UPDATE tail per the dialect's mode:
-// rendered, elided (SQLite's whole-db locking is the documented equivalent),
-// or rejected — ClickHouse has no row locks, and silently dropping a
-// requested lock would degrade instead of fail.
+// appendForUpdate renders, elides, or rejects the lock by dialect capability.
 func appendForUpdate(b []byte, d Dialect) ([]byte, error) {
 	switch d.caps().forUpdate {
 	case forUpdateRender:
 		return append(b, " FOR UPDATE"...), nil
 	case forUpdateReject:
-		return nil, unsupportedf("rio: ForUpdate is not supported on %s (no row locks); remove it — reads there are lock-free snapshots", d.name())
+		return nil, unsupportedf(
+			"rio: ForUpdate is not supported on %s (no row locks); remove it — reads there are lock-free snapshots",
+			d.name(),
+		)
 	}
 	return b, nil // forUpdateElide
 }
@@ -641,7 +823,10 @@ func appendForUpdate(b []byte, d Dialect) ([]byte, error) {
 // checkFinal rejects Final() on dialects without the FINAL table modifier.
 func checkFinal(d Dialect, s *queryState) error {
 	if s.final && !d.caps().finalTable {
-		return unsupportedf("rio: Final() requires a dialect with the FINAL table modifier (clickhouse); remove it on %s", d.name())
+		return unsupportedf(
+			"rio: Final() requires a dialect with the FINAL table modifier (clickhouse); remove it on %s",
+			d.name(),
+		)
 	}
 	return nil
 }
@@ -674,10 +859,15 @@ func appendLimitOffset(b []byte, d Dialect, s *queryState) ([]byte, error) {
 	return b, nil
 }
 
-// renderWhere renders user conditions, EXISTS relation filters, and the
-// soft-delete filter. Every statement that carries user conditions renders
-// through here, so this is where a builder-recorded fragment error surfaces.
-func renderWhere(b []byte, args []any, g *grammar, table string, p *plan, s *queryState) ([]byte, []any, error) {
+// renderWhere combines user, relation, and soft-delete predicates.
+func renderWhere(
+	b []byte,
+	args []any,
+	g *grammar,
+	table string,
+	p *plan,
+	s *queryState,
+) ([]byte, []any, error) {
 	if s.err != nil {
 		return nil, nil, s.err
 	}
@@ -703,7 +893,7 @@ func renderWhere(b []byte, args []any, g *grammar, table string, p *plan, s *que
 			return nil, nil, fmt.Errorf("rio: WhereHas needs an entity query")
 		}
 		and()
-		if hc.not {
+		if hc.isNegated {
 			b = append(b, "NOT "...)
 		}
 		var rq relQuery
@@ -735,10 +925,17 @@ func renderWhere(b []byte, args []any, g *grammar, table string, p *plan, s *que
 	return b, args, nil
 }
 
-// renderExists renders one EXISTS(...) level for a relation path. The
-// related table always gets a depth-numbered alias so self-referencing
-// relations never collide with the outer table, and rendering stays uniform.
-func renderExists(b []byte, args []any, g *grammar, owner *plan, ownerRef string, path string, leaf *relQuery, depth int) ([]byte, []any, error) {
+// renderExists aliases each path level so self-relations cannot collide.
+func renderExists(
+	b []byte,
+	args []any,
+	g *grammar,
+	owner *plan,
+	ownerRef string,
+	path string,
+	leaf *relQuery,
+	depth int,
+) ([]byte, []any, error) {
 	d := g.d
 	head, tail := splitPath(path)
 	rel, ok := owner.rels[head]
@@ -817,13 +1014,8 @@ func renderExists(b []byte, args []any, g *grammar, owner *plan, ownerRef string
 	return append(b, ')'), args, nil
 }
 
-// finishSQL runs the rebind pipeline (IN expansion then placeholder
-// renumbering in one lexer pass), then checks the dialect's bind budget and
-// normalizes arguments.
-//
-// finishSQL takes ownership of b: the returned SQL may alias its memory
-// (rebind returns its input unchanged when nothing rewrites), so the caller
-// must not read or append to b afterwards.
+// finishSQL expands slices, rebinds placeholders, checks the bind budget, and
+// normalizes arguments. It takes ownership of b.
 func finishSQL(d Dialect, b []byte, args []any) (string, []any, error) {
 	return finishSQLText(d, byteString(b), args)
 }
@@ -844,33 +1036,23 @@ func finishSQLText(d Dialect, sqlText string, args []any) (string, []any, error)
 	return out, outArgs, nil
 }
 
-// checkBindCount rejects a statement whose post-expansion argument count
-// exceeds the dialect's bind budget before the SQL leaves rio. The server's
-// own answer is an opaque protocol error (PostgreSQL: "bind message has
-// 65536 parameter formats but 0 parameters"), and ClickHouse's budget is
-// rio's text-size heuristic the server never enforces per parameter — this
-// funnel is the only place the limit fails honestly on every dialect. rio's
-// own writers already chunk to the budget (InsertAll, preloads, join-table
-// writes); a large user slice expanding inside IN (?) is the path that can
-// blow through it.
+// checkBindCount enforces the dialect's post-expansion bind budget before
+// execution. Internal batch operations chunk automatically; user queries do not.
 func checkBindCount(d Dialect, n int) error {
 	if limit := d.caps().maxBindParams; n > limit {
-		return fmt.Errorf("rio: statement binds %d parameters, over the %s limit of %d; chunk the query yourself (preloading via With chunks automatically)",
-			n, d.name(), limit)
+		return fmt.Errorf(
+			"rio: statement binds %d parameters, over the %s limit of %d; "+
+				"chunk the query yourself (preloading via With chunks automatically)",
+			n,
+			d.name(),
+			limit,
+		)
 	}
 	return nil
 }
 
-// normalizeArgs applies the write-side time rule to user-supplied arguments
-// (Where, Having, Set, Raw, compiled binds): UTC, microsecond precision,
-// dialect encoding. Without it a time compared on SQLite would use the
-// driver's own text format and silently miss rio's stored values. On
-// ClickHouse it additionally rejects times outside the DateTime64 range
-// (silently clamped server-side otherwise) and binds byte payloads as
-// strings (interpolated as Array literals otherwise).
-// Copy-on-write: the input is caller-owned (Find keys, compiled exec args,
-// a RawQuery's stored args shared across concurrent executions) and is
-// never mutated; with no time values the pass allocates nothing.
+// normalizeArgs applies rio's time and ClickHouse byte encoding rules without
+// mutating caller-owned arguments. It also rejects out-of-range DateTime64 values.
 func normalizeArgs(d Dialect, args []any) ([]any, error) {
 	out := args
 	cloned := false
@@ -894,8 +1076,6 @@ func normalizeArgs(d Dialect, args []any) ([]any, error) {
 				v = d.bindTime(nt)
 			}
 		case sql.NullTime:
-			// Left alone, the driver's Valuer path would encode the inner
-			// time in its own format, missing rio's stored SQLite text.
 			if !t.Valid {
 				v = nil
 			} else {
@@ -919,8 +1099,7 @@ func normalizeArgs(d Dialect, args []any) ([]any, error) {
 			if t <= math.MaxInt64 {
 				continue
 			}
-			// database/sql refuses uint64 with the high bit set; the
-			// decimal literal binds fine everywhere (mirrors bindArg).
+			// database/sql rejects uint64 values above MaxInt64.
 			v = strconv.FormatUint(t, 10)
 		case uint:
 			if uint64(t) <= math.MaxInt64 {
@@ -931,8 +1110,7 @@ func normalizeArgs(d Dialect, args []any) ([]any, error) {
 			if d.name() != "clickhouse" {
 				continue
 			}
-			// clickhouse-go interpolates []byte as an Array(UInt8) literal;
-			// String is ClickHouse's byte container (mirrors bindArg).
+			// clickhouse-go otherwise interpolates []byte as Array(UInt8).
 			if t == nil {
 				v = nil
 			} else {
@@ -957,85 +1135,12 @@ func normalizeArgs(d Dialect, args []any) ([]any, error) {
 	return out, nil
 }
 
-// Rows streams the result without materializing it, for result sets too
-// large to hold: for u, err := range q.Rows(ctx, db). Iteration stops on the
-// first error (yielded with a zero T) and closing happens automatically,
-// including on early break. Preloading needs the full set and cannot stream
-// — With/WithCount on a streamed query yields an error immediately.
-func (q Query[T]) Rows(ctx context.Context, db Queryer) iter.Seq2[T, error] {
-	return func(yield func(T, error) bool) {
-		var zero T
-		if len(q.s.withs) > 0 || len(q.s.counts) > 0 {
-			yield(zero, errors.New("rio: Rows cannot stream With/WithCount (preloading needs the full result); use All"))
-			return
-		}
-		p, err := planOf[T]()
-		if err != nil {
-			yield(zero, err)
-			return
-		}
-		sqlText, args, err := renderSelect(db.gram(), p, &q.s, selectRows)
-		if err != nil {
-			yield(zero, err)
-			return
-		}
-		rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
-		if err != nil {
-			yield(zero, err)
-			return
-		}
-		defer rows.Close()
-
-		fields, err := entityFields(rows, p, 0)
-		if err != nil {
-			finishQuery(finish, err)
-			yield(zero, err)
-			return
-		}
-		rs := newRowScanner(fields, nil)
-		defer rs.release()
-		for rows.Next() {
-			var row T
-			if err := rs.scan(rows, unsafe.Pointer(&row)); err != nil {
-				finishQuery(finish, err)
-				yield(zero, err)
-				return
-			}
-			if !yield(row, nil) {
-				finishQuery(finish, nil)
-				return
-			}
-		}
-		err = rows.Err()
-		finishQuery(finish, err)
-		if err != nil {
-			yield(zero, err)
-		}
-	}
-}
-
-// Pluck extracts a single column under the query's conditions:
-// emails, err := rio.Pluck[string](ctx, db, q, "email"). The column must be
-// one of T's mapped columns — expressions go through Raw.
-func Pluck[V any, T any](ctx context.Context, db Queryer, q Query[T], column string) ([]V, error) {
-	if len(q.s.groups) > 0 || len(q.s.havings) > 0 {
-		return nil, errors.New("rio: Pluck with GroupBy/Having is a projection; use Raw")
-	}
-	p, err := planOf[T]()
-	if err != nil {
-		return nil, err
-	}
-	f, ok := p.byColumn[column]
-	if !ok {
-		return nil, fmt.Errorf("rio: Pluck: %s has no column %q (expressions go through Raw)", p.structName, column)
-	}
-	g := db.gram()
+func renderPluck(g *grammar, p *plan, f *field, s *queryState) (string, []any, error) {
 	d := g.d
-	if err := checkFinal(d, &q.s); err != nil {
-		return nil, err
+	if err := checkFinal(d, s); err != nil {
+		return "", nil, err
 	}
 	table := g.table(p)
-
 	b := make([]byte, 0, 128)
 	b = append(b, "SELECT "...)
 	b = d.quote(b, table)
@@ -1043,46 +1148,37 @@ func Pluck[V any, T any](ctx context.Context, db Queryer, q Query[T], column str
 	b = d.quote(b, f.column)
 	b = append(b, " FROM "...)
 	b = d.quote(b, table)
-	if q.s.final {
+	if s.final {
 		b = append(b, " FINAL"...)
 	}
-	for _, j := range q.s.joins {
+	for _, j := range s.joins {
 		b = append(b, ' ')
 		b = append(b, j...)
 	}
 	var args []any
-	b, args, err = renderWhere(b, args, g, table, p, &q.s)
+	var err error
+	b, args, err = renderWhere(b, args, g, table, p, s)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	if len(q.s.orders) > 0 {
+	if len(s.orders) > 0 {
 		b = append(b, " ORDER BY "...)
-		for i, o := range q.s.orders {
+		for i, order := range s.orders {
 			if i > 0 {
 				b = append(b, ", "...)
 			}
-			b = append(b, o...)
+			b = append(b, order...)
 		}
 	}
-	b, err = appendLimitOffset(b, d, &q.s)
+	b, err = appendLimitOffset(b, d, s)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	if q.s.forUpdate {
-		if b, err = appendForUpdate(b, d); err != nil {
-			return nil, err
+	if s.forUpdate {
+		b, err = appendForUpdate(b, d)
+		if err != nil {
+			return "", nil, err
 		}
 	}
-
-	sqlText, outArgs, err := finishSQL(d, b, args)
-	if err != nil {
-		return nil, err
-	}
-	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, outArgs)
-	if err != nil {
-		return nil, err
-	}
-	out, err := scanScalars[V](rows)
-	finishQuery(finish, err)
-	return out, err
+	return finishSQL(d, b, args)
 }

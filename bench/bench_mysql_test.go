@@ -40,6 +40,8 @@ const mysqlDDL = `CREATE TABLE bench_users (
 	updated_at DATETIME(6) NOT NULL
 )`
 
+const mysqlResetSQL = "DELETE FROM bench_users"
+
 func mysqlDSN(b *testing.B) string {
 	b.Helper()
 	dsn := os.Getenv("RIO_BENCH_MYSQL_DSN")
@@ -94,7 +96,7 @@ func BenchmarkMySQLReadOne_Rio(b *testing.B) {
 	seedMySQL(b, raw, 100)
 	db := riomysql.New(raw)
 	ctx := context.Background()
-	q := rio.MustCompile[BenchUser](rio.From[BenchUser]().Where("id = ?").Limit(1))
+	q := rio.From[BenchUser]().Where("id = ?").Limit(1).Must()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -112,7 +114,7 @@ func BenchmarkMySQLReadOne_RioStmtCache(b *testing.B) {
 	seedMySQL(b, raw, 100)
 	db := riomysql.New(raw, rio.WithStmtCache())
 	ctx := context.Background()
-	q := rio.MustCompile[BenchUser](rio.From[BenchUser]().Where("id = ?").Limit(1))
+	q := rio.From[BenchUser]().Where("id = ?").Limit(1).Must()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -129,6 +131,7 @@ func BenchmarkMySQLInsert_RioStmtCache(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		resetInsertTable(b, raw, i, 1, mysqlResetSQL)
 		u := BenchUser{Email: "x@example.com", Age: 30}
 		if err := rio.Insert(ctx, db, &u); err != nil {
 			b.Fatal(err)
@@ -169,7 +172,7 @@ func BenchmarkMySQLReadOne_Stdlib(b *testing.B) {
 
 func BenchmarkMySQLReadOne_Gorm(b *testing.B) {
 	gdb := benchMySQLGorm(b)
-	sqlDB, _ := gdb.DB()
+	sqlDB := gormSQLDB(b, gdb)
 	seedMySQL(b, sqlDB, 100)
 	ctx := context.Background()
 	b.ReportAllocs()
@@ -187,7 +190,7 @@ func BenchmarkMySQLReadHundred_Rio(b *testing.B) {
 	seedMySQL(b, raw, 100)
 	db := riomysql.New(raw)
 	ctx := context.Background()
-	q := rio.MustCompile[BenchUser](rio.From[BenchUser]().Where("age >= ?"))
+	q := rio.From[BenchUser]().Where("age >= ?").Must()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -201,30 +204,26 @@ func BenchmarkMySQLReadHundred_Rio(b *testing.B) {
 func BenchmarkMySQLReadHundred_Stdlib(b *testing.B) {
 	raw := benchMySQLRaw(b)
 	seedMySQL(b, raw, 100)
+	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rows, err := raw.Query("SELECT `id`, `email`, `age`, `created_at`, `updated_at` FROM bench_users WHERE age >= ?", 0)
-		if err != nil {
-			b.Fatal(err)
-		}
-		var out []BenchUser
-		for rows.Next() {
-			var u BenchUser
-			if err := rows.Scan(&u.ID, &u.Email, &u.Age, &u.CreatedAt, &u.UpdatedAt); err != nil {
-				b.Fatal(err)
-			}
-			out = append(out, u)
-		}
-		if rows.Close(); len(out) != 100 {
-			b.Fatal(len(out))
+		out, err := readHundredStdlib(
+			ctx,
+			raw,
+			"SELECT `id`, `email`, `age`, `created_at`, `updated_at` "+
+				"FROM bench_users WHERE age >= ?",
+			0,
+		)
+		if err != nil || len(out) != 100 {
+			b.Fatalf("%v %d", err, len(out))
 		}
 	}
 }
 
 func BenchmarkMySQLReadHundred_Gorm(b *testing.B) {
 	gdb := benchMySQLGorm(b)
-	sqlDB, _ := gdb.DB()
+	sqlDB := gormSQLDB(b, gdb)
 	seedMySQL(b, sqlDB, 100)
 	ctx := context.Background()
 	b.ReportAllocs()
@@ -244,6 +243,7 @@ func BenchmarkMySQLInsert_Rio(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		resetInsertTable(b, raw, i, 1, mysqlResetSQL)
 		u := BenchUser{Email: "x@example.com", Age: 30}
 		if err := rio.Insert(ctx, db, &u); err != nil {
 			b.Fatal(err)
@@ -256,6 +256,7 @@ func BenchmarkMySQLInsert_Stdlib(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		resetInsertTable(b, raw, i, 1, mysqlResetSQL)
 		now := time.Now().UTC().Truncate(time.Microsecond)
 		res, err := raw.Exec("INSERT INTO bench_users (email, age, created_at, updated_at) VALUES (?, ?, ?, ?)",
 			"x@example.com", 30, now, now)
@@ -270,10 +271,12 @@ func BenchmarkMySQLInsert_Stdlib(b *testing.B) {
 
 func BenchmarkMySQLInsert_Gorm(b *testing.B) {
 	gdb := benchMySQLGorm(b)
+	sqlDB := gormSQLDB(b, gdb)
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		resetInsertTable(b, sqlDB, i, 1, mysqlResetSQL)
 		u := BenchUser{Email: "x@example.com", Age: 30}
 		if err := gdb.WithContext(ctx).Create(&u).Error; err != nil {
 			b.Fatal(err)
@@ -316,7 +319,7 @@ func BenchmarkMySQLUpdate_Stdlib(b *testing.B) {
 
 func BenchmarkMySQLUpdate_Gorm(b *testing.B) {
 	gdb := benchMySQLGorm(b)
-	sqlDB, _ := gdb.DB()
+	sqlDB := gormSQLDB(b, gdb)
 	seedMySQL(b, sqlDB, 100)
 	ctx := context.Background()
 	var u BenchUser
@@ -340,11 +343,25 @@ func BenchmarkMySQLInsertBatch100_Rio(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rows := make([]BenchUser, 100)
-		for j := range rows {
-			rows[j] = BenchUser{Email: "x@example.com", Age: j}
-		}
+		resetInsertTable(b, raw, i, benchBatchSize, mysqlResetSQL)
+		rows := newBenchBatch()
 		if err := rio.InsertAll(ctx, db, rows); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkMySQLInsertBatch100_Stdlib(b *testing.B) {
+	raw := benchMySQLRaw(b)
+	ctx := context.Background()
+	query := questionBatchInsertSQL(false)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resetInsertTable(b, raw, i, benchBatchSize, mysqlResetSQL)
+		rows := newBenchBatch()
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		if _, err := raw.ExecContext(ctx, query, batchInsertArgs(rows, now)...); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -352,14 +369,13 @@ func BenchmarkMySQLInsertBatch100_Rio(b *testing.B) {
 
 func BenchmarkMySQLInsertBatch100_Gorm(b *testing.B) {
 	gdb := benchMySQLGorm(b)
+	sqlDB := gormSQLDB(b, gdb)
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rows := make([]BenchUser, 100)
-		for j := range rows {
-			rows[j] = BenchUser{Email: "x@example.com", Age: j}
-		}
+		resetInsertTable(b, sqlDB, i, benchBatchSize, mysqlResetSQL)
+		rows := newBenchBatch()
 		if err := gdb.WithContext(ctx).Create(&rows).Error; err != nil {
 			b.Fatal(err)
 		}

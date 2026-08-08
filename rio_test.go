@@ -101,7 +101,8 @@ func TestFindByPrimaryKey(t *testing.T) {
 		t.Fatalf("Find must respect soft delete: %s", got)
 	}
 
-	if _, err := Find[User](context.Background(), db, 1, 2); err == nil || !strings.Contains(err.Error(), "1 key part(s)") {
+	_, err = Find[User](context.Background(), db, 1, 2)
+	if err == nil || !strings.Contains(err.Error(), "1 key part(s)") {
 		t.Fatalf("composite arity should be checked: %v", err)
 	}
 }
@@ -198,6 +199,27 @@ func TestInsertMySQLLastInsertID(t *testing.T) {
 	}
 }
 
+func TestInsertSQLiteLastInsertID(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueExec(99, 1)
+
+	u := &User{Email: "a@x"}
+	if err := Insert(context.Background(), db, u); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	got := f.logged()[0]
+	if strings.Contains(got, "RETURNING") {
+		t.Fatalf("sqlite auto-increment-only backfill must use LastInsertId: %s", got)
+	}
+	if !strings.HasPrefix(got, `INSERT INTO "users" ("email",`) {
+		t.Fatalf("sql: %s", got)
+	}
+	if u.ID != 99 {
+		t.Fatalf("LastInsertId backfill: %d", u.ID)
+	}
+}
+
 func TestInsertZeroValuesAreWritten(t *testing.T) {
 	f := newFakeDB()
 	db := f.open(MySQL)
@@ -256,10 +278,12 @@ func TestUpdateColumnWhitelist(t *testing.T) {
 		t.Fatalf("sql:\n got: %s\nwant: %s", got, want)
 	}
 
-	if err := Update(context.Background(), db, u, "no_such"); err == nil || !strings.Contains(err.Error(), `no column "no_such"`) {
+	err := Update(context.Background(), db, u, "no_such")
+	if err == nil || !strings.Contains(err.Error(), `no column "no_such"`) {
 		t.Fatalf("unknown column: %v", err)
 	}
-	if err := Update(context.Background(), db, u, "id"); err == nil || !strings.Contains(err.Error(), "maintained by rio") {
+	err = Update(context.Background(), db, u, "id")
+	if err == nil || !strings.Contains(err.Error(), "maintained by rio") {
 		t.Fatalf("pk in whitelist: %v", err)
 	}
 }
@@ -355,7 +379,10 @@ func TestUpdateAllRequiresWhere(t *testing.T) {
 
 func TestDeleteAllSoftDeletes(t *testing.T) {
 	f := newFakeDB()
-	db := f.open(SQLite)
+	var hookOp string
+	db := f.openWith(SQLite, WithQueryHook(hookFunc(func(_ context.Context, e *QueryEvent) {
+		hookOp = e.Op
+	})))
 	f.queueExec(0, 2)
 
 	n, err := From[User]().Where("age < ?", 10).DeleteAll(context.Background(), db)
@@ -365,6 +392,9 @@ func TestDeleteAllSoftDeletes(t *testing.T) {
 	got := f.logged()[0]
 	if !strings.HasPrefix(got, `UPDATE "users" SET "deleted_at" = ?`) || !strings.Contains(got, `"deleted_at" IS NULL`) {
 		t.Fatalf("soft DeleteAll updates only kept rows: %s", got)
+	}
+	if hookOp != "delete" {
+		t.Fatalf("soft DeleteAll hook op = %q, want delete", hookOp)
 	}
 }
 
@@ -548,7 +578,16 @@ func TestUpsertConflictTargetDeduped(t *testing.T) {
 
 	// The batch path shares the normalization.
 	f.queueExec(0, 2)
-	if err := UpsertAll(ctx, db, []User{{ID: 1, Email: "a@x"}, {ID: 2, Email: "b@x"}}, OnConflict("email", "email")); err != nil {
+	err := UpsertAll(
+		ctx,
+		db,
+		[]User{
+			{ID: 1, Email: "a@x"},
+			{ID: 2, Email: "b@x"},
+		},
+		OnConflict("email", "email"),
+	)
+	if err != nil {
 		t.Fatalf("UpsertAll: %v", err)
 	}
 	got = f.logged()[1]
@@ -804,6 +843,37 @@ func TestTxBeginHookPanicRollsBack(t *testing.T) {
 	joined := strings.Join(f.logged(), " | ")
 	if !strings.Contains(joined, "BEGIN") || !strings.Contains(joined, "ROLLBACK") {
 		t.Fatalf("BEGIN hook panic must roll back the open transaction: %s", joined)
+	}
+}
+
+func TestTxRollbackBeforeHookPanicStillRollsBack(t *testing.T) {
+	f := newFakeDB()
+	db := f.openWith(SQLite, WithQueryHook(beforeHook(func(ctx context.Context, e *QueryEvent) context.Context {
+		if e.Op == "rollback" {
+			panic("rollback telemetry exploded")
+		}
+		return ctx
+	})))
+	db.Unwrap().SetMaxOpenConns(1)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_ = db.Tx(context.Background(), func(*Tx) error {
+			return errors.New("work failed")
+		})
+	}()
+	if recovered != "rollback telemetry exploded" {
+		t.Fatalf("panic = %v, want rollback hook panic", recovered)
+	}
+	if logs := strings.Join(f.logged(), " | "); !strings.Contains(logs, "ROLLBACK") {
+		t.Fatalf("rollback hook panic must not block the driver rollback: %s", logs)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := Exec(ctx, db, "SELECT 1"); err != nil {
+		t.Fatalf("transaction connection was not returned to the pool: %v", err)
 	}
 }
 

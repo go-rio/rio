@@ -107,7 +107,11 @@ func (e *sqlEngine) begin(ctx context.Context, opts *sql.TxOptions) (txEngine, e
 	if err != nil {
 		return nil, err
 	}
-	return sqlTxEngine{tx: tx}, nil
+	var stmts *stmtCache
+	if e.stmts != nil {
+		stmts = newStmtCache(tx, e.stmts.cap)
+	}
+	return &sqlTxEngine{tx: tx, stmts: stmts}, nil
 }
 
 func (e *sqlEngine) close() error {
@@ -131,26 +135,51 @@ func (e *sqlEngine) evictOnSchemaChange(sqlText string, err error) error {
 	return err
 }
 
-// isStmtClosed matches database/sql's unexported "statement is closed"
-// condition — stable text since Go 1.0, and the only signal available.
-func isStmtClosed(err error) bool {
-	return err != nil && err.Error() == "sql: statement is closed"
-}
-
-// sqlTxEngine executes on one *sql.Tx. A single-pointer struct, so the
-// txEngine interface holds it directly and beginning a transaction
-// allocates nothing beyond what database/sql does. The statement cache
-// stays on the DB engine: re-preparing per transaction costs more than it
-// saves, so transactions always execute directly.
 type sqlTxEngine struct {
-	tx *sql.Tx
+	tx    *sql.Tx
+	stmts *stmtCache
 }
 
-func (e sqlTxEngine) exec(ctx context.Context, sqlText string, args []any) (sql.Result, error) {
-	return e.tx.ExecContext(ctx, sqlText, args...)
+func (e *sqlTxEngine) exec(ctx context.Context, sqlText string, args []any) (sql.Result, error) {
+	if e.stmts == nil || len(args) == 0 {
+		return e.tx.ExecContext(ctx, sqlText, args...)
+	}
+	st, err := e.stmts.get(ctx, sqlText)
+	if err != nil {
+		return nil, err
+	}
+	res, err := st.ExecContext(ctx, args...)
+	if isStmtClosed(err) {
+		return e.tx.ExecContext(ctx, sqlText, args...)
+	}
+	if err != nil && sqlState(err) == "0A000" {
+		e.stmts.evict(sqlText)
+	}
+	return res, err
 }
 
-func (e sqlTxEngine) query(ctx context.Context, sqlText string, args []any) (rows, error) {
+func (e *sqlTxEngine) query(ctx context.Context, sqlText string, args []any) (rows, error) {
+	if e.stmts == nil || len(args) == 0 {
+		return e.directQuery(ctx, sqlText, args)
+	}
+	st, err := e.stmts.get(ctx, sqlText)
+	if err != nil {
+		return nil, err
+	}
+	rs, err := st.QueryContext(ctx, args...)
+	if isStmtClosed(err) {
+		return e.directQuery(ctx, sqlText, args)
+	}
+	if err != nil {
+		if sqlState(err) == "0A000" {
+			e.stmts.evict(sqlText)
+		}
+		return nil, err
+	}
+	return rs, nil
+}
+
+func (e *sqlTxEngine) directQuery(ctx context.Context, sqlText string, args []any) (rows, error) {
 	rs, err := e.tx.QueryContext(ctx, sqlText, args...)
 	if err != nil {
 		return nil, err
@@ -161,5 +190,23 @@ func (e sqlTxEngine) query(ctx context.Context, sqlText string, args []any) (row
 // database/sql's transaction finishers take no context and always reach the
 // driver — exactly the property rio's cleanup discipline relies on — so the
 // seam's context is deliberately unused here.
-func (e sqlTxEngine) commit(context.Context) error   { return e.tx.Commit() }
-func (e sqlTxEngine) rollback(context.Context) error { return e.tx.Rollback() }
+func (e *sqlTxEngine) commit(context.Context) error {
+	err := e.tx.Commit()
+	if e.stmts != nil {
+		e.stmts.close()
+	}
+	return err
+}
+func (e *sqlTxEngine) rollback(context.Context) error {
+	err := e.tx.Rollback()
+	if e.stmts != nil {
+		e.stmts.close()
+	}
+	return err
+}
+
+// isStmtClosed matches database/sql's unexported "statement is closed"
+// condition — stable text since Go 1.0, and the only signal available.
+func isStmtClosed(err error) bool {
+	return err != nil && err.Error() == "sql: statement is closed"
+}

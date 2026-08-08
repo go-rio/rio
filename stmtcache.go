@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"database/sql"
+	"errors"
 	"sync"
 )
 
@@ -13,12 +14,18 @@ import (
 // reference-counted by database/sql, so closing an evicted statement while a
 // query still runs on it is safe.
 type stmtCache struct {
-	db  *sql.DB
-	cap int
+	prepare stmtPreparer
+	cap     int
 
-	mu    sync.Mutex
-	bySQL map[string]*list.Element
-	lru   *list.List // front = most recently used
+	mu       sync.Mutex
+	bySQL    map[string]*list.Element
+	lru      *list.List // front = most recently used
+	flight   map[string]*stmtFlight
+	isClosed bool
+}
+
+type stmtPreparer interface {
+	PrepareContext(context.Context, string) (*sql.Stmt, error)
 }
 
 type stmtEntry struct {
@@ -26,49 +33,82 @@ type stmtEntry struct {
 	stmt *sql.Stmt
 }
 
-func newStmtCache(db *sql.DB, capacity int) *stmtCache {
-	return &stmtCache{db: db, cap: capacity, bySQL: make(map[string]*list.Element), lru: list.New()}
+type stmtFlight struct {
+	done        chan struct{}
+	stmt        *sql.Stmt
+	err         error
+	shouldRetry bool
 }
 
 func (c *stmtCache) get(ctx context.Context, sqlText string) (*sql.Stmt, error) {
-	c.mu.Lock()
-	if el, ok := c.bySQL[sqlText]; ok {
-		c.lru.MoveToFront(el)
-		st := el.Value.(*stmtEntry).stmt
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		if c.isClosed {
+			c.mu.Unlock()
+			return nil, sql.ErrConnDone
+		}
+		if el, ok := c.bySQL[sqlText]; ok {
+			c.lru.MoveToFront(el)
+			st := el.Value.(*stmtEntry).stmt
+			c.mu.Unlock()
+			return st, nil
+		}
+		if f, ok := c.flight[sqlText]; ok {
+			c.mu.Unlock()
+			select {
+			case <-f.done:
+				if f.shouldRetry && ctx.Err() == nil {
+					continue
+				}
+				return f.stmt, f.err
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		f := &stmtFlight{done: make(chan struct{})}
+		c.flight[sqlText] = f
 		c.mu.Unlock()
-		return st, nil
-	}
-	c.mu.Unlock()
 
-	// Prepare outside the lock: it does a network round-trip. A concurrent
-	// racer may prepare the same SQL; the loser's statement is closed.
-	st, err := c.db.PrepareContext(ctx, sqlText)
-	if err != nil {
-		return nil, err
-	}
+		st, err := c.prepare.PrepareContext(ctx, sqlText)
+		shouldRetry := false
+		if err != nil {
+			shouldRetry = ctx.Err() != nil ||
+				errors.Is(err, context.Canceled) ||
+				errors.Is(err, context.DeadlineExceeded)
+		}
+		var evicted, discard *sql.Stmt
 
-	c.mu.Lock()
-	if el, ok := c.bySQL[sqlText]; ok {
-		c.lru.MoveToFront(el)
-		winner := el.Value.(*stmtEntry).stmt
+		c.mu.Lock()
+		if c.isClosed {
+			if st != nil {
+				discard = st
+			}
+			st, err, shouldRetry = nil, sql.ErrConnDone, false
+		} else if err == nil {
+			c.bySQL[sqlText] = c.lru.PushFront(&stmtEntry{sql: sqlText, stmt: st})
+			if c.lru.Len() > c.cap {
+				oldest := c.lru.Back()
+				c.lru.Remove(oldest)
+				e := oldest.Value.(*stmtEntry)
+				delete(c.bySQL, e.sql)
+				evicted = e.stmt
+			}
+		}
+		f.stmt, f.err, f.shouldRetry = st, err, shouldRetry
+		delete(c.flight, sqlText)
+		close(f.done)
 		c.mu.Unlock()
-		_ = st.Close()
-		return winner, nil
+		if discard != nil {
+			_ = discard.Close()
+		}
+		if evicted != nil {
+			_ = evicted.Close()
+		}
+		return st, err
 	}
-	c.bySQL[sqlText] = c.lru.PushFront(&stmtEntry{sql: sqlText, stmt: st})
-	var evicted *sql.Stmt
-	if c.lru.Len() > c.cap {
-		oldest := c.lru.Back()
-		c.lru.Remove(oldest)
-		e := oldest.Value.(*stmtEntry)
-		delete(c.bySQL, e.sql)
-		evicted = e.stmt
-	}
-	c.mu.Unlock()
-	if evicted != nil {
-		_ = evicted.Close()
-	}
-	return st, nil
 }
 
 func (c *stmtCache) evict(sqlText string) {
@@ -86,6 +126,7 @@ func (c *stmtCache) evict(sqlText string) {
 
 func (c *stmtCache) close() {
 	c.mu.Lock()
+	c.isClosed = true
 	stmts := make([]*sql.Stmt, 0, c.lru.Len())
 	for el := c.lru.Front(); el != nil; el = el.Next() {
 		stmts = append(stmts, el.Value.(*stmtEntry).stmt)
@@ -95,5 +136,15 @@ func (c *stmtCache) close() {
 	c.mu.Unlock()
 	for _, st := range stmts {
 		_ = st.Close()
+	}
+}
+
+func newStmtCache(prepare stmtPreparer, capacity int) *stmtCache {
+	return &stmtCache{
+		prepare: prepare,
+		cap:     capacity,
+		bySQL:   make(map[string]*list.Element),
+		lru:     list.New(),
+		flight:  make(map[string]*stmtFlight),
 	}
 }

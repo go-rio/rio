@@ -76,6 +76,45 @@ func TestPreloadLoadedEmpty(t *testing.T) {
 	}
 }
 
+func TestPreloadChunksParentKeysAtBindLimit(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+
+	parentRows := make([][]driver.Value, 1000)
+	for i := range parentRows {
+		parentRows[i] = userRow(int64(i+1), "user@example.com")
+	}
+	f.queueRows(userCols, parentRows...)
+	f.queueRows(postCols)
+	f.queueRows(postCols)
+
+	users, err := From[User]().
+		With("Posts", RelWhere("title <> ?", "draft")).
+		All(context.Background(), db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if len(users) != len(parentRows) {
+		t.Fatalf("users = %d, want %d", len(users), len(parentRows))
+	}
+	for i := range users {
+		if !users[i].Posts.Loaded() || len(users[i].Posts.Rows()) != 0 {
+			t.Fatalf("user %d relation is not loaded-empty", users[i].ID)
+		}
+	}
+
+	preloads := f.loggedContaining(`FROM "posts"`)
+	if len(preloads) != 2 {
+		t.Fatalf("preload queries = %d, want 2", len(preloads))
+	}
+	if got := len(preloads[0].args); got != 999 {
+		t.Fatalf("first preload args = %d, want SQLite limit 999", got)
+	}
+	if got := len(preloads[1].args); got != 3 {
+		t.Fatalf("second preload args = %d, want 2 keys plus RelWhere arg", got)
+	}
+}
+
 func TestPreloadBelongsToAndNullFK(t *testing.T) {
 	f := newFakeDB()
 	db := f.open()
@@ -291,17 +330,21 @@ func TestWithValidationDoesNotDependOnData(t *testing.T) {
 	f := newFakeDB()
 	db := f.open()
 
-	if _, err := From[User]().With("Bogus").All(ctx, db); err == nil || !strings.Contains(err.Error(), `no relation "Bogus"`) {
+	_, err := From[User]().With("Bogus").All(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), `no relation "Bogus"`) {
 		t.Fatalf("With typo on empty result: %v", err)
 	}
-	if _, err := From[User]().WithCount("Bogus").All(ctx, db); err == nil || !strings.Contains(err.Error(), `no relation "Bogus"`) {
+	_, err = From[User]().WithCount("Bogus").All(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), `no relation "Bogus"`) {
 		t.Fatalf("WithCount typo on empty result: %v", err)
 	}
-	if _, err := From[User]().With("Posts.Bogus").All(ctx, db); err == nil || !strings.Contains(err.Error(), `no relation "Bogus" (path "Posts.Bogus")`) {
+	_, err = From[User]().With("Posts.Bogus").All(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), `no relation "Bogus" (path "Posts.Bogus")`) {
 		t.Fatalf("nested typo on empty result: %v", err)
 	}
 	// First must report the typo, not hide it behind ErrNotFound.
-	if _, err := From[User]().With("Bogus").First(ctx, db); err == nil || !strings.Contains(err.Error(), `no relation "Bogus"`) {
+	_, err = From[User]().With("Bogus").First(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), `no relation "Bogus"`) {
 		t.Fatalf("First with typo: %v", err)
 	}
 	if got := f.logged(); len(got) != 0 {

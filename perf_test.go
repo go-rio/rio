@@ -7,6 +7,7 @@ import (
 	"errors"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // loopDB is fakeDB's measurement counterpart: it serves the same scripted
@@ -14,8 +15,9 @@ import (
 // statement log and no locking — fakeDB's per-statement log append would
 // pollute AllocsPerRun and benchmark numbers.
 type loopDB struct {
-	cols []string
-	rows [][]driver.Value
+	cols       []string
+	rows       [][]driver.Value
+	columnScan bool
 }
 
 func (l *loopDB) open(d Dialect, opts ...Option) *DB {
@@ -42,7 +44,11 @@ func (loopConn) Close() error                        { return nil }
 func (loopConn) Begin() (driver.Tx, error)           { return nil, errors.New("loopdb: no tx") }
 
 func (c loopConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
-	return &fakeRowsIter{data: fakeRows{cols: c.l.cols, rows: c.l.rows}}, nil
+	rows := &fakeRowsIter{data: fakeRows{cols: c.l.cols, rows: c.l.rows}}
+	if c.l.columnScan {
+		return &fakeRowsColumnIter{fakeRowsIter: rows}, nil
+	}
+	return rows, nil
 }
 
 func (c loopConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
@@ -145,6 +151,26 @@ func scanBenchDB() (*loopDB, [][]driver.Value) {
 	return &loopDB{cols: []string{"id", "a", "b", "c"}, rows: rows}, rows
 }
 
+func BenchmarkRowScannerTypedPlain(b *testing.B) {
+	p, err := planOf[perfPlain]()
+	if err != nil {
+		b.Fatal(err)
+	}
+	rs := newRowScanner(p.fields, nil)
+	defer rs.release()
+	rows := &nativeRows{nr: &loopNativeRows{
+		l:   &loopNative{rows: [][]any{{int64(1), int64(2), "value-string", float64(3)}}},
+		pos: 1,
+	}}
+	var row perfPlain
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := rs.scan(rows, unsafe.Pointer(&row)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkScan100Plain(b *testing.B) {
 	l, _ := scanBenchDB()
 	db := l.open(SQLite)
@@ -159,6 +185,57 @@ func BenchmarkScan100Plain(b *testing.B) {
 	}
 }
 
+func BenchmarkScan100PlainLimit(b *testing.B) {
+	l, _ := scanBenchDB()
+	db := l.open(SQLite)
+	q := From[perfPlain]().Limit(100)
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		out, err := q.All(ctx, db)
+		if err != nil || len(out) != 100 {
+			b.Fatalf("All: len=%d err=%v", len(out), err)
+		}
+	}
+}
+
+func BenchmarkScan100ColumnScanner(b *testing.B) {
+	l, _ := scanBenchDB()
+	l.columnScan = true
+	db := l.open(SQLite)
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		out, err := From[perfPlain]().All(ctx, db)
+		if err != nil || len(out) != 100 {
+			b.Fatalf("All: len=%d err=%v", len(out), err)
+		}
+	}
+}
+
+func BenchmarkRows100Plain(b *testing.B) {
+	l, _ := scanBenchDB()
+	db := l.open(SQLite)
+	q := From[perfPlain]().Must()
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		count := 0
+		for _, err := range q.Rows(ctx, db) {
+			if err != nil {
+				b.Fatal(err)
+			}
+			count++
+		}
+		if count != 100 {
+			b.Fatalf("Rows: count=%d", count)
+		}
+	}
+}
+
 func BenchmarkScan100Ptr(b *testing.B) {
 	l, _ := scanBenchDB()
 	db := l.open(SQLite)
@@ -169,6 +246,93 @@ func BenchmarkScan100Ptr(b *testing.B) {
 		out, err := From[perfPtr]().All(ctx, db)
 		if err != nil || len(out) != 100 {
 			b.Fatal(err, len(out))
+		}
+	}
+}
+
+func BenchmarkRawScalar100(b *testing.B) {
+	rows := make([][]driver.Value, 100)
+	for i := range rows {
+		rows[i] = []driver.Value{int64(i)}
+	}
+	db := (&loopDB{cols: []string{"n"}, rows: rows}).open(SQLite)
+	q := Raw[int64]("SELECT n FROM t")
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		out, err := q.All(ctx, db)
+		if err != nil || len(out) != 100 {
+			b.Fatalf("All: len=%d err=%v", len(out), err)
+		}
+	}
+}
+
+func BenchmarkRawFirstScalar(b *testing.B) {
+	rows := make([][]driver.Value, 100)
+	for i := range rows {
+		rows[i] = []driver.Value{int64(i)}
+	}
+	db := (&loopDB{cols: []string{"n"}, rows: rows}).open(SQLite)
+	q := Raw[int64]("SELECT n FROM t")
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		out, err := q.First(ctx, db)
+		if err != nil || *out != 0 {
+			b.Fatalf("First: out=%v err=%v", out, err)
+		}
+	}
+}
+
+func BenchmarkCountScalar(b *testing.B) {
+	db := (&loopDB{cols: []string{"count"}, rows: [][]driver.Value{{int64(100)}}}).open(SQLite)
+	q := From[perfUser]().Must()
+	ctx := context.Background()
+	if _, err := q.Count(ctx, db); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := q.Count(ctx, db); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkExistsScalar(b *testing.B) {
+	db := (&loopDB{cols: []string{"exists"}, rows: [][]driver.Value{{int64(1)}}}).open(SQLite)
+	q := From[perfUser]().Must()
+	ctx := context.Background()
+	if _, err := q.Exists(ctx, db); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := q.Exists(ctx, db); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkUpsertPostgresHoisted(b *testing.B) {
+	l := &loopDB{cols: perfUserCols, rows: [][]driver.Value{perfUserRow()}}
+	db := l.open(Postgres)
+	u := &perfUser{Email: "u@example.com", Age: 30}
+	opts := []UpsertOption{OnConflict("email"), DoUpdate("age")}
+	ctx := context.Background()
+	if err := Upsert(ctx, db, u, opts...); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		u.ID, u.CreatedAt, u.UpdatedAt = 0, time.Time{}, time.Time{}
+		if err := Upsert(ctx, db, u, opts...); err != nil {
+			b.Fatal(err)
 		}
 	}
 }
@@ -305,6 +469,23 @@ func BenchmarkUpsertAllSQLiteChunk(b *testing.B) {
 	}
 }
 
+func BenchmarkUpsertAllSQLiteThreeChunks(b *testing.B) {
+	l := &loopDB{}
+	db := l.open(SQLite)
+	ctx := context.Background()
+	rows := make([]perfUser, 597)
+	for i := range rows {
+		rows[i] = perfUser{ID: int64(i + 1), Email: "u@example.com", Age: 30, CreatedAt: testNow, UpdatedAt: testNow}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if err := UpsertAll(ctx, db, rows, OnConflict("email"), DoUpdate("age")); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // TestAllocDiagnostics prints AllocsPerRun for each CRUD op next to a
 // hand-written database/sql equivalent on the same loop driver. Run with
 // -run TestAllocDiagnostics -v; the pinned budget assertions live in
@@ -331,14 +512,14 @@ func TestCRUDAllocBudget(t *testing.T) {
 	budgets := map[string]float64{
 		"find/pg":           1,
 		"find/clickhouse":   1, // same read path; caps checks are branch-only
-		"insert/sqlite":     0, // RETURNING path
+		"insert/sqlite":     1, // exec + LastInsertId path
 		"insert/mysql":      1, // exec + LastInsertId path
 		"insert/clickhouse": 1, // exec path; chTimeFormat binds text like sqlite's
 		"update/pg":         2,
 		"delete/pg":         1,
-		"upsert/pg":         5, // conflict shape: spec, option appends, update set, cache key
-		"upsert/pg-hoisted": 5,
-		"upsert/mysql":      5,
+		"upsert/pg":         2,
+		"upsert/pg-hoisted": 2,
+		"upsert/mysql":      3,
 	}
 	ctx := context.Background()
 	pairs := allocMeasurements(ctx)
@@ -476,7 +657,13 @@ func TestNativeAllocBudget(t *testing.T) {
 			t.Errorf("%s: native %.0f allocs/op exceeds the pinned %.0f budget", name, nat, l.budget)
 		}
 		if nat > std {
-			t.Errorf("%s: native %.0f allocs/op exceeds the stdlib channel's %.0f — the channel exists to cost less", name, nat, std)
+			t.Errorf(
+				"%s: native %.0f allocs/op exceeds the stdlib channel's %.0f — "+
+					"the channel exists to cost less",
+				name,
+				nat,
+				std,
+			)
 		}
 		t.Logf("%-8s native=%.0f stdlib=%.0f", name, nat, std)
 	}
@@ -521,11 +708,11 @@ func allocMeasurements(ctx context.Context) map[string]allocPair {
 		}
 	}
 
-	{ // Insert, SQLite RETURNING path
-		l := &loopDB{cols: []string{"id"}, rows: [][]driver.Value{{int64(1)}}}
+	{ // Insert, SQLite exec path
+		l := &loopDB{}
 		db, raw := l.open(SQLite), l.raw()
 		u := &perfUser{Email: "u@example.com", Age: 30}
-		const q = `INSERT INTO "perf_users" ("email", "age", "created_at", "updated_at") VALUES (?, ?, ?, ?) RETURNING "id"`
+		const q = `INSERT INTO "perf_users" ("email", "age", "created_at", "updated_at") VALUES (?, ?, ?, ?)`
 		pairs["insert/sqlite"] = allocPair{
 			rio: func() {
 				u.ID, u.CreatedAt, u.UpdatedAt = 0, time.Time{}, time.Time{}
@@ -534,14 +721,11 @@ func allocMeasurements(ctx context.Context) map[string]allocPair {
 			std: func() {
 				now := time.Now().UTC().Truncate(time.Microsecond)
 				ts := now.Format(sqliteTimeFormat)
-				rows, err := raw.QueryContext(ctx, q, "u@example.com", int64(30), ts, ts)
+				res, err := raw.ExecContext(ctx, q, "u@example.com", int64(30), ts, ts)
 				fatal(err)
-				var id int64
-				if !rows.Next() {
-					panic("no row")
-				}
-				fatal(rows.Scan(&id))
-				fatal(rows.Close())
+				id, err := res.LastInsertId()
+				fatal(err)
+				_ = id
 			},
 		}
 	}

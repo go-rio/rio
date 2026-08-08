@@ -34,6 +34,20 @@ type DB struct {
 	native any // driver-native pool handle (NativeConfig.Handle); nil on database/sql
 }
 
+// Tx is a transaction handle. It satisfies Queryer, so every rio entry point
+// accepts it in place of a *DB. Like *sql.Tx it is bound to one connection
+// and must not be used concurrently.
+type Tx struct {
+	tx  *sql.Tx // Unwrap's view of the engine's transaction
+	e   txEngine
+	g   *grammar
+	cfg *config
+	// spSeq is shared across every Tx wrapper of the same root transaction
+	// and increases monotonically, so savepoint names are never reused by
+	// siblings or nested levels.
+	spSeq *int
+}
+
 // New wraps an existing *sql.DB. Driver modules (go-rio/postgres, go-rio/mysql,
 // go-rio/sqlite) call this for you and add driver-specific error translation;
 // use New directly when you bring your own driver.
@@ -83,10 +97,6 @@ func (d *DB) Native() any { return d.native }
 // *sql.DB.
 func (d *DB) Close() error { return d.e.close() }
 
-func (d *DB) eng() engine    { return d.e }
-func (d *DB) gram() *grammar { return d.g }
-func (d *DB) conf() *config  { return d.cfg }
-
 // Tx runs fn in a transaction with default options.
 func (d *DB) Tx(ctx context.Context, fn func(tx *Tx) error) error {
 	return d.TxWith(ctx, nil, fn)
@@ -99,7 +109,13 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 		// clickhouse-go's Begin returns the connection itself and opens
 		// nothing: fn would run with every statement committing independently
 		// while looking transactional — the heaviest silent surprise there is.
-		return unsupportedf("rio: transactions are not supported on %s (the driver's Begin is a no-op and statements would commit independently); group rows into one InsertAll for per-statement atomicity, or use db.Unwrap() with clickhouse-go's native batch API", d.g.d.name())
+		return unsupportedf(
+			"rio: transactions are not supported on %s "+
+				"(the driver's Begin is a no-op and statements would commit independently); "+
+				"group rows into one InsertAll for per-statement atomicity, "+
+				"or use db.Unwrap() with clickhouse-go's native batch API",
+			d.g.d.name(),
+		)
 	}
 	// Armed before BEGIN: its AfterQuery hook can panic with the transaction
 	// already open, and the connection must be rolled back before the panic
@@ -123,7 +139,7 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 	}
 
 	rtx := &Tx{e: te, g: d.g, cfg: d.cfg, spSeq: new(int)}
-	if se, ok := te.(sqlTxEngine); ok {
+	if se, ok := te.(*sqlTxEngine); ok {
 		rtx.tx = se.tx // Unwrap's view; engines without a *sql.Tx leave it nil
 	}
 	if err = fn(rtx); err != nil {
@@ -133,57 +149,6 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 		return err
 	}
 	return observe(ctx, d.cfg, d.g.d, "commit", "COMMIT", func(ctx context.Context) error { return te.commit(ctx) })
-}
-
-// finishTx rolls the transaction back. Unlike the savepoint statements below,
-// a canceled ctx cannot suppress this cleanup: the rollback runs on a
-// cancellation-decoupled context — the caller-owned WithoutCancel discipline
-// the engine seam documents. database/sql's Tx.Rollback ignores the context
-// anyway; a native engine's rollback honors it, and a dead one there would
-// strand the transaction (pgx fails fast and tears down the connection).
-// Either channel reports a transaction the driver already finished — a begin
-// context that died, for one — as sql.ErrTxDone, tolerated here.
-func (d *DB) finishTx(ctx context.Context, te txEngine, cause error) error {
-	// WithoutCancel wraps the hook context, not the raw ctx: a BeforeQuery span
-	// still reaches the rollback, but a canceled caller ctx cannot suppress it.
-	err := observe(ctx, d.cfg, d.g.d, "rollback", "ROLLBACK", func(ctx context.Context) error {
-		return te.rollback(context.WithoutCancel(ctx))
-	})
-	if err != nil && !errors.Is(err, sql.ErrTxDone) {
-		return fmt.Errorf("rio: rollback after %q failed: %w", cause, err)
-	}
-	return nil
-}
-
-// observe wraps transaction-control statements with hooks and error
-// translation. fn runs under the context BeforeQuery returned (hooks.go), so
-// a hook's span or deadline reaches begin/commit/rollback/savepoint. COMMIT
-// in particular must translate: deferred constraints surface their violations
-// at commit time.
-func observe(ctx context.Context, cfg *config, d Dialect, op, sqlText string, fn func(context.Context) error) error {
-	if len(cfg.hooks) == 0 {
-		return translateErr(fn(ctx), cfg, d)
-	}
-	ev := &QueryEvent{Op: op, Query: sqlText}
-	hctx := cfg.beforeQuery(ctx, ev)
-	start := time.Now()
-	err := translateErr(fn(hctx), cfg, d)
-	cfg.afterQuery(hctx, ev, start, err, -1)
-	return err
-}
-
-// Tx is a transaction handle. It satisfies Queryer, so every rio entry point
-// accepts it in place of a *DB. Like *sql.Tx it is bound to one connection
-// and must not be used concurrently.
-type Tx struct {
-	tx  *sql.Tx // Unwrap's view of the engine's transaction
-	e   txEngine
-	g   *grammar
-	cfg *config
-	// spSeq is shared across every Tx wrapper of the same root transaction
-	// and increases monotonically, so savepoint names are never reused by
-	// siblings or nested levels.
-	spSeq *int
 }
 
 // Unwrap returns the underlying *sql.Tx — and nil on the native channel,
@@ -202,10 +167,6 @@ func (t *Tx) NativeTx() any {
 	}
 	return nil
 }
-
-func (t *Tx) eng() engine    { return t.e }
-func (t *Tx) gram() *grammar { return t.g }
-func (t *Tx) conf() *config  { return t.cfg }
 
 // Tx runs fn inside a savepoint, giving nested transactional code partial
 // rollback. Savepoints commit ("RELEASE") when fn returns nil; on error the
@@ -230,7 +191,7 @@ func (t *Tx) Tx(ctx context.Context, fn func(tx *Tx) error) (err error) {
 	inner := &Tx{tx: t.tx, e: t.e, g: t.g, cfg: t.cfg, spSeq: t.spSeq}
 	defer func() {
 		if p := recover(); p != nil {
-			_ = t.spExec(cleanup, "ROLLBACK TO SAVEPOINT "+name)
+			_ = t.spRollback(cleanup, name)
 			panic(p)
 		}
 	}()
@@ -240,13 +201,47 @@ func (t *Tx) Tx(ctx context.Context, fn func(tx *Tx) error) (err error) {
 		// itself fail legitimately — a MySQL deadlock (1213) rolls back the
 		// whole transaction and destroys every savepoint — so its error is
 		// joined rather than allowed to mask the cause.
-		if rbErr := t.spExec(cleanup, "ROLLBACK TO SAVEPOINT "+name); rbErr != nil {
+		if rbErr := t.spRollback(cleanup, name); rbErr != nil {
 			return errors.Join(err, rbErr)
 		}
 		_ = t.spExec(cleanup, "RELEASE SAVEPOINT "+name) // keep the stack clean; failure is harmless here
 		return err
 	}
 	return t.spExec(cleanup, "RELEASE SAVEPOINT "+name)
+}
+
+func (d *DB) eng() engine    { return d.e }
+func (d *DB) gram() *grammar { return d.g }
+func (d *DB) conf() *config  { return d.cfg }
+
+// finishTx rolls the transaction back. Unlike the savepoint statements below,
+// a canceled ctx cannot suppress this cleanup: the rollback runs on a
+// cancellation-decoupled context — the caller-owned WithoutCancel discipline
+// the engine seam documents. database/sql's Tx.Rollback ignores the context
+// anyway; a native engine's rollback honors it, and a dead one there would
+// strand the transaction (pgx fails fast and tears down the connection).
+// Either channel reports a transaction the driver already finished — a begin
+// context that died, for one — as sql.ErrTxDone, tolerated here.
+func (d *DB) finishTx(ctx context.Context, te txEngine, cause error) error {
+	err := observeCleanup(ctx, d.cfg, d.g.d, "rollback", "ROLLBACK", func(ctx context.Context) error {
+		return te.rollback(ctx)
+	})
+	if err != nil && !errors.Is(err, sql.ErrTxDone) {
+		return fmt.Errorf("rio: rollback after %q failed: %w", cause, err)
+	}
+	return nil
+}
+
+func (t *Tx) eng() engine    { return t.e }
+func (t *Tx) gram() *grammar { return t.g }
+func (t *Tx) conf() *config  { return t.cfg }
+
+func (t *Tx) spRollback(ctx context.Context, name string) error {
+	stmt := "ROLLBACK TO SAVEPOINT " + name
+	return observeCleanup(ctx, t.cfg, t.g.d, "savepoint", stmt, func(ctx context.Context) error {
+		_, err := t.e.exec(ctx, stmt, nil)
+		return err
+	})
 }
 
 func (t *Tx) spExec(ctx context.Context, stmt string) error {
@@ -256,22 +251,83 @@ func (t *Tx) spExec(ctx context.Context, stmt string) error {
 	})
 }
 
+// observeCleanup guarantees fn runs even when a BeforeQuery hook panics. The
+// hook panic still propagates after the resource cleanup attempt.
+func observeCleanup(
+	ctx context.Context,
+	cfg *config,
+	d Dialect,
+	op string,
+	sqlText string,
+	fn func(context.Context) error,
+) (err error) {
+	attempted := false
+	defer func() {
+		if p := recover(); p != nil {
+			if !attempted {
+				_ = fn(context.WithoutCancel(ctx))
+			}
+			panic(p)
+		}
+	}()
+	return observe(ctx, cfg, d, op, sqlText, func(hookCtx context.Context) error {
+		attempted = true
+		return fn(context.WithoutCancel(hookCtx))
+	})
+}
+
+// observe wraps transaction-control statements with hooks and error
+// translation. fn runs under the context BeforeQuery returned (hooks.go), so
+// a hook's span or deadline reaches begin/commit/rollback/savepoint. COMMIT
+// in particular must translate: deferred constraints surface their violations
+// at commit time.
+func observe(
+	ctx context.Context,
+	cfg *config,
+	d Dialect,
+	op string,
+	sqlText string,
+	fn func(context.Context) error,
+) error {
+	if len(cfg.hooks) == 0 {
+		return translateErr(fn(ctx), cfg, d)
+	}
+	ev := &QueryEvent{Op: op, Query: sqlText}
+	hctx := cfg.beforeQuery(ctx, ev)
+	start := time.Now()
+	err := translateErr(fn(hctx), cfg, d)
+	cfg.afterQuery(hctx, ev, start, err, -1)
+	return err
+}
+
 // run executes a non-row-returning statement through the shared pipeline:
 // statement cache (DB only), hooks, error translation. The statement runs
 // under the context BeforeQuery returned (hooks.go). Without hooks the event
 // is never materialized — the hot path allocates nothing here.
-func run(ctx context.Context, q Queryer, op, model, sqlText string, args []any) (sql.Result, error) {
+func run(
+	ctx context.Context,
+	q Queryer,
+	op string,
+	model string,
+	sqlText string,
+	args []any,
+) (sql.Result, error) {
 	cfg := q.conf()
 	if len(cfg.hooks) == 0 {
 		res, err := q.eng().exec(ctx, sqlText, args)
 		return res, translateErr(err, cfg, q.gram().d)
 	}
-	ev := &QueryEvent{Op: op, Model: model, Query: sqlText, Args: args}
+	ev := &QueryEvent{
+		Op:    op,
+		Model: model,
+		Query: sqlText,
+		Args:  args,
+	}
 	hctx := cfg.beforeQuery(ctx, ev)
 	start := time.Now()
 	res, err := q.eng().exec(hctx, sqlText, args)
 	err = translateErr(err, cfg, q.gram().d)
-	var rows int64 = -1
+	rows := int64(-1)
 	hookErr := err
 	if err == nil && res != nil {
 		if n, aerr := res.RowsAffected(); aerr == nil {
@@ -293,13 +349,25 @@ func run(ctx context.Context, q Queryer, op, model, sqlText string, args []any) 
 // (nil without hooks — the hot path stays allocation-free) fires AfterQuery
 // once the rows are consumed, so hooks see scan errors and a duration that
 // includes row consumption.
-func runQuery(ctx context.Context, q Queryer, op, model, sqlText string, args []any) (rows, func(error), error) {
+func runQuery(
+	ctx context.Context,
+	q Queryer,
+	op string,
+	model string,
+	sqlText string,
+	args []any,
+) (rows, func(error), error) {
 	cfg := q.conf()
 	if len(cfg.hooks) == 0 {
 		rs, err := q.eng().query(ctx, sqlText, args)
 		return rs, nil, translateErr(err, cfg, q.gram().d)
 	}
-	ev := &QueryEvent{Op: op, Model: model, Query: sqlText, Args: args}
+	ev := &QueryEvent{
+		Op:    op,
+		Model: model,
+		Query: sqlText,
+		Args:  args,
+	}
 	hctx := cfg.beforeQuery(ctx, ev)
 	start := time.Now()
 	rs, err := q.eng().query(hctx, sqlText, args)

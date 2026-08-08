@@ -63,25 +63,6 @@ var (
 // UTC by the time they reach a dialect (see bindArg).
 const sqliteTimeFormat = "2006-01-02 15:04:05.999999+00:00"
 
-func quoteWith(b []byte, ident string, q byte) []byte {
-	b = append(b, q)
-	start := 0
-	for i := 0; i < len(ident); i++ {
-		switch ident[i] {
-		case q: // double the quote character inside the identifier
-			b = append(b, ident[start:i+1]...)
-			b = append(b, q)
-			start = i + 1
-		case '.': // quote each dotted segment separately
-			b = append(b, ident[start:i]...)
-			b = append(b, q, '.', q)
-			start = i + 1
-		}
-	}
-	b = append(b, ident[start:]...)
-	return append(b, q)
-}
-
 // --- PostgreSQL ---
 
 type postgresDialect struct{}
@@ -203,19 +184,6 @@ var (
 	chTimeMax = time.Date(2299, 12, 31, 23, 59, 59, 999999000, time.UTC)
 )
 
-// checkBindTime validates a normalized time against the dialect's storable
-// range. Only ClickHouse needs policing: PostgreSQL and MySQL reject
-// out-of-range times loudly on their own, ClickHouse clamps silently.
-func checkBindTime(d Dialect, nt time.Time) error {
-	if d.name() != "clickhouse" || !(nt.Before(chTimeMin) || nt.After(chTimeMax)) {
-		return nil
-	}
-	if nt.IsZero() {
-		return errors.New(`rio: a zero time.Time is outside ClickHouse's DateTime64 range [1900-01-01, 2299-12-31] and would be silently clamped; use a *time.Time (Nullable column) for "no value"`)
-	}
-	return fmt.Errorf("rio: time %s is outside ClickHouse's DateTime64 range [1900-01-01, 2299-12-31] and would be silently clamped", nt.Format(time.RFC3339Nano))
-}
-
 type clickhouseDialect struct{}
 
 func (clickhouseDialect) name() string      { return "clickhouse" }
@@ -265,4 +233,43 @@ func (clickhouseDialect) translate(error) error {
 	// of a dependency-free interface probe anyway. The go-rio/clickhouse
 	// module installs no translator either, for the same reason.
 	return nil
+}
+
+func quoteWith(b []byte, ident string, q byte) []byte {
+	b = append(b, q)
+	start := 0
+	for i := 0; i < len(ident); i++ {
+		switch ident[i] {
+		case q: // double the quote character inside the identifier
+			b = append(b, ident[start:i+1]...)
+			b = append(b, q)
+			start = i + 1
+		case '.': // quote each dotted segment separately
+			b = append(b, ident[start:i]...)
+			b = append(b, q, '.', q)
+			start = i + 1
+		}
+	}
+	b = append(b, ident[start:]...)
+	return append(b, q)
+}
+
+// checkBindTime validates a normalized time against the dialect's storable
+// range. Only ClickHouse needs policing: PostgreSQL and MySQL reject
+// out-of-range times loudly on their own, ClickHouse clamps silently.
+func checkBindTime(d Dialect, nt time.Time) error {
+	if d.name() != "clickhouse" || !(nt.Before(chTimeMin) || nt.After(chTimeMax)) {
+		return nil
+	}
+	if nt.IsZero() {
+		return errors.New(
+			"rio: a zero time.Time is outside ClickHouse's DateTime64 range [1900-01-01, 2299-12-31] " +
+				`and would be silently clamped; use a *time.Time (Nullable column) for "no value"`,
+		)
+	}
+	return fmt.Errorf(
+		"rio: time %s is outside ClickHouse's DateTime64 range [1900-01-01, 2299-12-31] "+
+			"and would be silently clamped",
+		nt.Format(time.RFC3339Nano),
+	)
 }

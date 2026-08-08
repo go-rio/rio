@@ -246,10 +246,10 @@ func TestUpsertSpecKeyDistinctness(t *testing.T) {
 		t.Fatal(err)
 	}
 	email, age := p.byColumn["email"], p.byColumn["age"]
-	key := func(conflict []string, update []*field, doNothing, keepTrashed bool) string {
+	key := func(conflict []string, update []*field, doNothing, keepTrashed bool) upsertCacheKey {
 		return upsertSpecKey(&upsertSpec{conflict: conflict, doNothing: doNothing, keepTrashed: keepTrashed}, update)
 	}
-	keys := map[string]string{
+	keys := map[string]upsertCacheKey{
 		"base":            key([]string{"a", "b"}, []*field{email}, false, false),
 		"join-boundary-1": key([]string{"a", "bc"}, []*field{email}, false, false),
 		"join-boundary-2": key([]string{"ab", "c"}, []*field{email}, false, false),
@@ -259,10 +259,10 @@ func TestUpsertSpecKeyDistinctness(t *testing.T) {
 		"do-nothing":      key([]string{"a", "b"}, nil, true, false),
 		"keep-trashed":    key([]string{"a", "b"}, []*field{email}, false, true),
 	}
-	seen := map[string]string{}
+	seen := map[upsertCacheKey]string{}
 	for name, k := range keys {
 		if prev, dup := seen[k]; dup {
-			t.Errorf("specs %s and %s collide on key %q", prev, name, k)
+			t.Errorf("specs %s and %s collide on key %v", prev, name, k)
 		}
 		seen[k] = name
 	}

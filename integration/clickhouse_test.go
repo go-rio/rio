@@ -171,7 +171,8 @@ func TestClickHouseDriverProbes(t *testing.T) {
 			t.Fatal("driver LastInsertId changed: must error")
 		}
 		var count uint64
-		if err := raw.QueryRowContext(ctx, "SELECT count(*) FROM probe_bytes WHERE id = 2").Scan(&count); err != nil || count != 1 {
+		row := raw.QueryRowContext(ctx, "SELECT count(*) FROM probe_bytes WHERE id = 2")
+		if err := row.Scan(&count); err != nil || count != 1 {
 			t.Fatalf("the insert itself must land: count=%d err=%v", count, err)
 		}
 	})
@@ -547,8 +548,8 @@ func TestClickHouseSuite(t *testing.T) {
 		t.Logf("skipping WhereHas: server < 25.8")
 	}
 
-	// Scalar plumbing: Pluck, Count, Exists, Rows streaming, compiled.
-	titles, err := rio.Pluck[string](ctx, db, rio.From[Story]().Where("writer_id = ?", 1).OrderBy("score DESC"), "title")
+	// Scalar plumbing: Pluck, Count, Exists, Rows streaming, reusable Query.
+	titles, err := rio.From[Story]().Where("writer_id = ?", 1).OrderBy("score DESC").Pluck[string](ctx, db, "title")
 	if err != nil || len(titles) != 3 || titles[0] != "three" {
 		t.Fatalf("Pluck: %v %v", err, titles)
 	}
@@ -565,10 +566,10 @@ func TestClickHouseSuite(t *testing.T) {
 	if streamed != 2 {
 		t.Fatalf("streamed %d", streamed)
 	}
-	compiled := rio.MustCompile[Story](rio.From[Story]().Where("score >= ?").OrderBy("id"))
-	cs, err := compiled.All(ctx, db, 1)
+	reusable := rio.From[Story]().Where("score >= ?").OrderBy("id").Must()
+	cs, err := reusable.All(ctx, db, 1)
 	if err != nil || len(cs) != 2 {
-		t.Fatalf("compiled: %v %d", err, len(cs))
+		t.Fatalf("reusable Query: %v %d", err, len(cs))
 	}
 
 	// The ReplacingMergeTree recipe: Insert new versions, Final() merges.
@@ -613,7 +614,13 @@ func TestClickHouseSuite(t *testing.T) {
 	}
 
 	// The mutation escape hatch works and reports the documented zero count.
-	res, err := rio.Exec(ctx, db, "ALTER TABLE notes UPDATE body = ? WHERE id = ? SETTINGS mutations_sync = 1", "edited", 1)
+	res, err := rio.Exec(
+		ctx,
+		db,
+		"ALTER TABLE notes UPDATE body = ? WHERE id = ? SETTINGS mutations_sync = 1",
+		"edited",
+		1,
+	)
 	if err != nil {
 		t.Fatalf("mutation escape hatch: %v", err)
 	}

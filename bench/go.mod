@@ -1,11 +1,11 @@
 module github.com/go-rio/rio/bench
 
-go 1.25.0
+go 1.27rc2
 
 require (
 	github.com/go-rio/mysql v0.2.2
 	github.com/go-rio/postgres v0.3.0
-	github.com/go-rio/rio v0.8.0
+	github.com/go-rio/rio v0.10.0
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/libtnb/sqlite v1.2.0
@@ -14,6 +14,8 @@ require (
 	gorm.io/gorm v1.31.2
 	modernc.org/sqlite v1.53.0
 )
+
+replace github.com/go-rio/rio => ../
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect

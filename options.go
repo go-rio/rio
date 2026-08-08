@@ -16,20 +16,11 @@ type config struct {
 	stmtCap    int
 }
 
-func defaultConfig() *config {
-	return &config{
-		clock:   time.Now,
-		logArgs: true,
-		stmtCap: 512,
-	}
-}
-
 // Option configures a DB handle at construction time.
 type Option func(*config)
 
-// WithQueryHook installs an observability hook. Hooks see every statement rio
-// executes — entity CRUD, builder queries, compiled queries, Raw, and
-// transaction control — and cannot alter them.
+// WithQueryHook installs a read-only hook for executed statements and
+// transaction control.
 func WithQueryHook(h QueryHook) Option {
 	return func(c *config) {
 		if h != nil {
@@ -56,10 +47,8 @@ func WithErrorTranslator(f func(error) error) Option {
 	return func(c *config) { c.translator = f }
 }
 
-// WithTableNamer overrides the convention-based struct-name→table-name
-// derivation for this DB handle. Models implementing TableName() string still
-// win. The namer is part of the DB's grammar identity: SQL caches are keyed
-// by it, so two handles with different namers never share rendered SQL.
+// WithTableNamer overrides conventional table names for this handle. A model's
+// TableName method takes precedence, and SQL caches remain handle-specific.
 func WithTableNamer(f func(structName string) string) Option {
 	return func(c *config) { c.tableNamer = f }
 }
@@ -69,27 +58,11 @@ func WithoutArgs() Option {
 	return func(c *config) { c.logArgs = false }
 }
 
-// WithStmtCache enables the prepared-statement cache on this DB handle. With
-// the ClickHouse dialect it panics at New — clickhouse-go prepares only INSERT
-// batches, so a prepared SELECT fails on first use.
-//
-// Off by default: connection poolers in transaction/statement mode (PgBouncer
-// et al.) break server-side prepared statements. Enable it only when rio
-// talks to the database directly. Statements are cached per SQL text on the
-// DB only — transactions bypass the cache — and the cache is LRU-bounded
-// (cap configurable) because IN (?) expansion makes every slice length a
-// distinct statement. On schema-change errors the entry is evicted and the
-// error propagates; rio never retries on its own.
-//
-// Whether it pays depends on the driver. go-sql-driver/mysql runs every
-// parameterized query as prepare+execute — two blocking round-trips — so the
-// cache halves single-statement latency there (measured −35% to −46% against
-// a local MySQL 8.4; the DSN option interpolateParams=true is the
-// alternative, see the go-rio/mysql README). pgx's database/sql adapter
-// already caches statements per connection, and stacking database/sql's
-// Stmt layer on top measured slower, not faster — leave it off for pgx.
-// modernc SQLite is in-process; the cache saves parsing, worth measuring
-// per workload.
+// WithStmtCache enables bounded prepared-statement caches. The DB and each
+// transaction own separate caches; transactions never share the DB cache. It
+// is off by default and unsuitable for transaction/statement-mode poolers.
+// Schema-change errors evict entries and are not retried. New panics if this
+// option is used with ClickHouse, which cannot prepare general queries.
 func WithStmtCache(capacity ...int) Option {
 	return func(c *config) {
 		c.stmtCache = true
@@ -99,15 +72,12 @@ func WithStmtCache(capacity ...int) Option {
 	}
 }
 
-// grammar is the SQL-shaping identity of a DB handle: dialect plus every
-// option that affects rendered SQL. All SQL caches (entity CRUD on plans,
-// Compiled queries, the rebind cache) key by *grammar, so handles that would
-// render different SQL can never poison each other.
+// grammar isolates SQL caches by dialect and rendering options.
 type grammar struct {
 	d          Dialect
 	tableNamer func(string) string
 
-	// crud caches rendered entity-CRUD SQL: key is crudKey.
+	// crud caches rendered entity-CRUD SQL by crudKey.
 	crud sync.Map
 }
 
@@ -116,13 +86,25 @@ type crudKey struct {
 	op   string
 	bits uint64 // participating-column bitmap for shape-variable statements
 	rows int    // VALUES tuple count for batch statements
-	spec string // normalized upsert conflict shape (upsertSpecKey), "" otherwise
+	spec upsertCacheKey
 }
 
-// cachedSQL renders entity-CRUD SQL once per grammar and shape. The hot path
-// pays one sync.Map lookup instead of a render plus a rebind.
-func (g *grammar) cachedSQL(p *plan, op string, bits uint64, rows int, spec string, build func() (string, error)) (string, error) {
-	key := crudKey{plan: p, op: op, bits: bits, rows: rows, spec: spec}
+// cachedSQL renders entity-CRUD SQL once per grammar and shape.
+func (g *grammar) cachedSQL(
+	p *plan,
+	op string,
+	bits uint64,
+	rows int,
+	spec upsertCacheKey,
+	build func() (string, error),
+) (string, error) {
+	key := crudKey{
+		plan: p,
+		op:   op,
+		bits: bits,
+		rows: rows,
+		spec: spec,
+	}
 	if v, ok := g.crud.Load(key); ok {
 		return v.(string), nil
 	}
@@ -132,10 +114,6 @@ func (g *grammar) cachedSQL(p *plan, op string, bits uint64, rows int, spec stri
 	}
 	actual, _ := g.crud.LoadOrStore(key, sqlText)
 	return actual.(string), nil
-}
-
-func newGrammar(d Dialect, cfg *config) *grammar {
-	return &grammar{d: d, tableNamer: cfg.tableNamer}
 }
 
 // table resolves a plan's table name under this grammar: a TableName()
@@ -148,4 +126,16 @@ func (g *grammar) table(p *plan) string {
 		return g.tableNamer(p.structName)
 	}
 	return p.defaultTable
+}
+
+func defaultConfig() *config {
+	return &config{
+		clock:   time.Now,
+		logArgs: true,
+		stmtCap: 512,
+	}
+}
+
+func newGrammar(d Dialect, cfg *config) *grammar {
+	return &grammar{d: d, tableNamer: cfg.tableNamer}
 }

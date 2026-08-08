@@ -99,7 +99,11 @@ func naiveRebind(p lexProfile, style bindStyle, query string, args []any) (strin
 				out = append(out, '-', '-')
 				i += 2
 				state = nvLine
-			case c == '#' && (p.hashComment || (p.hashSpaceComment && i+1 < len(query) && (query[i+1] == ' ' || query[i+1] == '!'))):
+			case c == '#' &&
+				(p.hashComment ||
+					(p.hashSpaceComment &&
+						i+1 < len(query) &&
+						(query[i+1] == ' ' || query[i+1] == '!'))):
 				out = append(out, c)
 				i++
 				state = nvLine

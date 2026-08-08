@@ -8,17 +8,9 @@ import (
 	"slices"
 )
 
-// InsertAll writes rows in multi-VALUES statements, auto-chunked to the
-// dialect's bind-parameter ceiling. Outside a transaction each chunk commits
-// independently — a failure in chunk N leaves earlier chunks written; wrap
-// the call in db.Tx for atomicity (rio adds no hidden transaction).
-//
-// Backfill promises only what the dialects can keep: auto-increment PKs on
-// PostgreSQL (RETURNING, positional) and SQLite (RETURNING sorted by PK —
-// its output order is documented as undefined), nothing on MySQL (its
-// default interleaved autoinc mode makes first-ID+i arithmetic wrong).
-// Timestamps, version, and every explicit value are already in your slice.
-// omitzero does not apply on the batch path: one statement, one column list.
+// InsertAll inserts rows in chunks within the dialect's bind limit. Chunks
+// commit independently unless the caller supplies a transaction. It backfills
+// generated keys only where ordering is reliable; omitzero does not apply.
 func InsertAll[T any](ctx context.Context, db Queryer, rows []T) error {
 	if len(rows) == 0 {
 		return nil
@@ -32,11 +24,14 @@ func InsertAll[T any](ctx context.Context, db Queryer, rows []T) error {
 	now := normalizeTime(db.conf().clock())
 
 	if !d.caps().autoIncrPK && p.autoIncr != nil {
-		// Any zero conventional ID errors — covering batchColumns's
-		// mixed-batch arbitration and its all-zero backfill branch in one
-		// rule, since neither generating nor backfilling exists here.
+		// This dialect can neither generate nor backfill a zero conventional ID.
 		for i := range rows {
-			if err := checkGeneratedID(d, "InsertAll", p, reflect.ValueOf(&rows[i]).Elem()); err != nil {
+			if err := checkGeneratedID(
+				d,
+				"InsertAll",
+				p,
+				reflect.ValueOf(&rows[i]).Elem(),
+			); err != nil {
 				return err
 			}
 		}
@@ -58,149 +53,35 @@ func InsertAll[T any](ctx context.Context, db Queryer, rows []T) error {
 		chunk = 1
 	}
 	bn := binder{d: d, now: now}
+	args := make([]any, 0, chunk*len(cols))
 	for start := 0; start < len(rows); start += chunk {
 		end := min(start+chunk, len(rows))
-		if err := insertChunk(ctx, db, p, cols, rows[start:end], backfill, &bn, chunk); err != nil {
+		if err := insertChunk(
+			ctx,
+			db,
+			p,
+			cols,
+			rows[start:end],
+			backfill,
+			&bn,
+			chunk,
+			args,
+		); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// batchColumns picks one column list for the whole batch. Auto-increment
-// PKs must be all-zero (skip and backfill) or all-set (write, no backfill):
-// mixing would silently reassign explicit IDs.
-func batchColumns[T any](p *plan, rows []T) (cols []*field, backfill bool, err error) {
-	backfill = p.autoIncr != nil
-	if p.autoIncr != nil {
-		zero, nonzero := 0, 0
-		for i := range rows {
-			if reflect.ValueOf(&rows[i]).Elem().FieldByIndex(p.autoIncr.index).IsZero() {
-				zero++
-			} else {
-				nonzero++
-			}
-		}
-		switch {
-		case zero == len(rows):
-			backfill = true
-		case nonzero == len(rows):
-			backfill = false
-		default:
-			return nil, false, fmt.Errorf("rio: batch write: %s rows mix zero and explicit %s values; split the batch",
-				p.structName, p.autoIncr.column)
-		}
-	}
-	for _, f := range p.fields {
-		if f.isAutoIncr && backfill {
-			continue
-		}
-		cols = append(cols, f)
-	}
-	return cols, backfill, nil
-}
-
-func insertChunk[T any](ctx context.Context, db Queryer, p *plan, cols []*field, rows []T, backfill bool, bn *binder, fullChunk int) error {
-	g := db.gram()
-	d := g.d
-	bits, cacheable := setBits(p, cols)
-	// Only full-sized chunks enter the SQL cache: tail sizes (total % chunk)
-	// vary freely with workload row counts, and every distinct tail length
-	// would pin a complete multi-VALUES statement in grammar.crud forever.
-	// Tails render directly — microseconds next to the round-trip they open.
-	cacheable = cacheable && len(rows) == fullChunk
-	returning := backfill && d.caps().returning
-	op := "insertall"
-	if returning {
-		op = "insertall+ret"
-	}
-	sqlText, err := crudSQLRows(g, p, op, bits, len(rows), cacheable, func() []byte {
-		b := renderInsertHead(g, p, cols)
-		b = append(b, " VALUES "...)
-		for r := range rows {
-			if r > 0 {
-				b = append(b, ", "...)
-			}
-			b = append(b, '(')
-			for i := range cols {
-				if i > 0 {
-					b = append(b, ", "...)
-				}
-				b = append(b, '?')
-			}
-			b = append(b, ')')
-		}
-		if returning {
-			b = append(b, " RETURNING "...)
-			b = d.quote(b, p.autoIncr.column)
-		}
-		return b
-	})
-	if err != nil {
-		return err
-	}
-	args := make([]any, 0, len(rows)*len(cols))
-	for r := range rows {
-		rv := reflect.ValueOf(&rows[r]).Elem()
-		base := rv.Addr().UnsafePointer()
-		for _, f := range cols {
-			a, err := fieldValue(f, base, rv, bn)
-			if err != nil {
-				return err
-			}
-			args = append(args, a)
-		}
-	}
-
-	if returning {
-		sqlRows, finish, err := runQuery(ctx, db, "insert", p.structName, sqlText, args)
-		if err != nil {
-			return err
-		}
-		ids, err := scanScalars[int64](sqlRows)
-		finishQuery(finish, err)
-		if err != nil {
-			return err
-		}
-		if len(ids) != len(rows) {
-			return fmt.Errorf("rio: InsertAll: RETURNING yielded %d ids for %d rows", len(ids), len(rows))
-		}
-		if d.name() == "sqlite" {
-			// SQLite documents RETURNING output order as undefined; rowids
-			// are assigned monotonically within one statement, so sorted
-			// ids correspond to input order.
-			slices.Sort(ids)
-		}
-		for i := range rows {
-			fv := reflect.ValueOf(&rows[i]).Elem().FieldByIndex(p.autoIncr.index)
-			if isUintKind(fv.Kind()) {
-				fv.SetUint(uint64(ids[i]))
-			} else {
-				fv.SetInt(ids[i])
-			}
-		}
-		return nil
-	}
-
-	_, err = run(ctx, db, "insert", p.structName, sqlText, args)
-	return err
-}
-
-// UpsertAll upserts rows in multi-VALUES statements with the same conflict
-// clause as Upsert. It never backfills: DoNothing shrinks the returned row
-// set, so positional matching would silently misalign (the batch-backfill
-// killer). Reload rows you need generated values for.
-//
-// omitzero does not apply on the batch path (one statement, one column
-// list): unlike Upsert, zero omitzero columns are inserted and stay in the
-// default conflict update set, so batch zeros overwrite on conflict.
-// UpdatedAt is reset to the clock on every non-DoNothing row, like Upsert.
-// The MySQL DoUpdate version floor (8.0.19+, no MariaDB) also matches Upsert.
+// UpsertAll applies Upsert conflict behavior in chunked multi-VALUES
+// statements. It does not backfill generated values, and omitzero does not
+// apply. MySQL DoUpdate requires MySQL 8.0.19 or later and excludes MariaDB.
 func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertOption) error {
 	if len(rows) == 0 {
 		return nil
 	}
 	var spec upsertSpec
+	spec.init()
 	for _, opt := range opts {
 		opt(&spec)
 	}
@@ -222,7 +103,12 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 	}
 	now := normalizeTime(db.conf().clock())
 	for i := range rows {
-		prepareUpsertRow(p, reflect.ValueOf(&rows[i]).Elem(), &spec, now)
+		prepareUpsertRow(
+			p,
+			reflect.ValueOf(&rows[i]).Elem(),
+			&spec,
+			now,
+		)
 	}
 	cols, _, err := batchColumns(p, rows)
 	if err != nil {
@@ -231,8 +117,7 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 	if len(cols) == 0 {
 		return fmt.Errorf("rio: UpsertAll: %s has no insertable columns", p.structName)
 	}
-	// The batch column list applies no omitzero (batchColumns), so nothing is
-	// skipped — every column the conflict update references was inserted.
+	// Batch columns do not apply omitzero, so none are skipped.
 	update, err := upsertUpdateSet(p, &spec, nil)
 	if err != nil {
 		return err
@@ -245,14 +130,22 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 	table := g.table(p)
 	bits, cacheable := setBits(p, cols)
 	bn := binder{d: d, now: now}
+	args := make([]any, 0, chunk*len(cols))
 	for start := 0; start < len(rows); start += chunk {
 		end := min(start+chunk, len(rows))
 		part := rows[start:end]
 
-		// Cached per (shape, tuple count, conflict shape) like insertChunk,
-		// under the same full-chunks-only rule: tail sizes render directly.
-		sqlText, err := upsertSQL(g, p, "upsertall", bits, len(part), &spec, update,
-			cacheable && len(part) == chunk, func() []byte {
+		// Cache full chunks by tuple and conflict shape.
+		sqlText, err := upsertSQL(
+			g,
+			p,
+			"upsertall",
+			bits,
+			len(part),
+			&spec,
+			update,
+			cacheable && len(part) == chunk,
+			func() []byte {
 				b := renderInsertHead(g, p, cols)
 				b = append(b, " VALUES "...)
 				for r := range part {
@@ -274,12 +167,19 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 						b = append(b, "DO NOTHING"...)
 					} else {
 						b = append(b, "DO UPDATE SET "...)
-						b = appendConflictSets(b, d, table, p, update, &spec, "excluded")
+						b = appendConflictSets(
+							b,
+							d,
+							table,
+							p,
+							update,
+							&spec,
+							"excluded",
+						)
 					}
 					return b
 				}
-				// The row alias is DoUpdate-only, as in Upsert: 8.0.19+ syntax
-				// that DoNothing's no-op assignment never needs.
+				// The MySQL row alias is required only for DoUpdate.
 				if !spec.doNothing {
 					b = appendMySQLUpsertAlias(b)
 				}
@@ -293,15 +193,24 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 					b = append(b, " = "...)
 					b = d.quote(b, col)
 				} else {
-					b = appendConflictSets(b, d, table, p, update, &spec, mysqlUpsertAlias)
+					b = appendConflictSets(
+						b,
+						d,
+						table,
+						p,
+						update,
+						&spec,
+						mysqlUpsertAlias,
+					)
 				}
 				return b
-			})
+			},
+		)
 		if err != nil {
 			return err
 		}
 
-		args := make([]any, 0, len(part)*len(cols))
+		args = args[:0]
 		for r := range part {
 			rv := reflect.ValueOf(&part[r]).Elem()
 			base := rv.Addr().UnsafePointer()
@@ -313,9 +222,157 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 				args = append(args, a)
 			}
 		}
-		if _, err := run(ctx, db, "upsert", p.structName, sqlText, args); err != nil {
+		if _, err := run(
+			ctx,
+			db,
+			"upsert",
+			p.structName,
+			sqlText,
+			args,
+		); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// batchColumns requires generated keys to be either all zero or all explicit.
+func batchColumns[T any](p *plan, rows []T) (cols []*field, backfill bool, err error) {
+	backfill = p.autoIncr != nil
+	if p.autoIncr != nil {
+		var zero, nonzero int
+		for i := range rows {
+			if reflect.ValueOf(&rows[i]).Elem().FieldByIndex(p.autoIncr.index).IsZero() {
+				zero++
+			} else {
+				nonzero++
+			}
+		}
+		switch {
+		case zero == len(rows):
+			backfill = true
+		case nonzero == len(rows):
+			backfill = false
+		default:
+			return nil, false, fmt.Errorf("rio: batch write: %s rows mix zero and explicit %s values; split the batch",
+				p.structName, p.autoIncr.column)
+		}
+	}
+	if backfill {
+		return p.insCols, true, nil
+	}
+	return p.fields, false, nil
+}
+
+func insertChunk[T any](
+	ctx context.Context,
+	db Queryer,
+	p *plan,
+	cols []*field,
+	rows []T,
+	backfill bool,
+	bn *binder,
+	fullChunk int,
+	args []any,
+) error {
+	g := db.gram()
+	d := g.d
+	bits, cacheable := setBits(p, cols)
+	// Cache only reusable full-chunk shapes, not arbitrary tail lengths.
+	cacheable = cacheable && len(rows) == fullChunk
+	returning := backfill && d.caps().returning
+	op := "insertall"
+	if returning {
+		op = "insertall+ret"
+	}
+	sqlText, err := crudSQLRows(
+		g,
+		p,
+		op,
+		bits,
+		len(rows),
+		cacheable,
+		func() []byte {
+			b := renderInsertHead(g, p, cols)
+			b = append(b, " VALUES "...)
+			for r := range rows {
+				if r > 0 {
+					b = append(b, ", "...)
+				}
+				b = append(b, '(')
+				for i := range cols {
+					if i > 0 {
+						b = append(b, ", "...)
+					}
+					b = append(b, '?')
+				}
+				b = append(b, ')')
+			}
+			if returning {
+				b = append(b, " RETURNING "...)
+				b = d.quote(b, p.autoIncr.column)
+			}
+			return b
+		},
+	)
+	if err != nil {
+		return err
+	}
+	args = args[:0]
+	for r := range rows {
+		rv := reflect.ValueOf(&rows[r]).Elem()
+		base := rv.Addr().UnsafePointer()
+		for _, f := range cols {
+			a, err := fieldValue(f, base, rv, bn)
+			if err != nil {
+				return err
+			}
+			args = append(args, a)
+		}
+	}
+
+	if returning {
+		sqlRows, finish, err := runQuery(
+			ctx,
+			db,
+			"insert",
+			p.structName,
+			sqlText,
+			args,
+		)
+		if err != nil {
+			return err
+		}
+		ids, err := scanScalarsCap[int64](sqlRows, 0, len(rows))
+		finishQuery(finish, err)
+		if err != nil {
+			return err
+		}
+		if len(ids) != len(rows) {
+			return fmt.Errorf("rio: InsertAll: RETURNING yielded %d ids for %d rows", len(ids), len(rows))
+		}
+		if d.name() == "sqlite" {
+			// SQLite RETURNING order is undefined; generated rowids are monotonic.
+			slices.Sort(ids)
+		}
+		for i := range rows {
+			fv := reflect.ValueOf(&rows[i]).Elem().FieldByIndex(p.autoIncr.index)
+			if isUintKind(fv.Kind()) {
+				fv.SetUint(uint64(ids[i]))
+			} else {
+				fv.SetInt(ids[i])
+			}
+		}
+		return nil
+	}
+
+	_, err = run(
+		ctx,
+		db,
+		"insert",
+		p.structName,
+		sqlText,
+		args,
+	)
+	return err
 }

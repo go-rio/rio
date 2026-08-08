@@ -39,6 +39,8 @@ const pgDDL = `CREATE TABLE bench_users (
 	updated_at TIMESTAMPTZ NOT NULL
 )`
 
+const pgResetSQL = "TRUNCATE TABLE bench_users CONTINUE IDENTITY"
+
 func pgDSN(b *testing.B) string {
 	b.Helper()
 	dsn := os.Getenv("RIO_BENCH_PG_DSN")
@@ -106,7 +108,7 @@ func BenchmarkPGReadOne_Rio(b *testing.B) {
 	seedPG(b, raw, 100)
 	db := riopostgres.New(raw)
 	ctx := context.Background()
-	q := rio.MustCompile[BenchUser](rio.From[BenchUser]().Where("id = ?").Limit(1))
+	q := rio.From[BenchUser]().Where("id = ?").Limit(1).Must()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -121,7 +123,7 @@ func BenchmarkPGReadOne_RioNative(b *testing.B) {
 	seedPG(b, raw, 100)
 	db := benchPGNative(b, raw)
 	ctx := context.Background()
-	q := rio.MustCompile[BenchUser](rio.From[BenchUser]().Where("id = ?").Limit(1))
+	q := rio.From[BenchUser]().Where("id = ?").Limit(1).Must()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -139,7 +141,7 @@ func BenchmarkPGReadOne_RioStmtCache(b *testing.B) {
 	seedPG(b, raw, 100)
 	db := riopostgres.New(raw, rio.WithStmtCache())
 	ctx := context.Background()
-	q := rio.MustCompile[BenchUser](rio.From[BenchUser]().Where("id = ?").Limit(1))
+	q := rio.From[BenchUser]().Where("id = ?").Limit(1).Must()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -156,6 +158,7 @@ func BenchmarkPGInsert_RioStmtCache(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		resetInsertTable(b, raw, i, 1, pgResetSQL)
 		u := BenchUser{Email: "x@example.com", Age: 30}
 		if err := rio.Insert(ctx, db, &u); err != nil {
 			b.Fatal(err)
@@ -196,7 +199,7 @@ func BenchmarkPGReadOne_Stdlib(b *testing.B) {
 
 func BenchmarkPGReadOne_Gorm(b *testing.B) {
 	gdb := benchPGGorm(b)
-	sqlDB, _ := gdb.DB()
+	sqlDB := gormSQLDB(b, gdb)
 	seedPG(b, sqlDB, 100)
 	ctx := context.Background()
 	b.ReportAllocs()
@@ -214,7 +217,7 @@ func BenchmarkPGReadHundred_Rio(b *testing.B) {
 	seedPG(b, raw, 100)
 	db := riopostgres.New(raw)
 	ctx := context.Background()
-	q := rio.MustCompile[BenchUser](rio.From[BenchUser]().Where("age >= ?"))
+	q := rio.From[BenchUser]().Where("age >= ?").Must()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -230,7 +233,7 @@ func BenchmarkPGReadHundred_RioNative(b *testing.B) {
 	seedPG(b, raw, 100)
 	db := benchPGNative(b, raw)
 	ctx := context.Background()
-	q := rio.MustCompile[BenchUser](rio.From[BenchUser]().Where("age >= ?"))
+	q := rio.From[BenchUser]().Where("age >= ?").Must()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -244,30 +247,26 @@ func BenchmarkPGReadHundred_RioNative(b *testing.B) {
 func BenchmarkPGReadHundred_Stdlib(b *testing.B) {
 	raw := benchPGRaw(b)
 	seedPG(b, raw, 100)
+	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rows, err := raw.Query(`SELECT "id", "email", "age", "created_at", "updated_at" FROM bench_users WHERE age >= $1`, 0)
-		if err != nil {
-			b.Fatal(err)
-		}
-		var out []BenchUser
-		for rows.Next() {
-			var u BenchUser
-			if err := rows.Scan(&u.ID, &u.Email, &u.Age, &u.CreatedAt, &u.UpdatedAt); err != nil {
-				b.Fatal(err)
-			}
-			out = append(out, u)
-		}
-		if rows.Close(); len(out) != 100 {
-			b.Fatal(len(out))
+		out, err := readHundredStdlib(
+			ctx,
+			raw,
+			`SELECT "id", "email", "age", "created_at", "updated_at" `+
+				`FROM bench_users WHERE age >= $1`,
+			0,
+		)
+		if err != nil || len(out) != 100 {
+			b.Fatalf("%v %d", err, len(out))
 		}
 	}
 }
 
 func BenchmarkPGReadHundred_Gorm(b *testing.B) {
 	gdb := benchPGGorm(b)
-	sqlDB, _ := gdb.DB()
+	sqlDB := gormSQLDB(b, gdb)
 	seedPG(b, sqlDB, 100)
 	ctx := context.Background()
 	b.ReportAllocs()
@@ -287,6 +286,7 @@ func BenchmarkPGInsert_Rio(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		resetInsertTable(b, raw, i, 1, pgResetSQL)
 		u := BenchUser{Email: "x@example.com", Age: 30}
 		if err := rio.Insert(ctx, db, &u); err != nil {
 			b.Fatal(err)
@@ -301,6 +301,7 @@ func BenchmarkPGInsert_RioNative(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		resetInsertTable(b, raw, i, 1, pgResetSQL)
 		u := BenchUser{Email: "x@example.com", Age: 30}
 		if err := rio.Insert(ctx, db, &u); err != nil {
 			b.Fatal(err)
@@ -313,10 +314,17 @@ func BenchmarkPGInsert_Stdlib(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		resetInsertTable(b, raw, i, 1, pgResetSQL)
 		now := time.Now().UTC().Truncate(time.Microsecond)
 		var id int64
-		err := raw.QueryRow(`INSERT INTO bench_users (email, age, created_at, updated_at) VALUES ($1, $2, $3, $4) RETURNING id`,
-			"x@example.com", 30, now, now).Scan(&id)
+		err := raw.QueryRow(
+			`INSERT INTO bench_users (email, age, created_at, updated_at) `+
+				`VALUES ($1, $2, $3, $4) RETURNING id`,
+			"x@example.com",
+			30,
+			now,
+			now,
+		).Scan(&id)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -325,10 +333,12 @@ func BenchmarkPGInsert_Stdlib(b *testing.B) {
 
 func BenchmarkPGInsert_Gorm(b *testing.B) {
 	gdb := benchPGGorm(b)
+	sqlDB := gormSQLDB(b, gdb)
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		resetInsertTable(b, sqlDB, i, 1, pgResetSQL)
 		u := BenchUser{Email: "x@example.com", Age: 30}
 		if err := gdb.WithContext(ctx).Create(&u).Error; err != nil {
 			b.Fatal(err)
@@ -390,7 +400,7 @@ func BenchmarkPGUpdate_Stdlib(b *testing.B) {
 
 func BenchmarkPGUpdate_Gorm(b *testing.B) {
 	gdb := benchPGGorm(b)
-	sqlDB, _ := gdb.DB()
+	sqlDB := gormSQLDB(b, gdb)
 	seedPG(b, sqlDB, 100)
 	ctx := context.Background()
 	var u BenchUser
@@ -414,10 +424,8 @@ func BenchmarkPGInsertBatch100_Rio(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rows := make([]BenchUser, 100)
-		for j := range rows {
-			rows[j] = BenchUser{Email: "x@example.com", Age: j}
-		}
+		resetInsertTable(b, raw, i, benchBatchSize, pgResetSQL)
+		rows := newBenchBatch()
 		if err := rio.InsertAll(ctx, db, rows); err != nil {
 			b.Fatal(err)
 		}
@@ -431,11 +439,25 @@ func BenchmarkPGInsertBatch100_RioNative(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rows := make([]BenchUser, 100)
-		for j := range rows {
-			rows[j] = BenchUser{Email: "x@example.com", Age: j}
-		}
+		resetInsertTable(b, raw, i, benchBatchSize, pgResetSQL)
+		rows := newBenchBatch()
 		if err := rio.InsertAll(ctx, db, rows); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkPGInsertBatch100_Stdlib(b *testing.B) {
+	raw := benchPGRaw(b)
+	ctx := context.Background()
+	query := postgresBatchInsertSQL()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resetInsertTable(b, raw, i, benchBatchSize, pgResetSQL)
+		rows := newBenchBatch()
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		if err := insertBatchReturningStdlib(ctx, raw, query, batchInsertArgs(rows, now), rows); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -443,14 +465,13 @@ func BenchmarkPGInsertBatch100_RioNative(b *testing.B) {
 
 func BenchmarkPGInsertBatch100_Gorm(b *testing.B) {
 	gdb := benchPGGorm(b)
+	sqlDB := gormSQLDB(b, gdb)
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rows := make([]BenchUser, 100)
-		for j := range rows {
-			rows[j] = BenchUser{Email: "x@example.com", Age: j}
-		}
+		resetInsertTable(b, sqlDB, i, benchBatchSize, pgResetSQL)
+		rows := newBenchBatch()
 		if err := gdb.WithContext(ctx).Create(&rows).Error; err != nil {
 			b.Fatal(err)
 		}

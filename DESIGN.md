@@ -1,61 +1,39 @@
 # rio Design
 
-rio is an ORM for Go. This document records rio's design decisions, their
-research basis, and the features rio omits by design.
-
-Research base:
-
-- Go: GORM, ent, Bun, sqlc, SQLBoiler, sqlx, Jet, XORM.
-- Active Record family: ActiveRecord, Eloquent, Django.
-- Data Mapper family: SQLAlchemy, Hibernate, EF Core, Doctrine.
-- Modern type-safe family: Prisma, Drizzle, Kysely, Ecto, Diesel, SeaORM, jOOQ.
-- Go community complaints.
-
-Design orientation: explicit declaration over implicit magic.
+rio is an explicit, stateless ORM for Go. This document records its design
+invariants and intentional omissions; usage belongs in the README and godoc.
 
 ## Positioning
 
-> GORM's ergonomics + sqlc's explicit SQL + type safety through generics,
-> without the weight of all three.
-
-- **Repo-style explicitness** (Ecto): structs are pure data; every database
-  operation is a visible call. No `user.Save()`, no global handles, no
-  sessions, no identity map.
-- **SQL correspondence** (Drizzle): one builder call ≈ one SQL fragment.
-  Generated SQL is predictable and printable.
-- **Stateless by default** (Hibernate 7): insert/update/delete execute
-  immediately. No unit of work, no change tracking, no flush ordering.
-- **Queries are values** (SQLAlchemy 2.0 statement/session split): builders are
-  immutable, connection-free values; execution points take the `Queryer`. Every
-  execution signature reads `(ctx, db, ...)`.
+- **Explicit operations:** structs are data; writes are visible function calls.
+  There are no model sessions, identity maps, or hidden flushes.
+- **SQL correspondence:** one builder call maps to one SQL fragment, so the
+  generated statement stays predictable.
+- **Stateless execution:** writes execute immediately. There is no change
+  tracking or unit of work.
+- **Queries are values:** builders are immutable and connection-free; terminal
+  methods take `(ctx, db, ...)` and accept either `*DB` or `*Tx` through
+  `Queryer`.
 - **Zero dependencies** in the core. Drivers live in separate modules
   (`github.com/go-rio/sqlite|mysql|postgres|clickhouse`) and carry the real
   driver deps.
 
 ## Architecture
 
-One pipeline, one explicit cache key per stage:
+One pipeline, one parameter contract:
 
-> **build** (connection-free pure value, no cache) →
-> **render** (SQL text, cached per *grammar* — the identity frozen per DB:
-> dialect + table namer + SQL-affecting options) →
+> **build** (connection-free immutable value) →
+> **validate + bind** (structure plus this execution's deferred arguments) →
+> **render** (actual dialect; entity CRUD shapes cache per grammar) →
 > **prepare** (optional `*sql.Stmt` cache, keyed by SQL text, opt-in) →
-> **exec** (database/sql, hooks, error translation)
+> **exec** (database/sql or native engine, hooks, error translation)
 
 Four layers inside `github.com/go-rio/rio`:
 
-1. **Execution kernel** — two engines behind one opaque `Queryer`. The default
-   engine wraps `database/sql`; the PostgreSQL driver module can supply a
-   pgx-native engine (`postgres.OpenNative`) that keeps every rio semantic and
-   drops the `driver.Value` boxing cost. `*rio.DB` and `*rio.Tx` both implement
-   `rio.Queryer`, so DAO code works inside and outside transactions unchanged,
-   on either engine. `Unwrap()` exposes the underlying `*sql.DB` on both
-   engines; the native engine carries a `database/sql` view of the same pool.
-   rio never builds a connection pool (pooling belongs to the platform layer:
-   `database/sql`'s pool or pgx's `pgxpool`) and never tunes one; configure the
-   pool you constructed. (Prisma spent 2025 undoing its
-   self-built engine and pool; rio adopts the driver's pool instead — less ORM
-   machinery.)
+1. **Execution kernel** — the default engine wraps `database/sql`; the
+   PostgreSQL module can supply a pgx-native engine. Both preserve the same rio
+   semantics behind `Queryer`. rio owns neither pool policy nor pool tuning;
+   callers configure the `database/sql` or pgx pool they construct.
 2. **SQL layer** — per-statement renderers, dialect grammars, the `?`
    placeholder rebinder with per-dialect lexer profiles, `IN (?)` slice
    expansion (expand first, renumber second). Dialects are an *opaque*
@@ -63,112 +41,73 @@ Four layers inside `github.com/go-rio/rio`:
    `rio.ClickHouse`); capability flags replace type switches: returning,
    conflict target, max bind params, FOR UPDATE render/elide/reject, mutations,
    transactions, unique keys, generated PKs, statement prepare, FINAL.
-   Cross-module dialect implementations would freeze the interface (same
-   argument validated in go-rio/migrate).
+   The dialect interface stays internal so capabilities can evolve without
+   freezing a cross-module implementation contract.
 3. **Mapping layer** — reflection-based struct↔table plans, computed once per
    type and cached forever (plans are immutable once published). Scanning has a
    reflect slow path and an unsafe fast path (see Performance).
 4. **ORM facade** — generic entry points (`rio.From[T]`, `rio.Insert`, …),
    relations with explicit preloading, optimistic locking, timestamps, explicit
-   soft delete, compiled queries.
+   soft delete, and connection-free reusable query templates.
 
-Driver modules contain only: `Open(dsn)` / `New(*sql.DB)` constructors, an
-error translator (driver error → `rio.ErrDuplicateKey` / `ErrForeignKeyViolated`,
-keeping the driver error in the chain), and DSN hygiene. Grammar lives in the
-core.
+Driver modules contain constructors, DSN hygiene, and error translation while
+preserving the driver error chain. SQL grammar stays in the core.
 
 | Driver | DSN hygiene |
 |---|---|
 | mysql | forces `parseTime=true`; rejects an explicit `parseTime=false` |
 | sqlite | defaults `foreign_keys=on` (without it SQLite never raises FK violations) and `busy_timeout` |
 
-## API at a glance
+## Reusable query templates and caching
 
-```go
-db, err := postgres.Open(dsn)            // *rio.DB
-
-// Builders are immutable, connection-free values; package-level base queries
-// and concurrent derivation are safe (GORM's "condition pollution" is
-// structurally impossible).
-users, err := rio.From[User]().
-    Where("age > ?", 18).
-    OrderBy("created_at DESC").
-    Limit(10).
-    With("Posts", rio.RelWhere("published = ?", true)).
-    All(ctx, db)
-
-user, err := rio.Find[User](ctx, db, 42)             // by PK; composite PKs pass all parts in declared order
-user, err := rio.From[User]().Where("email = ?", e).First(ctx, db)
-n, err    := rio.From[User]().Where(...).Count(ctx, db)
-
-// Writes: immediate, explicit, zero values are real values.
-err = rio.Insert(ctx, db, &user)                     // fills ID + skipped omitzero columns via RETURNING on PG/SQLite
-err = rio.InsertAll(ctx, db, users)                  // single multi-VALUES statement, auto-chunked
-err = rio.Update(ctx, db, &user)                     // full-column UPDATE by PK, or:
-err = rio.Update(ctx, db, &user, "name", "email")    // explicit column whitelist
-err = rio.Delete(ctx, db, &user)
-
-// Set-based writes: refuse to run without WHERE.
-n, err = rio.From[User]().Where("last_login < ?", cutoff).
-    UpdateAll(ctx, db, rio.Set{"status": "inactive"})    // maintains updated_at; rio.Expr for "count + 1"
-n, err = rio.From[Session]().Where("expired").DeleteAll(ctx, db)
-
-// Upsert: conflict target, update whitelist, returning, timestamps.
-err = rio.Upsert(ctx, db, &user, rio.OnConflict("email"), rio.DoUpdate("name"))
-
-// Escape hatch: same scanner, same transactions, any shape.
-stats, err := rio.Raw[UserStat](
-    "SELECT org_id, count(*) AS n FROM users GROUP BY org_id").All(ctx, db)
-n, err := rio.Raw[int64]("SELECT count(*) FROM users").First(ctx, db)
-
-// Transactions: closure + automatic SAVEPOINT on nesting.
-err = db.Tx(ctx, func(tx *rio.Tx) error {
-    if err := rio.Insert(ctx, tx, &order); err != nil { return err }
-    return rio.Insert(ctx, tx, &payment)
-})
-```
-
-## Compiled queries
-
-Most application SQL is fixed in shape; only parameters vary. Three tiers:
+Three mechanisms cover structure, rendering, and preparation:
 
 1. **Entity CRUD is cached automatically** — Insert/Update/Delete/Find SQL
-   depends only on the column set, so it is rendered once per grammar and cached
-   on the plan.
-2. **`rio.MustCompile[T]`** for hand-built queries, `regexp.MustCompile` style:
+   depends only on the column set, so each grammar caches it by model and
+   statement shape.
+2. **`Query[T]` is the reusable hand-built template.** It owns no connection or
+   prepared statement. `Must` may attach a private, concurrency-safe SQL-shape
+   cache keyed by grammar and terminal:
 
    ```go
-   var adults = rio.MustCompile[User](
-       rio.From[User]().Where("age > ?").OrderBy("created_at DESC").Limit(10),
-   )
-   users, err := adults.All(ctx, db, 18)   // binds parameters only
+   var adults = rio.From[User]().
+       Where("tenant_id = ?", fixedTenantID).
+       Where("active").
+       Where("age > ?").
+       OrderBy("created_at DESC").
+       Limit(10).
+       Must()
+
+   users, err := adults.All(ctx, db, 18)
+   emails, err := adults.Pluck[string](ctx, tx, "email", 18)
    ```
 
-   - Package-level declaration runs before any DB exists: the eager phase does
-     structural validation only (tags, plan, relation paths; panic fits Must
-     semantics) and renders nothing grammar-dependent.
-   - SQL is rendered lazily per grammar and cached; placeholder arity is
-     verified precisely at first render (`?` counting is lexer- and therefore
-     dialect-dependent).
-   - MustCompile passing does not mean execution cannot fail.
-   - Inline args and exec-time args must not mix: a compiled query is either
-     fully inline (frozen constant query) or fully exec-parameterized; mixing
-     panics. `RelWhere` args are preload subqueries, inherently inline, exempt.
+   - `Validate` returns the first connection-independent model, builder, or
+     relation error. `Must` panics on the same error and otherwise preserves the
+     query description while enabling its private cache.
+   - Deferred main-query placeholders pass validation. At execution, the
+     actual dialect lexer classifies each Where/Having fragment independently.
+     Each fragment is either fully inline or fully deferred; the two forms may
+     be mixed across fragments.
+   - Missing and excess arguments fail before driver execution and before query
+     hooks. Runtime slices expand in `IN (?)` on every terminal path.
+   - `WhereHas` and `With` relation conditions stay fully inline because nested
+     EXISTS and preload statements do not share the main query's argument
+     order.
+   - SQL renders under the executing handle's grammar. Stable scalar shapes on
+     a `Must` query reuse a grammar-and-terminal-specific internal render;
+     runtime slices and function-valued relation options bypass it. The same
+     Query can run across DBs, transactions, dialects, table namers, and
+     argument values. Dialect capabilities and driver execution remain runtime
+     checks.
    - Limit/Offset take int values and are not parameterizable; rebuild paged
-     queries per page (build cost is negligible, only render is cached).
-   - Compiled execution still runs every QueryHook. `rio.Compile` is the
-     error-returning variant.
+     queries per page (builder cost is negligible).
 3. **`rio.WithStmtCache()`** (opt-in, **default off**) caches `*sql.Stmt` per
-   SQL text on the `*rio.DB` only; transactions bypass it. LRU-bounded (`IN`
-   expansion makes each slice length a distinct statement); evicted statements
-   are closed correctly; schema-change errors ("cached plan must not change
-   result type") evict and propagate, never auto-retry. Off by default because
-   of PgBouncer transaction pooling (GORM #5908's lesson). Independent of
-   MustCompile so compiled queries never smuggle prepared statements past a
-   pooler. On the native channel it panics at construction: there are no
-   `database/sql` prepared statements there; statement caching belongs to pgx's
-   query exec mode (the DSN parameter `default_query_exec_mode`, caching by
-   default).
+   SQL text on the `*rio.DB` and within each transaction. Both caches are
+   LRU-bounded because each expanded slice length creates a distinct statement.
+   Schema-change errors evict and propagate without an automatic retry. It is
+   off by default for transaction-pooler compatibility and independent of Query
+   reuse. The native channel uses pgx's query execution mode instead.
 
 ## Model mapping
 
@@ -205,21 +144,14 @@ type User struct {
   existing row's value survives a conflict), and naming it in `DoUpdate` is an
   error (the statement inserts no value to reference). `UpsertAll` binds every
   column (one statement, one column list), so batch zeros are written on both
-  branches. Every other column writes its zero value by default (Go zero values
-  are values; go-pg's `NULL`-by-default is the counterexample).
+  branches. Every other column writes its zero value by default.
 - Composite primary keys: tag multiple fields `rio:",pk"`. `Find` takes all
   parts in field-declaration order. Models without a PK return
   `ErrNoPrimaryKey` from Find/Update/Delete.
-- Embedding: an anonymous struct field flattens its exported fields into the
-  parent — a shared `type Timestamps struct { CreatedAt, UpdatedAt time.Time }`
-  maps the same as if written inline, even when the embedded type's name is
-  unexported (`encoding/json` flattens these too). Same-named
-  fields follow Go's shadowing rules: the shallowest declaration wins (even one
-  excluded with `rio:"-"` or renamed) and deeper ones do not map; two at the
-  same depth are a plan-time error, not a silent drop. An unexported embedded
-  type can only flatten: tagging it into a column of its own is refused at plan
-  time (binding cannot address unexported fields). Embed by value; pointer
-  embedding is rejected because offset-based scanning cannot hop a nil.
+- Embedding flattens exported fields and follows Go shadowing rules. Two fields
+  at the same depth are a plan-time error. An unexported embedded type may only
+  flatten; pointer embedding is rejected because offset-based scanning cannot
+  cross nil pointers.
 - Structs containing relation containers are not comparable (they hold slices),
   and `cmp.Diff` panics on the containers' unexported state: pass
   `cmpopts.IgnoreUnexported(rio.HasMany[Post]{}, ...)` and compare relation
@@ -230,25 +162,19 @@ type User struct {
 
 `rio.HasMany[T]` / `HasOne[T]` / `BelongsTo[T]` / `ManyToMany[T]` know whether
 they were loaded. Accessing an unloaded relation panics with instructions (add
-`.With("Posts")`) instead of silently returning empty data. This is Ecto's
-`NotLoaded` + Rails/Laravel strict-loading. `Loaded()` reports the state; JSON
-marshalling emits `null` when unloaded. `Set` is exported (manual assembly is
-supported). Implicit lazy loading does not exist: rio never issues a query you
-didn't ask for. Foreign keys resolve by convention (`Post.UserID` ↔
-`users.id`); tags override (`fk:`, `ref:`, `join:` — on ManyToMany, `fk:`/`ref:`
-name the join table's owner-side and target-side columns). Resolution is lazy
-(first preload) to allow mutually referencing models. A self-referential
-ManyToMany must name its two join columns explicitly: the convention would
-derive the same name for both, so rio errors with the fix.
+`.With("Posts")`) instead of silently returning empty data. `Loaded()` reports
+the state; JSON emits `null` when unloaded, and `Set` supports manual assembly.
+Implicit lazy loading does not exist. Foreign keys resolve by convention
+(`Post.UserID` ↔ `users.id`); tags override `fk:`, `ref:`, and `join:`. On a
+many-to-many relation, `fk:` and `ref:` name the join table columns. Resolution
+is lazy to allow mutually referencing models. A self-referential many-to-many
+relation must name both join columns explicitly.
 
-Preloading always uses per-relation `WHERE fk IN (...)` split queries
-(selectin): no cartesian explosion, pagination-safe, identical behavior on all
-dialects (the strategy ActiveRecord, Eloquent, Ecto, and SQLAlchemy all
-converged on). Parent keys are deduplicated and chunked by the dialect's bind
-limit. `With("Posts.Comments")` nests; `RelWhere`/`RelOrder`/`RelWithTrashed`
-customize. After preloading, containers are always resolved: no children →
-loaded-empty; a NULL FK on BelongsTo → loaded-nil. m2m across composite PKs
-returns a clear error in v1.
+Preloading uses per-relation `WHERE fk IN (...)` queries, avoiding cartesian
+products and preserving parent pagination. Keys are deduplicated and chunked
+by the dialect's bind limit. Nested paths and relation options are explicit.
+After preloading, containers are resolved to loaded-empty or loaded-nil when no
+row matches. Many-to-many relations across composite keys are unsupported.
 
 ## Operation semantics
 
@@ -266,7 +192,8 @@ returns a clear error in v1.
 | Unique violation | `rio.ErrDuplicateKey` (translated by driver modules, driver error stays in chain) |
 | FK violation | `rio.ErrForeignKeyViolated` |
 | NULL into non-pointer field | error naming the column — sole exception: the `softdelete` column reads NULL as zero time |
-| MySQL insert | fills auto-increment ID only; rio never issues a hidden second SELECT (`SupportsReturning` capability, Ecto's route) |
+| MySQL insert | fills the auto-increment ID only and never issues a hidden second SELECT |
+| SQLite insert | uses `LastInsertId` when only the auto-increment key needs backfill; uses `RETURNING` when omitted default columns must also be loaded |
 | Batch backfill | InsertAll backfills auto-inc PKs only (PG by position; SQLite sorted-by-PK since RETURNING order is documented as undefined; MySQL none — interleaved autoinc); UpsertAll never backfills (DoNothing shrinks the row set) |
 | ClickHouse writes | **never backfilled** — no RETURNING, no generated IDs, the driver's LastInsertId always errors: after Insert/InsertAll the struct holds exactly what you set. A zero conventional `ID` errors instead of silently storing constraint-less `0` duplicates; `rio:",noautoincr"` stays the "zero is a real value" escape hatch |
 | Soft-deleted model queries | filtered by default *because the tag is explicit*; `WithTrashed()` / `OnlyTrashed()`; `Delete` becomes UPDATE, `ForceDelete` is real |
@@ -275,158 +202,83 @@ returns a clear error in v1.
 | Zero `omitzero` column in `Upsert` | skipped from the INSERT list **and** the default conflict update set — a conflict preserves the existing value instead of resetting it to the DB DEFAULT; naming it in `DoUpdate` errors; `UpsertAll` binds every column and writes zeros on conflict |
 | MySQL Upsert version floor | the DoUpdate branch names the new row with the 8.0.19+ row alias (`VALUES()` is deprecated); MySQL <8.0.19 and MariaDB reject that syntax — `DoNothing` renders alias-free and runs everywhere |
 | `First` ordering | no implicit ORDER BY — LIMIT 1 (unless the caller set an explicit Limit, which is respected) over whatever order the DB returns; add OrderBy for determinism |
-| Placeholders | always `?`, rebound per dialect with a per-dialect lexer; `??` escapes a literal `?` (PostgreSQL JSONB operators); `IN (?)` expands slices — sqlx/Bun's established conventions |
+| Placeholders | always `?`, rebound by a dialect lexer; `??` escapes a literal `?`; `IN (?)` expands slices |
 | Scan priority | `rio:"-"` → `json` tag (beats Scanner, documented) → `sql.Scanner` (NULL handed to Scan(nil)) → pointer fields (NULL→nil) → `[]byte` (NULL→nil) → basic conversions (overflow-checked; MySQL unsigned BIGINT > MaxInt64 arrives as bytes and is parsed) → NULL into anything else errors with the column name |
 | Times | written as UTC, monotonic-stripped, truncated to microseconds (PG/MySQL precision — otherwise reload-and-Equal never holds), and the normalized value is written back to the struct as it binds, so the struct holds exactly what the database stores; trigger-rewritten columns are not read back; SQLite text format is rio's own, not the driver's |
 | Failed `Insert/Update/Upsert` | the struct may already carry this attempt's stamps (CreatedAt/UpdatedAt filled, a zero version set to 1) — stamping happens before execution, the database is untouched, and retrying with the same struct is safe |
-| Partial scans | `Raw[T]` into an entity requires the result to cover every mapped column — a partial scan errors (naming the missing columns and pointing at a DTO) rather than letting a later `rio.Update` write zeros to the unscanned ones (mirror image of GORM #6860) |
+| Partial scans | `Raw[T]` into an entity must cover every mapped column; partial projections use a DTO |
 
 ### ClickHouse: the read + append dialect
 
-ClickHouse is the fourth built-in dialect and does not speak the full surface.
-The supported half is OLAP's usage shape (analytical reads + batched appends);
-every rejected API returns an error naming the ClickHouse-native way out. An API
-whose contract cannot hold returns an error rather than a weaker lookalike.
+ClickHouse supports analytical reads and append-oriented writes. APIs whose
+contracts depend on row locks, synchronous mutations, affected-row counts, or
+unique constraints return an error instead of a weaker approximation.
 
-The server floor is **26.x**: that is where INSERT and comparisons natively
-parse rio's offset-carrying time text. Earlier servers reject it — 25.x
-comparisons raise TYPE_MISMATCH through the implicit String→DateTime64 cast no
-session setting reaches. rio requires the version that speaks its encoding
-rather than carry a per-version binding strategy. Version 26 also covers the
-WhereHas ≥ 25.8 correlated-EXISTS floor and fixes 25.x's mirrored parsing of
-pre-1970 fractional seconds.
-
-- **Reads are complete**: the whole query builder, all four relation preloads,
-  `WithCount`, window-function `RelLimit`, `WhereHas`, soft-delete read
-  filtering, `Raw`/`Exec`/compiled queries. Plus one dialect-gated addition,
-  `Query.Final()` — reads through the `FINAL` table modifier, the read-side
-  companion of ReplacingMergeTree deduplication. It exists because the
-  Upsert/Update rejection messages point at ReplacingMergeTree; pointing there
-  without a read-side closure would send users back to Raw.
-- **Writes are Insert/InsertAll (+ `rio.Exec` mutations)**. The
-  UPDATE/DELETE/Upsert families, transactions, `ForUpdate`, and the stmt cache
-  are rejected at the render/execution layer, each on a double ground: server
-  semantics (asynchronous mutations, no unique constraints, no row locks) *and*
-  driver fact (clickhouse-go's `Begin` is a no-op, its `RowsAffected` is
-  unconditionally 0 — the count `ErrNotFound`, `ErrStaleObject`, and the
-  idempotence probe are built on cannot be implemented).
-- **Every argument is interpolated client-side** — the driver's `database/sql`
-  path has no parameter binding. Two dialect rules follow:
-  - times bind as fixed-format text (`2006-01-02 15:04:05.000000+00:00`) — the
-    driver would silently truncate a `time.Time` to whole seconds; the explicit
-    offset overrides column timezones; out-of-range values ClickHouse would
-    silently *clamp* are rejected client-side, zero `time.Time` included.
-  - `[]byte` binds as `String` (the driver renders it as an `Array(UInt8)`
-    literal otherwise — a String column then stores the literal's text form
-    silently).
-- **The lexer is pinned to the server's Lexer.cpp** (heredocs with empty and
-  digit-leading tags where unterminated ones do not lex, `//` comments, the
-  `# ` space rule, backslash escapes in every quote flavor), and `??` emits the
-  driver's `\?` escape so a literal `?` (ClickHouse's ternary operator) survives
-  the driver's own rewriting. The two regions the driver's scanner cannot see —
-  heredocs and `//` comments — are rejected on argument-carrying statements
-  instead of silently corrupted; a bare `\?` passes through as the driver's
-  literal-? escape, consuming nothing.
-- **`ErrDuplicateKey` and `ErrForeignKeyViolated` never fire** — ClickHouse has
-  no constraints to violate. The go-rio/clickhouse module installs no error
-  translator: a documented dialect fact, not a gap.
-- The upstream behaviors this leans on (quote-aware binding — clickhouse-go ≥
-  v2.47.0, enforced in the driver module's go.mod — the second-truncation, the
-  Array rendering, RowsAffected 0, the fake Begin, INSERT-only Prepare) are each
-  pinned by a named integration probe: if upstream changes one, the matching
-  probe fails before any user does.
+- The server floor is **26.x**, which supports rio's offset-carrying time
+  encoding, correlated EXISTS, and correct pre-1970 fractional timestamps.
+- Reads support the full builder, relations, `WithCount`, `RelLimit`,
+  `WhereHas`, soft-delete filtering, Raw, and reusable Query templates.
+  `Query.Final` exposes the ReplacingMergeTree `FINAL` modifier.
+- Writes are limited to `Insert`, `InsertAll`, and explicit `Exec` mutations.
+  UPDATE/DELETE/Upsert families, transactions, `ForUpdate`, and rio's statement
+  cache are rejected.
+- clickhouse-go interpolates arguments client-side. rio therefore binds time as
+  offset-carrying microsecond text, rejects values ClickHouse would clamp, and
+  binds `[]byte` as String instead of `Array(UInt8)`.
+- The dialect lexer follows ClickHouse quoting, heredoc, and comment rules.
+  `??` produces the driver's literal-question-mark escape; regions its binder
+  cannot parse are rejected on argument-carrying statements.
+- Duplicate-key and foreign-key sentinels do not apply because ClickHouse has
+  neither constraint. Integration probes pin the upstream driver behavior rio
+  relies on.
 
 ## Performance
 
-Target, set by the user: **fastest full-featured Go ORM; at minimum, beat GORM
-everywhere by ≥25%** (research baseline, reads: raw/sqlc ~148k ns/op < Bun/ent
-~176k < GORM 223k < sqlx 319k). The gap is not reflection itself; it is missing
-plan caches and string assembly.
+Performance follows a few enforceable rules:
 
-- Per-type plans cached forever; per-grammar SQL caches (see pipeline).
-- Rendering appends to `[]byte` (no fmt in hot paths).
-- Scanning appends a zero value and scans into `&s[len(s)-1]` in place; dest
-  slices are pooled across queries (zero steady-state allocations) and reused
-  per row. Non-NULL pointer cells (`*T` fields) come out of chunked per-column
-  backing arrays (1→4→16→64, then 128-cell chunks) instead of one `reflect.New`
-  per cell: a hundred nullable rows cost five allocations per column, not a
-  hundred; a surviving `*T` keeps at most its chunk alive, never the whole
-  column.
-- **Unsafe fast path**: plans record field offsets; fixed-layout kinds
-  (ints/uints/floats/bool/string/[]byte/time.Time) are written via `unsafe.Add`
-  directly, skipping reflect.Value.Set (Bun/sonic-class technique). Discipline:
-  no uintptr variables; pointer embedding is rejected at plan time (offset-based
-  scanning cannot hop a nil); []byte is always cloned; the per-kind scan test
-  matrix (fast stores and reflect slow paths) runs under -race, which enables
-  checkptr. Entity SELECTs render columns in plan order and verify the
-  result set matches once per query; Raw always matches by column name.
-- Entity CRUD ≤2 extra allocs per call over hand-written database/sql on the
-  same driver — measured Find +1, Insert +0 (RETURNING) / +1 (exec), Update +2,
-  Delete +1 — asserted with testing.AllocsPerRun (TestCRUDAllocBudget). Upsert
-  adds its conflict-shape machinery on top: +5 (PostgreSQL) / +5 (MySQL),
-  asserted at those budgets. ClickHouse rides the same paths (Find +1, Insert
-  +1): its capability checks are early-exit branches, so the three older
-  dialects' budgets did not move when it landed.
-- The pgx-native channel (`postgres.OpenNative`) removes the `driver.Value`
-  boxing layer entirely: decoded values flow from pgtype's typed scanner
-  interfaces into typed sinks on the same cells (`NativeCell`), sharing the
-  stdlib channel's store helpers so the two channels cannot drift. Measured on
-  loopback PostgreSQL (bench/bench_pg_test.go, median of 3): the 100-row read
-  drops from 433 to 124 allocs/op (−71%, B/op −20%), single-row Find 30→18,
-  Insert 19→14, Update 9→6 — while pgx's own `CollectRows` idiom costs ~316
-  allocs on the same shape. Channel-only counts are pinned on a deterministic
-  fake driver (TestNativeAllocBudget: Find 4, 100-row All 11, Insert 5, Update
-  3, Delete 1, Upsert 10), with the invariant that native never allocates more
-  than stdlib for the same call.
-- Benchmarks in-repo against hand-written database/sql (fake driver in
-  perf_test.go isolates rio's own overhead; bench/ adds real SQLite and a GORM
-  comparison, the source of the README numbers).
+- Model plans are immutable and cached by type; stable SQL shapes cache by
+  grammar. Rendering appends to byte buffers instead of formatting strings.
+- Scanners write into the final result slice. Destination arrays are pooled,
+  and nullable pointer values use chunked backing storage instead of one
+  reflection allocation per cell.
+- Fixed-layout fields use offset-based typed stores. Pointer embedding is
+  rejected, byte slices are copied, and race/checkptr tests cover the unsafe
+  boundary. Entity queries verify plan-order columns once per result set; Raw
+  maps by name.
+- The pgx-native channel bypasses `driver.Value` conversion while sharing the
+  same store helpers and semantic tests as `database/sql`.
+- Deterministic fake-driver allocation budgets guard rio's own overhead. Real
+  SQLite, MySQL, PostgreSQL, and native pgx benchmarks measure end-to-end cost
+  under the documented [benchmark methodology](bench/README.md). Benchmark
+  numbers belong in benchmark output, not as permanent design claims.
 
 ## What rio does not have
 
 Each of these is a decision, not a gap:
 
-- **No model hooks/callbacks.** BeforeSave-style hooks let invariants drift
-  (Rails' callback hell, reproduced by GORM). Side effects belong in visible
-  application code; invariants belong in database constraints. Observability
-  gets `QueryHook` (before/after, ctx-deriving, with op/model/duration/args;
-  `WithoutArgs` for redaction), which cannot alter queries. The context
-  `BeforeQuery` returns *is* the execution context rio hands the driver — spans
-  and deadlines set there flow into the statement, and `AfterQuery` receives
-  that same context.
-- **No implicit lazy loading.** The only source of invisible N+1. Unloaded
-  relations fail instead.
-- **No dirty tracking / unit of work / identity map / flush.** Go has no
-  property interception; snapshot diffing doubles memory and hides what a save
-  will write (Hibernate/Doctrine problems; Hibernate 7 promoted StatelessSession
-  to first class). Explicit `Update` with optional column whitelist replaces all
-  of it.
-- **No struct-update-skips-zero-values.** GORM foot-gun (issue #6860).
-  Full-column by default, whitelist when partial, `omitzero` when you want DB
-  defaults. All three are visible at the call site.
+- **No model hooks/callbacks.** Side effects stay in application code and
+  invariants in database constraints. `QueryHook` observes execution but cannot
+  alter SQL; a context returned by `BeforeQuery` reaches the driver and the
+  matching `AfterQuery`.
+- **No implicit lazy loading.** Unloaded relations fail instead of issuing
+  invisible N+1 queries.
+- **No dirty tracking, identity map, or flush.** Explicit `Update`, with an
+  optional column whitelist, makes every write visible.
+- **No struct update that silently skips zero values.** Full-column writes,
+  explicit whitelists, and `omitzero` have distinct contracts.
 - **No default scope of any kind** — soft delete is the single, explicitly
   tagged exception, and even it is a per-model declaration, never a global.
-- **No AutoMigrate.** Half a migration tool is worse than none (schema drift,
-  repeated ALTERs, silent data loss). Use a real versioned migration tool; rio
-  pairs with `github.com/go-rio/migrate` (Go-code migrations, compiled into your
-  binary, no dirty state).
-- **No second-level cache.** Invalidation across nodes/out-of-band writes is an
-  operations trap (Hibernate's lesson; EF Core never shipped one). Caching
-  belongs to the application.
-- **No association auto-writes.** GORM's `Association.Replace` upserting rows
-  behind your back (#3462) is the anti-pattern. Writing relations means visible
-  inserts/deletes; the shipped helpers — Attach, Detach, SyncRelation — are
-  exactly that: explicit join-table writes, never entity upserts.
-- **No client-side evaluation, ever.** If rio can't compile it to SQL, it
-  returns an error (EF Core 3.0's lesson: fail, don't degrade).
+- **No AutoMigrate.** Schema changes require a versioned migration tool.
+- **No second-level cache.** Cross-process invalidation belongs to the
+  application.
+- **No association auto-writes.** Attach, Detach, and SyncRelation perform
+  explicit join-table writes and never upsert related entities.
+- **No client-side evaluation.** Unsupported expressions return an error.
 - **No expression-tree query language.** Go can't introspect closures; any
-  simulation leaks. Type safety lives in generics (result types) and the
-  optional column-constant generator (WriteColumns), never required for full
-  ergonomics (jOOQ's cliff is the counterexample).
+  simulation leaks. Type safety lives in result generics and the optional
+  `WriteColumns` generator.
 - **No `.Select()` column pruning on entity queries.** Partial columns never
-  produce entity values (Doctrine deleted partial objects for a reason, and Go's
-  zero values make it worse); projections go through `Raw[T]` with any target
-  shape.
+  produce entity values; projections use `Raw[T]` with a dedicated target type.
 - **No read/write splitting or multi-DB routing.** Builders are connection-free
   values — construct two `*rio.DB` (primary, replica) and choose one at the call
   site; routing is a caller decision, not ORM state.
@@ -439,39 +291,24 @@ Each of these is a decision, not a gap:
 
 ## Testing & engineering
 
-- Core: fake `database/sql` driver asserting exact SQL sequences, args, and
-  transaction boundaries (the go-rio/migrate pattern) + golden SQL tests per
-  dialect. Inflector goldens freeze before model.go exists.
-- Differential fuzz on the rebind lexer (fast vs naive-correct, four dialect
-  profiles × three bind styles, scalar and slice-expansion arguments), a
-  per-kind scan-path test matrix (fast stores and the reflect slow paths),
-  concurrent query derivation under -race, savepoint failure paths (PG aborted
-  state; MySQL 1213 kills all savepoints — tolerate ROLLBACK TO failing via
-  errors.Join).
-- `integration/` sub-module drives real databases through the core only
-  (modernc SQLite always — including a probe test pinning the driver's time/type
-  behavior; PG/MySQL/ClickHouse gated by env DSNs, provided as CI services or
-  local docker; the ClickHouse leg adds named probes pinning every clickhouse-go
-  behavior the dialect design depends on). Driver modules carry their own small
-  suites.
-- Family conventions: MIT (TreeNewBee), zero-dependency core, go 1.25,
-  functional options, CI matrix (oldstable/stable × linux/macos/windows), never
-  move a published tag.
+- A fake `database/sql` driver asserts SQL, arguments, hooks, and transaction
+  boundaries; golden tests cover each dialect.
+- Differential fuzzing checks placeholder lexers and slice expansion. Race and
+  scan matrices cover immutable query derivation, typed stores, reflection
+  fallbacks, and unsafe pointer rules.
+- The integration module runs SQLite by default and gates PostgreSQL, MySQL,
+  and ClickHouse on DSNs. Driver modules keep adapter-specific suites and probes
+  for upstream behavior on which rio depends.
+- The core remains dependency-free, requires Go 1.27, and uses functional
+  options. Published tags are immutable.
 
 ## Shipped scope
 
-Core + four drivers: full mapping/tags, From/Find/First/Sole/Count/Exists,
-immutable connection-free builder (Where/OrderBy/Limit/Offset/GroupBy/Having/
-Join-for-filtering/ForUpdate), Insert/InsertAll/Update/Delete/Upsert/UpsertAll,
-set-based UpdateAll/DeleteAll with rio.Expr, FirstOrCreate/CreateOrFirst (race
-behavior documented), four relation kinds with nested preloading, per-parent
-preload limits (RelLimit, window functions), WithCount aggregate preloads,
-explicit relation write helpers (Attach/Detach/SyncRelation), optimistic
-locking, soft delete, timestamps, Raw[T]/Exec with strict column-completeness
-checks for Raw-into-entity, MustCompile/Compile, column-constant generation
-(WriteColumns), opt-in stmt cache, transactions with savepoints, QueryHook,
-error translation, composite PKs. ClickHouse speaks the read + append subset of
-all of this plus `Query.Final()` (see the dialect section above).
+The core ships mapping, immutable queries, entity and set writes, upsert and
+batch paths, four relation types, nested preloading and counts, optimistic
+locking, soft delete, timestamps, Raw/Exec, reusable validated Query templates,
+column generation, opt-in statement caching, transactions/savepoints, hooks,
+error translation, and composite keys. ClickHouse implements the read-and-append
+subset plus `Query.Final`.
 
-Not shipped yet: cursor pagination (the README documents the keyset WHERE
-pattern instead of an API), schema-drift lint.
+Not shipped yet: cursor pagination and schema-drift lint.

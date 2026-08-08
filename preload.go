@@ -7,7 +7,6 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
-	"unsafe"
 )
 
 // resolvedRel is the lazily computed wiring of one relation. Resolution
@@ -25,6 +24,65 @@ type resolvedRel struct {
 
 	joinTable       string // ManyToMany only
 	joinFK, joinRef string // join-table columns: owner side, target side
+}
+
+// preloadSpec is one With() request: a dot path plus options for the leaf.
+type preloadSpec struct {
+	path string
+	opts []RelOption
+}
+
+// RelOption customizes how one preloaded relation is fetched.
+type RelOption func(*relQuery)
+
+type relQuery struct {
+	wheres       []cond
+	orders       []string
+	withTrashed  bool
+	limit        int
+	limitSet     bool
+	changesCount bool
+}
+
+// RelWhere restricts the preloaded rows. The condition runs inside the
+// preload's own query, so it can only reference the related table's columns.
+// The expression is included verbatim; never build it from untrusted input —
+// dynamic identifiers belong in column whitelists or rio.WriteColumns constants.
+func RelWhere(expr string, args ...any) RelOption {
+	return func(rq *relQuery) {
+		rq.wheres = append(rq.wheres, cond{expr: expr, args: copyArgs(args)})
+		rq.changesCount = true
+	}
+}
+
+// RelOrder orders the preloaded rows before they are grouped per parent.
+// Ordering does not prevent WithCount from reusing a full preload. The term
+// is included verbatim; never build it from untrusted input — dynamic
+// identifiers belong in column whitelists or rio.WriteColumns constants.
+func RelOrder(expr string) RelOption {
+	return func(rq *relQuery) { rq.orders = append(rq.orders, expr) }
+}
+
+// RelWithTrashed includes soft-deleted rows in the preload when the target
+// model declares a softdelete column.
+func RelWithTrashed() RelOption {
+	return func(rq *relQuery) {
+		rq.withTrashed = true
+		rq.changesCount = true
+	}
+}
+
+// RelLimit caps the preloaded rows per parent (not overall), via
+// ROW_NUMBER() OVER (PARTITION BY the foreign key) — the query stays one
+// round trip and pagination-correct. Order within each parent follows
+// RelOrder, defaulting to the target's primary key for determinism.
+// Requires window functions: PostgreSQL, MySQL 8+, SQLite 3.25+. RelLimit(0)
+// loads no children per parent (like Query.Limit(0)), not all of them.
+func RelLimit(n int) RelOption {
+	return func(rq *relQuery) {
+		rq.limit, rq.limitSet = n, true
+		rq.changesCount = true
+	}
 }
 
 func (r *relField) resolve(owner *plan) (*resolvedRel, error) {
@@ -51,15 +109,26 @@ func resolveRel(owner *plan, r *relField) (*resolvedRel, error) {
 		if len(p.pks) == 1 {
 			return p.pks[0], nil
 		}
-		return nil, fmt.Errorf("%s %s needs exactly one primary key column for convention-based relations (has %d); set ref: explicitly or restructure",
-			side, p.structName, len(p.pks))
+		return nil, fmt.Errorf(
+			"%s %s needs exactly one primary key column for convention-based relations (has %d); "+
+				"set ref: explicitly or restructure",
+			side,
+			p.structName,
+			len(p.pks),
+		)
 	}
 	m2mPK := func(p *plan, side string) (*field, error) {
 		if len(p.pks) == 1 {
 			return p.pks[0], nil
 		}
-		return nil, fmt.Errorf("ManyToMany across composite primary keys is not supported in v1 (%s %s has %d primary key columns); give it a single-column surrogate key, or query the join table by hand",
-			side, p.structName, len(p.pks))
+		return nil, fmt.Errorf(
+			"ManyToMany across composite primary keys is not supported in v1 "+
+				"(%s %s has %d primary key columns); give it a single-column surrogate key, "+
+				"or query the join table by hand",
+			side,
+			p.structName,
+			len(p.pks),
+		)
 	}
 
 	switch r.kind {
@@ -132,7 +201,11 @@ func resolveRel(owner *plan, r *relField) (*resolvedRel, error) {
 		if res.joinFK == res.joinRef {
 			// Self-referential m2m (friends, follows): the convention would
 			// name both join columns identically — physically impossible.
-			return nil, fmt.Errorf("both join-table columns would be %q; a self-referential ManyToMany needs explicit fk: and ref: tags naming the two columns", res.joinFK)
+			return nil, fmt.Errorf(
+				"both join-table columns would be %q; a self-referential ManyToMany "+
+					"needs explicit fk: and ref: tags naming the two columns",
+				res.joinFK,
+			)
 		}
 	}
 	if r.kind != relManyToMany && keyFamily(res.fk.typ) != keyFamily(res.ref.typ) {
@@ -141,8 +214,18 @@ func resolveRel(owner *plan, r *relField) (*resolvedRel, error) {
 		// every row the IN query returns would silently assemble empty.
 		// ManyToMany is exempt: its grouping key is re-scanned from the join
 		// table as the owner key's type, never compared across the two PKs.
-		return nil, fmt.Errorf("cannot match %s.%s (%s) against %s.%s (%s): the key types never compare equal and every preload would silently come back empty; align the Go types (integer kinds are interchangeable; string matches []byte) or point fk:/ref: at compatible columns",
-			owner.structName, res.ref.name, res.ref.typ, target.structName, res.fk.name, res.fk.typ)
+		return nil, fmt.Errorf(
+			"cannot match %s.%s (%s) against %s.%s (%s): the key types never compare equal "+
+				"and every preload would silently come back empty; align the Go types "+
+				"(integer kinds are interchangeable; string matches []byte) "+
+				"or point fk:/ref: at compatible columns",
+			owner.structName,
+			res.ref.name,
+			res.ref.typ,
+			target.structName,
+			res.fk.name,
+			res.fk.typ,
+		)
 	}
 	return res, nil
 }
@@ -170,56 +253,6 @@ func keyFamily(t reflect.Type) any {
 	return t
 }
 
-// preloadSpec is one With() request: a dot path plus options for the leaf.
-type preloadSpec struct {
-	path string
-	opts []RelOption
-}
-
-// RelOption customizes how one preloaded relation is fetched.
-type RelOption func(*relQuery)
-
-type relQuery struct {
-	wheres      []cond
-	orders      []string
-	withTrashed bool
-	limit       int
-	limitSet    bool
-}
-
-// RelWhere restricts the preloaded rows. The condition runs inside the
-// preload's own query, so it can only reference the related table's columns.
-// The expression is included verbatim; never build it from untrusted input —
-// dynamic identifiers belong in column whitelists or rio.WriteColumns constants.
-func RelWhere(expr string, args ...any) RelOption {
-	return func(rq *relQuery) {
-		rq.wheres = append(rq.wheres, cond{expr: expr, args: copyArgs(args)})
-	}
-}
-
-// RelOrder orders the preloaded rows before they are grouped per parent. The
-// term is included verbatim; never build it from untrusted input — dynamic
-// identifiers belong in column whitelists or rio.WriteColumns constants.
-func RelOrder(expr string) RelOption {
-	return func(rq *relQuery) { rq.orders = append(rq.orders, expr) }
-}
-
-// RelWithTrashed includes soft-deleted rows in the preload when the target
-// model declares a softdelete column.
-func RelWithTrashed() RelOption {
-	return func(rq *relQuery) { rq.withTrashed = true }
-}
-
-// RelLimit caps the preloaded rows per parent (not overall), via
-// ROW_NUMBER() OVER (PARTITION BY the foreign key) — the query stays one
-// round trip and pagination-correct. Order within each parent follows
-// RelOrder, defaulting to the target's primary key for determinism.
-// Requires window functions: PostgreSQL, MySQL 8+, SQLite 3.25+. RelLimit(0)
-// loads no children per parent (like Query.Limit(0)), not all of them.
-func RelLimit(n int) RelOption {
-	return func(rq *relQuery) { rq.limit, rq.limitSet = n, true }
-}
-
 // preloadInto loads relation paths into rows of one plan.
 func preloadInto[T any](ctx context.Context, db Queryer, p *plan, rows []T, specs []preloadSpec) error {
 	if len(rows) == 0 || len(specs) == 0 {
@@ -238,8 +271,8 @@ func preloadValues(ctx context.Context, db Queryer, p *plan, rows reflect.Value,
 		opts  []RelOption
 		tails []preloadSpec
 	}
-	groups := make(map[string]*group)
-	var order []string
+	groups := make(map[string]*group, len(specs))
+	order := make([]string, 0, len(specs))
 	for _, s := range specs {
 		head, tail := splitPath(s.path)
 		g, ok := groups[head]
@@ -278,13 +311,25 @@ func splitPath(path string) (head, tail string) {
 	return path, ""
 }
 
-func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, rows reflect.Value, opts []RelOption, tails []preloadSpec) error {
+func loadRelation(
+	ctx context.Context,
+	db Queryer,
+	owner *plan,
+	rel *relField,
+	rows reflect.Value,
+	opts []RelOption,
+	tails []preloadSpec,
+) error {
 	res, err := rel.resolve(owner)
 	if err != nil {
 		return err
 	}
 	if rel.kind == relManyToMany && len(res.target.pks) != 1 {
-		return fmt.Errorf("rio: relation %s.%s: ManyToMany across composite primary keys is not supported", owner.structName, rel.name)
+		return fmt.Errorf(
+			"rio: relation %s.%s: ManyToMany across composite primary keys is not supported",
+			owner.structName,
+			rel.name,
+		)
 	}
 	var rq relQuery
 	for _, opt := range opts {
@@ -296,8 +341,8 @@ func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, r
 	// canonKey groups (it stringifies []byte, which is not a comparable map
 	// key); the child IN (?) binds the *original* value — a stringified
 	// []byte would not match a BLOB/BYTEA column, silently loading nothing.
-	seen := make(map[any]struct{})
-	var keys []any
+	seen := make(map[any]struct{}, rows.Len())
+	keys := make([]any, 0, rows.Len())
 	parentKey := make([]any, rows.Len())
 	for i := 0; i < rows.Len(); i++ {
 		kv := rows.Index(i).FieldByIndex(res.ref.index)
@@ -325,8 +370,8 @@ func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, r
 		relArgs := 0
 		for _, w := range rq.wheres {
 			for _, a := range w.args {
-				if elems, ok := sliceElems(a); ok {
-					relArgs += len(elems) // IN (?) expansion counts per element
+				if elems, ok := sliceValue(a); ok {
+					relArgs += elems.Len() // IN (?) expansion counts per element
 				} else {
 					relArgs++
 				}
@@ -334,8 +379,14 @@ func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, r
 		}
 		limit := db.gram().d.caps().maxBindParams
 		if relArgs >= limit {
-			return fmt.Errorf("rio: preload relation %s.%s uses %d bind parameter(s) in RelWhere, leaving none for parent keys (dialect limit %d)",
-				owner.structName, rel.name, relArgs, limit)
+			return fmt.Errorf(
+				"rio: preload relation %s.%s uses %d bind parameter(s) in RelWhere, "+
+					"leaving none for parent keys (dialect limit %d)",
+				owner.structName,
+				rel.name,
+				relArgs,
+				limit,
+			)
 		}
 		chunk := limit - relArgs
 		for start := 0; start < len(keys); start += chunk {
@@ -366,10 +417,17 @@ func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, r
 		}
 	}
 
-	byKey := make(map[any][]int, buf.Len())
+	type indexSpan struct {
+		start int
+		next  int
+		end   int
+	}
+	byKey := make(map[any]indexSpan, len(keys))
 	if rel.kind == relManyToMany {
-		for i, k := range bufKeys {
-			byKey[k] = append(byKey[k], i)
+		for _, k := range bufKeys {
+			span := byKey[k]
+			span.end++
+			byKey[k] = span
 		}
 	} else {
 		// res.fk is the child-side column for HasMany/HasOne and the
@@ -385,16 +443,51 @@ func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, r
 				kv = kv.Elem()
 			}
 			k := canonKey(kv)
-			byKey[k] = append(byKey[k], i)
+			span := byKey[k]
+			span.end++
+			byKey[k] = span
+		}
+	}
+	grouped := make([]int, buf.Len())
+	offset := 0
+	for k, span := range byKey {
+		count := span.end
+		span.start, span.next, span.end = offset, offset, offset+count
+		byKey[k] = span
+		offset += count
+	}
+	if rel.kind == relManyToMany {
+		for i, k := range bufKeys {
+			span := byKey[k]
+			grouped[span.next] = i
+			span.next++
+			byKey[k] = span
+		}
+	} else {
+		keyField := res.fk
+		for i := 0; i < buf.Len(); i++ {
+			kv := buf.Index(i).FieldByIndex(keyField.index)
+			if kv.Kind() == reflect.Pointer {
+				if kv.IsNil() {
+					continue
+				}
+				kv = kv.Elem()
+			}
+			k := canonKey(kv)
+			span := byKey[k]
+			grouped[span.next] = i
+			span.next++
+			byKey[k] = span
 		}
 	}
 
 	ptrType := reflect.PointerTo(elemType)
 	for i := 0; i < rows.Len(); i++ {
 		container := rows.Index(i).FieldByIndex(rel.index).Addr().Interface().(relContainer)
-		matches := []int(nil)
+		var matches []int
 		if parentKey[i] != nil {
-			matches = byKey[parentKey[i]]
+			span := byKey[parentKey[i]]
+			matches = grouped[span.start:span.end]
 		}
 		switch rel.kind {
 		case relHasMany, relManyToMany:
@@ -411,8 +504,15 @@ func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, r
 			if rel.kind == relHasOne && len(matches) > 1 {
 				// HasOne declares "one" — silently keeping whichever row the
 				// driver returned first would be a nondeterministic answer.
-				return fmt.Errorf("rio: relation %s.%s: HasOne loaded %d rows for one parent; the schema evidently allows several — use HasMany, or make %s.%s unique",
-					owner.structName, rel.name, len(matches), target.structName, res.fk.column)
+				return fmt.Errorf(
+					"rio: relation %s.%s: HasOne loaded %d rows for one parent; "+
+						"the schema evidently allows several — use HasMany, or make %s.%s unique",
+					owner.structName,
+					rel.name,
+					len(matches),
+					target.structName,
+					res.fk.column,
+				)
 			}
 			cp := reflect.New(elemType)
 			cp.Elem().Set(buf.Index(matches[0]))
@@ -424,7 +524,13 @@ func loadRelation(ctx context.Context, db Queryer, owner *plan, rel *relField, r
 
 // renderRelSelect renders the preload query. keyed reports whether an extra
 // join-key column is appended after the entity columns (ManyToMany).
-func renderRelSelect(g *grammar, res *resolvedRel, kind relKind, keys []any, rq *relQuery) (string, []any, bool, error) {
+func renderRelSelect(
+	g *grammar,
+	res *resolvedRel,
+	kind relKind,
+	keys []any,
+	rq *relQuery,
+) (string, []any, bool, error) {
 	if rq.limitSet {
 		return renderRelSelectLimited(g, res, kind, keys, rq)
 	}
@@ -506,7 +612,13 @@ func renderRelSelect(g *grammar, res *resolvedRel, kind relKind, keys []any, rq 
 
 // scanRel appends scanned rows to buf, returning the grown slice and, when
 // keyed, one owner key per appended row.
-func scanRel(rows rows, p *plan, buf reflect.Value, keyed bool, res *resolvedRel) (out reflect.Value, keys []any, err error) {
+func scanRel(
+	rows rows,
+	p *plan,
+	buf reflect.Value,
+	keyed bool,
+	res *resolvedRel,
+) (out reflect.Value, keys []any, err error) {
 	defer mergeClose(rows, &err)
 	extra := 0
 	if keyed {
@@ -572,11 +684,11 @@ func canonKey(v reflect.Value) any {
 		// Sign-normalize so an int64 PK groups with a uint32 FK; values
 		// above MaxInt64 keep their own key space (they can never equal a
 		// signed key anyway).
-		if n := v.Uint(); n <= math.MaxInt64 {
+		n := v.Uint()
+		if n <= math.MaxInt64 {
 			return int64(n)
-		} else {
-			return n
 		}
+		return n
 	case reflect.String:
 		return v.String()
 	case reflect.Slice:
@@ -588,8 +700,6 @@ func canonKey(v reflect.Value) any {
 		return v.Interface()
 	}
 }
-
-var _ = unsafe.Pointer(nil) // unsafe is used via UnsafePointer accessors
 
 // countInto fills WithCount targets: one GROUP BY query per relation, the
 // aggregate sibling of selectin preloading.
@@ -613,6 +723,65 @@ func countInto[T any](ctx context.Context, db Queryer, p *plan, rows []T, counts
 	return nil
 }
 
+func relOptionsChangeCount(opts []RelOption) bool {
+	var rq relQuery
+	for _, opt := range opts {
+		opt(&rq)
+	}
+	return rq.changesCount
+}
+
+func countsNotPreloaded[T any](p *plan, rows []T, specs []preloadSpec, counts []string) ([]string, error) {
+	if len(rows) == 0 || len(specs) == 0 || len(counts) == 0 {
+		return counts, nil
+	}
+	full := make(map[string]bool, len(specs))
+	for _, spec := range specs {
+		head, tail := splitPath(spec.path)
+		if _, seen := full[head]; !seen {
+			full[head] = true
+		}
+		if tail == "" && relOptionsChangeCount(spec.opts) {
+			full[head] = false
+		}
+	}
+
+	reused := make(map[string]bool, len(full))
+	rv := reflect.ValueOf(rows)
+	for _, name := range counts {
+		if reused[name] || !full[name] {
+			continue
+		}
+		rel, ok := p.rels[name]
+		if !ok || (rel.kind != relHasMany && rel.kind != relManyToMany) {
+			continue
+		}
+		target, ok := p.counts[name]
+		if !ok {
+			continue
+		}
+		for i := 0; i < rv.Len(); i++ {
+			container := rv.Index(i).FieldByIndex(rel.index).Addr().Interface().(relContainer)
+			n, loaded := container.loadedLen()
+			if !loaded {
+				return nil, fmt.Errorf("rio: relation %s.%s was not loaded before count reuse", p.structName, name)
+			}
+			rv.Index(i).FieldByIndex(target).SetInt(int64(n))
+		}
+		reused[name] = true
+	}
+	if len(reused) == 0 {
+		return counts, nil
+	}
+	remaining := make([]string, 0, len(counts)-len(reused))
+	for _, name := range counts {
+		if !reused[name] {
+			remaining = append(remaining, name)
+		}
+	}
+	return remaining, nil
+}
+
 func countRelation(ctx context.Context, db Queryer, owner *plan, name string, rows reflect.Value) error {
 	rel, ok := owner.rels[name]
 	if !ok {
@@ -620,10 +789,19 @@ func countRelation(ctx context.Context, db Queryer, owner *plan, name string, ro
 	}
 	target, ok := owner.counts[name]
 	if !ok {
-		return fmt.Errorf("rio: %s has no count target for %q; declare a field tagged `rio:\",countof:%s\"`", owner.structName, name, name)
+		return fmt.Errorf(
+			"rio: %s has no count target for %q; declare a field tagged `rio:\",countof:%s\"`",
+			owner.structName,
+			name,
+			name,
+		)
 	}
 	if rel.kind != relHasMany && rel.kind != relManyToMany {
-		return fmt.Errorf("rio: WithCount(%q): counting a %s relation is meaningless (0 or 1); load it instead", name, rel.kind)
+		return fmt.Errorf(
+			"rio: WithCount(%q): counting a %s relation is meaningless (0 or 1); load it instead",
+			name,
+			rel.kind,
+		)
 	}
 	res, err := rel.resolve(owner)
 	if err != nil {
@@ -631,8 +809,8 @@ func countRelation(ctx context.Context, db Queryer, owner *plan, name string, ro
 	}
 
 	// canonKey groups; the IN (?) binds the original value (see loadRelation).
-	seen := make(map[any]struct{})
-	var keys []any
+	seen := make(map[any]struct{}, rows.Len())
+	keys := make([]any, 0, rows.Len())
 	parentKey := make([]any, rows.Len())
 	for i := 0; i < rows.Len(); i++ {
 		kv := rows.Index(i).FieldByIndex(res.ref.index)
@@ -778,7 +956,13 @@ func scanCounts(rows rows, keyType reflect.Type, byKey map[any]int64) (err error
 // applies per parent: the inner query numbers rows within each foreign-key
 // partition, the outer one keeps the first N and projects exactly the entity
 // columns (plus the join key) — the row number never leaves the subquery.
-func renderRelSelectLimited(g *grammar, res *resolvedRel, kind relKind, keys []any, rq *relQuery) (string, []any, bool, error) {
+func renderRelSelectLimited(
+	g *grammar,
+	res *resolvedRel,
+	kind relKind,
+	keys []any,
+	rq *relQuery,
+) (string, []any, bool, error) {
 	if rq.limit < 0 {
 		return "", nil, false, fmt.Errorf("rio: RelLimit requires a non-negative value, got %d", rq.limit)
 	}

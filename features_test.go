@@ -15,6 +15,17 @@ import (
 	"unsafe"
 )
 
+type observedDoneContext struct {
+	context.Context
+	observed chan<- struct{}
+	once     sync.Once
+}
+
+func (c *observedDoneContext) Done() <-chan struct{} {
+	c.once.Do(func() { c.observed <- struct{}{} })
+	return c.Context.Done()
+}
+
 type Profile struct {
 	ID     int64
 	UserID int64
@@ -73,7 +84,7 @@ func TestFirstOrCreate(t *testing.T) {
 	f.queueRows(userCols)
 	f.queueRows([]string{"id"}, []driver.Value{int64(5)})
 	u := &User{Email: "new@x"}
-	if err := From[User]().Where("email = ?", "new@x").FirstOrCreate(ctx, db, u); err != nil {
+	if err := From[User]().Where("email = ?").FirstOrCreate(ctx, db, u, "new@x"); err != nil {
 		t.Fatalf("FirstOrCreate insert path: %v", err)
 	}
 	if u.ID != 5 {
@@ -83,7 +94,7 @@ func TestFirstOrCreate(t *testing.T) {
 	// Hit → no insert.
 	f.queueRows(userCols, userRow(7, "hit@x"))
 	v := &User{Email: "hit@x"}
-	if err := From[User]().Where("email = ?", "hit@x").FirstOrCreate(ctx, db, v); err != nil {
+	if err := From[User]().Where("email = ?").FirstOrCreate(ctx, db, v, "hit@x"); err != nil {
 		t.Fatalf("FirstOrCreate hit path: %v", err)
 	}
 	if v.ID != 7 {
@@ -110,7 +121,7 @@ func TestCreateOrFirstRaceAndTombstone(t *testing.T) {
 	f.failContaining("INSERT", dup)
 	f.queueRows(userCols, userRow(3, "race@x"))
 	u := &User{Email: "race@x"}
-	if err := From[User]().Where("email = ?", "race@x").CreateOrFirst(ctx, dbT, u); err != nil {
+	if err := From[User]().Where("email = ?").CreateOrFirst(ctx, dbT, u, "race@x"); err != nil {
 		t.Fatalf("CreateOrFirst: %v", err)
 	}
 	if u.ID != 3 {
@@ -120,7 +131,7 @@ func TestCreateOrFirstRaceAndTombstone(t *testing.T) {
 	// Insert conflicts and find misses: a soft-deleted tombstone holds the
 	// key — the error says so.
 	f.queueRows(userCols)
-	err := From[User]().Where("email = ?", "ghost@x").CreateOrFirst(ctx, dbT, &User{Email: "ghost@x"})
+	err := From[User]().Where("email = ?").CreateOrFirst(ctx, dbT, &User{Email: "ghost@x"}, "ghost@x")
 	if !errors.Is(err, ErrDuplicateKey) || !strings.Contains(err.Error(), "soft-deleted") {
 		t.Fatalf("tombstone hint: %v", err)
 	}
@@ -144,15 +155,127 @@ func TestStmtCache(t *testing.T) {
 		t.Fatalf("same shape must prepare once, prepared %d times: %v", len(f.prepped), f.prepped)
 	}
 
-	// Transactions bypass the cache.
+	// Transactions get a cache scoped to the transaction.
 	before := len(f.prepped)
 	_ = db.Tx(ctx, func(tx *Tx) error {
 		f.queueRows(userCols)
-		_, err := From[User]().Where("age > ?", 3).All(ctx, tx)
+		f.queueRows(userCols)
+		q := From[User]().Where("age > ?")
+		if _, err := q.All(ctx, tx, 3); err != nil {
+			return err
+		}
+		_, err := q.All(ctx, tx, 4)
 		return err
 	})
-	if len(f.prepped) != before {
-		t.Fatal("transactions must not prepare through the cache")
+	if got := len(f.prepped) - before; got != 1 {
+		t.Fatalf("same transaction shape must prepare once, prepared %d times", got)
+	}
+}
+
+func TestStmtCacheCoalescesConcurrentPrepare(t *testing.T) {
+	f := newFakeDB()
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	f.prepareStarted, f.prepareBlock = started, release
+	raw := sql.OpenDB(fakeConnector{f})
+	cache := newStmtCache(raw, 4)
+	t.Cleanup(func() {
+		cache.close()
+		_ = raw.Close()
+	})
+
+	const workers = 32
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := make(chan struct{})
+	joined := make(chan struct{}, workers)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			workerCtx := &observedDoneContext{Context: ctx, observed: joined}
+			_, err := cache.get(workerCtx, "SELECT 1")
+			errs <- err
+		}()
+	}
+	close(start)
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	for range workers {
+		select {
+		case <-joined:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	close(release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+	}
+	if got := len(f.prepped); got != 1 {
+		t.Fatalf("same-SQL cold miss prepared %d times, want 1", got)
+	}
+}
+
+func TestStmtCacheCanceledLeaderDoesNotPoisonWaiter(t *testing.T) {
+	f := newFakeDB()
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	f.prepareStarted, f.prepareBlock = started, release
+	raw := sql.OpenDB(fakeConnector{f})
+	cache := newStmtCache(raw, 4)
+	t.Cleanup(func() {
+		cache.close()
+		_ = raw.Close()
+	})
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderErr := make(chan error, 1)
+	go func() {
+		_, err := cache.get(leaderCtx, "SELECT 1")
+		leaderErr <- err
+	}()
+	<-started
+
+	waiterCtx, cancelWaiter := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelWaiter()
+	joined := make(chan struct{}, 1)
+	waiterErr := make(chan error, 1)
+	go func() {
+		observedCtx := &observedDoneContext{Context: waiterCtx, observed: joined}
+		_, err := cache.get(observedCtx, "SELECT 1")
+		waiterErr <- err
+	}()
+	select {
+	case <-joined:
+	case <-waiterCtx.Done():
+		t.Fatal(waiterCtx.Err())
+	}
+	cancelLeader()
+	select {
+	case <-started: // the waiter retried as the new prepare leader
+	case <-waiterCtx.Done():
+		t.Fatal(waiterCtx.Err())
+	}
+	close(release)
+	if err := <-leaderErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader: %v", err)
+	}
+	if err := <-waiterErr; err != nil {
+		t.Fatalf("waiter inherited the leader cancellation: %v", err)
+	}
+	if got := len(f.prepped); got != 1 {
+		t.Fatalf("successful prepares = %d, want 1", got)
 	}
 }
 
@@ -465,7 +588,7 @@ func TestQueryHookSeesEverything(t *testing.T) {
 	hook := &recordingHook{}
 	db := f.openWith(SQLite, WithQueryHook(hook))
 
-	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
+	f.queueExec(1, 1)
 	_ = db.Tx(ctx, func(tx *Tx) error {
 		return Insert(ctx, tx, &Post{Title: "x", UserID: 1})
 	})
@@ -703,8 +826,6 @@ type Sub struct {
 	DeletedAt *time.Time `rio:",softdelete"`
 }
 
-// --- audit regression: opus audit before v0.1.0 ---
-
 type Doc struct {
 	ID     int64
 	Config *Prefs `rio:",json"`
@@ -715,14 +836,12 @@ type Prefs struct {
 	Theme string `json:"theme"`
 }
 
-// Audit: a nil *T json field stores SQL NULL but the scan side had no NULL
-// arm for scanJSON — rio wrote rows it could not read back.
 func TestJSONPointerNullRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
 	db := f.open(SQLite)
 
-	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
+	f.queueExec(1, 1)
 	if err := Insert(ctx, db, &Doc{}); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -731,8 +850,6 @@ func TestJSONPointerNullRoundTrip(t *testing.T) {
 		t.Fatalf("nil json pointer must bind SQL NULL, got %v", ins.args[0])
 	}
 
-	// Audit: *sql.NullString fields panicked in slowScanner (nil receiver);
-	// both fixes verify in one scan.
 	f.queueRows([]string{"id", "config", "note"}, []driver.Value{int64(1), nil, nil})
 	got, err := Find[Doc](ctx, db, 1)
 	if err != nil {
@@ -761,7 +878,6 @@ type Counter struct {
 	Version uint32 `rio:",version"`
 }
 
-// Audit: a zero unsigned version column hit SetInt and panicked.
 func TestUnsignedVersionColumn(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -782,8 +898,6 @@ type Lookup struct {
 	Slug string
 }
 
-// Audit: a model whose every column is a key or maintained rendered
-// "DO UPDATE SET" with no assignments — invalid SQL on all three dialects.
 func TestUpsertEmptyUpdateSetRefused(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -798,7 +912,6 @@ func TestUpsertEmptyUpdateSetRefused(t *testing.T) {
 	}
 }
 
-// Audit: OFFSET without LIMIT is invalid SQL on MySQL and SQLite.
 func TestOffsetWithoutLimit(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
@@ -829,14 +942,16 @@ func TestNegativeLimitOffsetRejected(t *testing.T) {
 	if _, err := From[User]().Offset(-1).All(ctx, db); err == nil || !strings.Contains(err.Error(), "Offset") {
 		t.Fatalf("negative Offset must be refused: %v", err)
 	}
-	if _, err := Pluck[string](ctx, db, From[User]().Limit(-2), "email"); err == nil || !strings.Contains(err.Error(), "Limit") {
+	_, err := From[User]().Limit(-2).Pluck[string](ctx, db, "email")
+	if err == nil || !strings.Contains(err.Error(), "Limit") {
 		t.Fatalf("negative Limit in Pluck must be refused: %v", err)
 	}
 
 	f := newFakeDB()
 	db = f.open(SQLite)
 	f.queueRows(userCols, userRow(1, "a@x"))
-	if _, err := From[User]().With("Posts", RelLimit(-1)).All(ctx, db); err == nil || !strings.Contains(err.Error(), "RelLimit") {
+	_, err = From[User]().With("Posts", RelLimit(-1)).All(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "RelLimit") {
 		t.Fatalf("negative RelLimit must be refused: %v", err)
 	}
 }
@@ -860,7 +975,6 @@ func TestPreloadRelWhereBindLimit(t *testing.T) {
 	}
 }
 
-// Audit: Exists on a query that already had LIMIT/OFFSET doubled the LIMIT.
 func TestExistsIgnoresUserLimit(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -873,8 +987,6 @@ func TestExistsIgnoresUserLimit(t *testing.T) {
 	}
 }
 
-// Audit: DoNothing on PG/SQLite never backfilled a fresh insert's PK while
-// MySQL did; now RETURNING reports generated columns and conflicts no-op.
 func TestUpsertDoNothingBackfill(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1062,14 +1174,18 @@ func TestWhereHasWorksOnSetOps(t *testing.T) {
 	}
 }
 
-func TestCompiledRejectsParamedWhereHas(t *testing.T) {
-	_, err := Compile[User](From[User]().Where("age > ?").WhereHas("Posts", RelWhere("title = ?", "x")))
-	if err == nil || !strings.Contains(err.Error(), "WhereHas") {
-		t.Fatalf("exec-mode compile with paramed WhereHas must be refused: %v", err)
+func TestQueryAllowsDeferredWhereWithInlineWhereHas(t *testing.T) {
+	ctx := context.Background()
+	q := From[User]().Where("age > ?").WhereHas("Posts", RelWhere("title = ?", "x")).Must()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows(userCols)
+	if _, err := q.All(ctx, db, 18); err != nil {
+		t.Fatalf("All: %v", err)
 	}
-	// Fully inline WhereHas compiles.
-	if _, err := Compile[User](From[User]().Where("age > ?", 1).WhereHas("Posts", RelWhere("title = ?", "x"))); err != nil {
-		t.Fatalf("inline compile: %v", err)
+	stmt := f.loggedContaining("EXISTS")[0]
+	if len(stmt.args) != 2 || stmt.args[0] != int64(18) || stmt.args[1] != "x" {
+		t.Fatalf("args = %#v", stmt.args)
 	}
 }
 
@@ -1108,6 +1224,127 @@ func TestWithCount(t *testing.T) {
 	// The count target itself is not a column.
 	if !strings.Contains(f.logged()[0], `SELECT "boards"."id" FROM "boards"`) {
 		t.Fatalf("countof field must not map to a column: %s", f.logged()[0])
+	}
+}
+
+func TestWithCountReusesFullPreload(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)}, []driver.Value{int64(2)})
+	f.queueRows([]string{"id", "board_id"},
+		[]driver.Value{int64(10), int64(1)},
+		[]driver.Value{int64(11), int64(1)},
+		[]driver.Value{int64(12), int64(2)},
+	)
+
+	boards, err := From[Board]().With("Posts").WithCount("Posts").All(context.Background(), db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if boards[0].PostsCount != 2 || boards[1].PostsCount != 1 {
+		t.Fatalf("counts: %+v", boards)
+	}
+	if got := len(f.logged()); got != 2 {
+		t.Fatalf("full preload must satisfy WithCount without another query, logged %d statements", got)
+	}
+}
+
+func TestWithCountReusesOrderedPreload(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)}, []driver.Value{int64(2)})
+	f.queueRows([]string{"id", "board_id"},
+		[]driver.Value{int64(12), int64(2)},
+		[]driver.Value{int64(11), int64(1)},
+		[]driver.Value{int64(10), int64(1)},
+	)
+
+	boards, err := From[Board]().
+		With("Posts", RelOrder("id DESC")).
+		WithCount("Posts").
+		All(context.Background(), db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if boards[0].PostsCount != 2 || boards[1].PostsCount != 1 {
+		t.Fatalf("counts: %+v", boards)
+	}
+	logs := f.logged()
+	if len(logs) != 2 {
+		t.Fatalf("ordered preload must satisfy WithCount without another query, logged %d statements", len(logs))
+	}
+	if !strings.Contains(logs[1], "ORDER BY id DESC") {
+		t.Fatalf("preload order is missing: %s", logs[1])
+	}
+}
+
+func TestRelOptionsChangeCount(t *testing.T) {
+	cases := []struct {
+		name string
+		opts []RelOption
+		want bool
+	}{
+		{name: "none"},
+		{name: "order", opts: []RelOption{RelOrder("id")}},
+		{name: "where", opts: []RelOption{RelWhere("id > ?", 1)}, want: true},
+		{name: "limit", opts: []RelOption{RelLimit(1)}, want: true},
+		{name: "with trashed", opts: []RelOption{RelWithTrashed()}, want: true},
+		{
+			name: "order and where",
+			opts: []RelOption{RelOrder("id"), RelWhere("id > ?", 1)},
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := relOptionsChangeCount(tc.opts); got != tc.want {
+				t.Fatalf("relOptionsChangeCount() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWithCountDoesNotReuseFilteredPreload(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
+	f.queueRows([]string{"id", "board_id"}, []driver.Value{int64(10), int64(1)})
+	f.queueRows([]string{"board_id", "count"}, []driver.Value{int64(1), int64(3)})
+
+	boards, err := From[Board]().
+		With("Posts", RelWhere("id > ?", 9)).
+		WithCount("Posts").
+		All(context.Background(), db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if boards[0].PostsCount != 3 || len(boards[0].Posts.Rows()) != 1 {
+		t.Fatalf("filtered preload and full count: %+v", boards)
+	}
+	if got := len(f.logged()); got != 3 {
+		t.Fatalf("filtered preload must keep the independent count query, logged %d statements", got)
+	}
+}
+
+func TestWithCountDoesNotReuseLimitedPreload(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
+	f.queueRows([]string{"id", "board_id"}, []driver.Value{int64(10), int64(1)})
+	f.queueRows([]string{"board_id", "count"}, []driver.Value{int64(1), int64(3)})
+
+	boards, err := From[Board]().
+		With("Posts", RelLimit(1)).
+		WithCount("Posts").
+		All(context.Background(), db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if boards[0].PostsCount != 3 || len(boards[0].Posts.Rows()) != 1 {
+		t.Fatalf("limited preload and full count: %+v", boards)
+	}
+	if got := len(f.logged()); got != 3 {
+		t.Fatalf("limited preload must keep the independent count query, logged %d statements", got)
 	}
 }
 
@@ -1212,6 +1449,9 @@ func TestAttachDetach(t *testing.T) {
 	if err := Attach(ctx, db, &User{ID: 1}, "Posts", 1); err == nil || !strings.Contains(err.Error(), "ManyToMany") {
 		t.Fatalf("HasMany attach must refuse: %v", err)
 	}
+	if err := SyncRelation(ctx, db, &User{ID: 1}, "Posts", []int64{1}); err == nil || !strings.Contains(err.Error(), "SyncRelation handles ManyToMany") {
+		t.Fatalf("SyncRelation errors must name the operation: %v", err)
+	}
 }
 
 func TestAttachMySQLForm(t *testing.T) {
@@ -1255,13 +1495,35 @@ func TestRowsStreams(t *testing.T) {
 	}
 }
 
+func TestRowsEarlyBreakCloseErrorReachesHook(t *testing.T) {
+	f := newFakeDB()
+	closeErr := errors.New("driver: close after early break")
+	var hookErr error
+	db := f.openWith(Postgres, WithQueryHook(hookFunc(func(_ context.Context, e *QueryEvent) {
+		if e.Op == "select" {
+			hookErr = e.Err
+		}
+	})))
+	f.queueRowsCloseErr(closeErr, userCols, userRow(1, "a@x"), userRow(2, "b@x"))
+
+	for _, err := range From[User]().Rows(context.Background(), db) {
+		if err != nil {
+			t.Fatalf("Rows: %v", err)
+		}
+		break
+	}
+	if !errors.Is(hookErr, closeErr) {
+		t.Fatalf("hook error = %v, want %v", hookErr, closeErr)
+	}
+}
+
 func TestPluck(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
 	db := f.open()
 	f.queueRows([]string{"email"}, []driver.Value{"a@x"}, []driver.Value{"b@x"})
 
-	emails, err := Pluck[string](ctx, db, From[User]().Where("age > ?", 18).OrderBy("id"), "email")
+	emails, err := From[User]().Where("age > ?").OrderBy("id").Pluck[string](ctx, db, "email", 18)
 	if err != nil {
 		t.Fatalf("Pluck: %v", err)
 	}
@@ -1274,12 +1536,12 @@ func TestPluck(t *testing.T) {
 		t.Fatalf("pluck sql:\n got: %s\nwant: %s", got, want)
 	}
 
-	if _, err := Pluck[string](ctx, db, From[User](), "no_such"); err == nil || !strings.Contains(err.Error(), "Raw") {
+	if _, err := From[User]().Pluck[string](ctx, db, "no_such"); err == nil || !strings.Contains(err.Error(), "Raw") {
 		t.Fatalf("unknown column must point at Raw: %v", err)
 	}
 }
 
-// --- v0.3: WriteColumns, SyncRelation, Scope, Compiled.Rows ---
+// --- v0.3: WriteColumns, SyncRelation, Scope, Query.Rows ---
 
 func TestWriteColumns(t *testing.T) {
 	var buf strings.Builder
@@ -1311,9 +1573,6 @@ func TestWriteColumns(t *testing.T) {
 	}
 }
 
-// Sync converges by reading the existing join rows and diffing in memory
-// (AUDIT M14: a NOT IN over the full id set breaks at the bind limit, and
-// chunking a NOT IN would delete every other chunk's ids).
 func TestSyncRelation(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1387,9 +1646,9 @@ func TestScope(t *testing.T) {
 	}
 }
 
-func TestCompiledRows(t *testing.T) {
+func TestQueryDeferredRows(t *testing.T) {
 	ctx := context.Background()
-	q := MustCompile[User](From[User]().Where("age > ?"))
+	q := From[User]().Where("age > ?").Must()
 
 	f := newFakeDB()
 	db := f.open()
@@ -1458,6 +1717,65 @@ func TestRawQueryRowsScalars(t *testing.T) {
 	}
 }
 
+type retainedStreamRow struct {
+	ID   int64
+	Blob []byte
+	Opt  *int64
+	Meta map[string]int `rio:",json"`
+}
+
+func TestRawQueryRowsRetainedValuesDoNotAlias(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueRows([]string{"id", "blob", "opt", "meta"},
+		[]driver.Value{int64(1), []byte("first"), int64(10), []byte(`{"n":1}`)},
+		[]driver.Value{int64(2), []byte("second"), int64(20), []byte(`{"n":2}`)},
+	)
+
+	var got []retainedStreamRow
+	for row, err := range Raw[retainedStreamRow]("SELECT id, blob, opt, meta FROM t").Rows(context.Background(), db) {
+		if err != nil {
+			t.Fatalf("Rows: %v", err)
+		}
+		got = append(got, row)
+	}
+	if len(got) != 2 || string(got[0].Blob) != "first" || *got[0].Opt != 10 || got[0].Meta["n"] != 1 {
+		t.Fatalf("first retained row changed after scanning the second: %+v", got)
+	}
+	if string(got[1].Blob) != "second" || *got[1].Opt != 20 || got[1].Meta["n"] != 2 {
+		t.Fatalf("second row: %+v", got[1])
+	}
+}
+
+func TestRawFirstStopsAfterOneRow(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueRows([]string{"n"}, []driver.Value{int64(1)}, []driver.Value{"not-an-integer"})
+
+	got, err := Raw[int64]("SELECT n FROM t").First(context.Background(), db)
+	if err != nil {
+		t.Fatalf("First: %v", err)
+	}
+	if *got != 1 {
+		t.Fatalf("First = %d, want 1", *got)
+	}
+}
+
+func TestRawSoleStopsAfterSecondRow(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueRows([]string{"n"},
+		[]driver.Value{int64(1)},
+		[]driver.Value{int64(2)},
+		[]driver.Value{"not-an-integer"},
+	)
+
+	_, err := Raw[int64]("SELECT n FROM t").Sole(context.Background(), db)
+	if !errors.Is(err, ErrMultipleRows) {
+		t.Fatalf("Sole: got %v, want ErrMultipleRows", err)
+	}
+}
+
 // Early break must close the driver rows even though the result is undrained.
 func TestRawQueryRowsEarlyBreakCloses(t *testing.T) {
 	ctx := context.Background()
@@ -1482,6 +1800,30 @@ func TestRawQueryRowsEarlyBreakCloses(t *testing.T) {
 	}
 	if f.rowsCloseCount() == before {
 		t.Fatal("early break must close the rows")
+	}
+}
+
+func TestRawQueryRowsEarlyBreakCloseErrorReachesHook(t *testing.T) {
+	f := newFakeDB()
+	closeErr := errors.New("driver: raw close after early break")
+	var hookErr error
+	db := f.openWith(Postgres, WithQueryHook(hookFunc(func(_ context.Context, e *QueryEvent) {
+		if e.Op == "raw" {
+			hookErr = e.Err
+		}
+	})))
+	f.queueRowsCloseErr(closeErr, []string{"id", "name"},
+		[]driver.Value{int64(1), "a"},
+		[]driver.Value{int64(2), "b"})
+
+	for _, err := range Raw[rawStreamRow]("SELECT id, name FROM t").Rows(context.Background(), db) {
+		if err != nil {
+			t.Fatalf("Rows: %v", err)
+		}
+		break
+	}
+	if !errors.Is(hookErr, closeErr) {
+		t.Fatalf("hook error = %v, want %v", hookErr, closeErr)
 	}
 }
 
@@ -1613,21 +1955,35 @@ func TestWriteColumnsRefusesDuplicateFieldNames(t *testing.T) {
 
 // --- post-v0.3.0 self-review hardening ---
 
-// Compiled.All ran preloads but silently dropped WithCount.
-func TestCompiledAllFillsWithCount(t *testing.T) {
+// Reusable Query.All must run WithCount after the main query.
+func TestQueryAllFillsWithCount(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
 	db := f.open()
 	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
 	f.queueRows([]string{"board_id", "count"}, []driver.Value{int64(1), int64(4)})
 
-	counted := MustCompile(From[Board]().WithCount("Posts"))
+	counted := From[Board]().WithCount("Posts").Must()
 	boards, err := counted.All(ctx, db)
 	if err != nil {
 		t.Fatalf("All: %v", err)
 	}
 	if len(boards) != 1 || boards[0].PostsCount != 4 {
-		t.Fatalf("compiled WithCount must fill counts: %+v", boards)
+		t.Fatalf("reusable Query WithCount must fill counts: %+v", boards)
+	}
+}
+
+func TestSoleRejectsMultipleRowsBeforePreloading(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)}, []driver.Value{int64(2)})
+
+	_, err := From[Board]().With("Posts").WithCount("Posts").Sole(context.Background(), db)
+	if !errors.Is(err, ErrMultipleRows) {
+		t.Fatalf("Sole: got %v, want ErrMultipleRows", err)
+	}
+	if got := len(f.logged()); got != 1 {
+		t.Fatalf("multiple-row Sole must not preload or count, logged %d statements", got)
 	}
 }
 
@@ -1637,19 +1993,24 @@ func TestSetOpsRefuseLimitOffsetGroupBy(t *testing.T) {
 	ctx := context.Background()
 	db := newFakeDB().open()
 
-	if _, err := From[User]().Where("age > ?", 1).Limit(10).DeleteAll(ctx, db); err == nil || !strings.Contains(err.Error(), "DeleteAll cannot honor Limit/Offset") {
+	_, err := From[User]().Where("age > ?", 1).Limit(10).DeleteAll(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "DeleteAll cannot honor Limit/Offset") {
 		t.Fatalf("DeleteAll with Limit: %v", err)
 	}
-	if _, err := From[User]().Where("age > ?", 1).Offset(5).UpdateAll(ctx, db, Set{"age": 2}); err == nil || !strings.Contains(err.Error(), "UpdateAll cannot honor Limit/Offset") {
+	_, err = From[User]().Where("age > ?", 1).Offset(5).UpdateAll(ctx, db, Set{"age": 2})
+	if err == nil || !strings.Contains(err.Error(), "UpdateAll cannot honor Limit/Offset") {
 		t.Fatalf("UpdateAll with Offset: %v", err)
 	}
-	if _, err := From[User]().Where("age > ?", 1).Limit(10).ForceDeleteAll(ctx, db); err == nil || !strings.Contains(err.Error(), "ForceDeleteAll cannot honor Limit/Offset") {
+	_, err = From[User]().Where("age > ?", 1).Limit(10).ForceDeleteAll(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "ForceDeleteAll cannot honor Limit/Offset") {
 		t.Fatalf("ForceDeleteAll with Limit: %v", err)
 	}
-	if _, err := From[User]().Where("age > ?", 1).GroupBy("age").UpdateAll(ctx, db, Set{"age": 2}); err == nil || !strings.Contains(err.Error(), "GroupBy") {
+	_, err = From[User]().Where("age > ?", 1).GroupBy("age").UpdateAll(ctx, db, Set{"age": 2})
+	if err == nil || !strings.Contains(err.Error(), "GroupBy") {
 		t.Fatalf("UpdateAll with GroupBy: %v", err)
 	}
-	if _, err := From[User]().Where("age > ?", 1).Limit(3).RestoreAll(ctx, db); err == nil || !strings.Contains(err.Error(), "RestoreAll cannot honor Limit/Offset") {
+	_, err = From[User]().Where("age > ?", 1).Limit(3).RestoreAll(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "RestoreAll cannot honor Limit/Offset") {
 		t.Fatalf("Restore with Limit: %v", err)
 	}
 }
@@ -1764,11 +2125,12 @@ func TestPluckShapeGuards(t *testing.T) {
 	f := newFakeDB()
 	db := f.open()
 
-	if _, err := Pluck[string](ctx, db, From[User]().GroupBy("age"), "email"); err == nil || !strings.Contains(err.Error(), "Raw") {
+	_, err := From[User]().GroupBy("age").Pluck[string](ctx, db, "email")
+	if err == nil || !strings.Contains(err.Error(), "Raw") {
 		t.Fatalf("Pluck with GroupBy: %v", err)
 	}
 	f.queueRows([]string{"email"}, []driver.Value{"a@x"})
-	if _, err := Pluck[string](ctx, db, From[User]().Where("id = ?", 1).ForUpdate(), "email"); err != nil {
+	if _, err := From[User]().Where("id = ?", 1).ForUpdate().Pluck[string](ctx, db, "email"); err != nil {
 		t.Fatalf("Pluck: %v", err)
 	}
 	if got := f.logged()[0]; !strings.HasSuffix(got, " FOR UPDATE") {
@@ -1777,24 +2139,24 @@ func TestPluckShapeGuards(t *testing.T) {
 }
 
 // WhereHas conditions bind inside the EXISTS subquery; a bare ? there can
-// never be an exec-time parameter and must refuse at compile time.
-func TestCompileRejectsBareWhereHasPlaceholder(t *testing.T) {
-	_, err := Compile[User](From[User]().Where("age > ?").WhereHas("Posts", RelWhere("title = ?")))
+// never be an exec-time parameter and must refuse during validation.
+func TestQueryValidateRejectsBareWhereHasPlaceholder(t *testing.T) {
+	err := From[User]().Where("age > ?").WhereHas("Posts", RelWhere("title = ?")).Validate()
 	if err == nil || !strings.Contains(err.Error(), "bind inline") {
-		t.Fatalf("bare ? in WhereHas must refuse at compile: %v", err)
+		t.Fatalf("bare ? in WhereHas must refuse during validation: %v", err)
 	}
-	_, err = Compile[User](From[User]().WhereHas("Posts", RelWhere("title = ?")))
+	err = From[User]().WhereHas("Posts", RelWhere("title = ?")).Validate()
 	if err == nil || !strings.Contains(err.Error(), "bind inline") {
 		t.Fatalf("bare ? in WhereHas (no other conds) must refuse: %v", err)
 	}
 }
 
-func TestCompileValidatesWhereHasAndWithCountPaths(t *testing.T) {
-	if _, err := Compile[User](From[User]().WhereHas("Nope")); err == nil || !strings.Contains(err.Error(), "Nope") {
-		t.Fatalf("unknown WhereHas path must fail at compile: %v", err)
+func TestQueryValidateWhereHasAndWithCountPaths(t *testing.T) {
+	if err := From[User]().WhereHas("Nope").Validate(); err == nil || !strings.Contains(err.Error(), "Nope") {
+		t.Fatalf("unknown WhereHas path must fail validation: %v", err)
 	}
-	if _, err := Compile[Board](From[Board]().WithCount("Nope")); err == nil || !strings.Contains(err.Error(), "Nope") {
-		t.Fatalf("unknown WithCount relation must fail at compile: %v", err)
+	if err := From[Board]().WithCount("Nope").Validate(); err == nil || !strings.Contains(err.Error(), "Nope") {
+		t.Fatalf("unknown WithCount relation must fail validation: %v", err)
 	}
 	type PostWithAuthorCount struct {
 		ID          int64
@@ -1802,8 +2164,9 @@ func TestCompileValidatesWhereHasAndWithCountPaths(t *testing.T) {
 		Author      BelongsTo[User] `rio:",fk:user_id"`
 		AuthorCount int64           `rio:",countof:Author"`
 	}
-	if _, err := Compile[PostWithAuthorCount](From[PostWithAuthorCount]().WithCount("Author")); err == nil || !strings.Contains(err.Error(), "meaningless") {
-		t.Fatalf("non-aggregate WithCount relation must fail at compile: %v", err)
+	err := From[PostWithAuthorCount]().WithCount("Author").Validate()
+	if err == nil || !strings.Contains(err.Error(), "meaningless") {
+		t.Fatalf("non-aggregate WithCount relation must fail validation: %v", err)
 	}
 }
 
@@ -1851,12 +2214,6 @@ func TestNormalizeArgsNullTime(t *testing.T) {
 	}
 }
 
-// --- opus multi-lens audit (post-v0.3.0) regressions ---
-
-// The SQL cache keys on an order-free column bitmap; whitelist rendering and
-// binding must therefore use one canonical order, or the second of two
-// same-columns-different-order Updates would bind values into the wrong
-// columns through the first call's cached statement.
 func TestUpdateWhitelistOrderInsensitive(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1874,8 +2231,7 @@ func TestUpdateWhitelistOrderInsensitive(t *testing.T) {
 	if len(stmts) != 2 || stmts[0].sql != stmts[1].sql {
 		t.Fatalf("both orders must share one canonical statement:\n%s\n%s", stmts[0].sql, stmts[1].sql)
 	}
-	// Canonical order is field order: email before age. The second call's
-	// args must match that layout, not its caller order.
+	// The second call must bind in model order, not caller order.
 	if stmts[1].args[0] != "b@x" || stmts[1].args[1] != int64(40) {
 		t.Fatalf("second call bound values in caller order, not canonical: %v", stmts[1].args)
 	}
@@ -1886,9 +2242,6 @@ type AllDefaults struct {
 	Slot int `rio:",omitzero"`
 }
 
-// A row whose every column is skipped (auto-increment PK + zero omitzero
-// columns) must render the dialect's empty-row form, not "() VALUES ()"
-// which PostgreSQL and SQLite reject.
 func TestInsertAllDefaultsRendersDefaultValues(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1917,14 +2270,12 @@ func TestInsertAllDefaultsRendersDefaultValues(t *testing.T) {
 		t.Fatalf("mysql all-defaults insert: %s", got)
 	}
 
-	// Upsert cannot express DEFAULT VALUES + conflict clause on SQLite;
-	// refuse uniformly instead of working on two dialects out of three.
-	if err := Upsert(ctx, db, &AllDefaults{}, OnConflict("id")); err == nil || !strings.Contains(err.Error(), "use Insert") {
+	err := Upsert(ctx, db, &AllDefaults{}, OnConflict("id"))
+	if err == nil || !strings.Contains(err.Error(), "use Insert") {
 		t.Fatalf("all-defaults upsert must refuse: %v", err)
 	}
 }
 
-// json.RawMessage is one JSONB value, not a list of bytes.
 func TestNamedByteSliceStaysScalar(t *testing.T) {
 	raw := json.RawMessage(`{"k":1}`)
 	sqlText, args, err := rebind(pgLex, bindDollar, "data @> ?", []any{raw})
@@ -1955,8 +2306,6 @@ type NodeOK struct {
 	Related ManyToMany[NodeOK] `rio:",join:node_links,fk:src_id,ref:dst_id"`
 }
 
-// fk:/ref: on ManyToMany name the join table's columns; the convention would
-// otherwise hardcode struct names — and collide on self-referential m2m.
 func TestManyToManyJoinColumnOverrides(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1975,15 +2324,13 @@ func TestManyToManyJoinColumnOverrides(t *testing.T) {
 		}
 	}
 
-	// Self-referential m2m without explicit columns: both join columns would
-	// be "node_id" — refuse with the fix.
+	// Self-relations need distinct explicit join columns.
 	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
 	_, err = From[Node]().With("Related").All(ctx, db)
 	if err == nil || !strings.Contains(err.Error(), "fk: and ref:") {
 		t.Fatalf("self-referential m2m must demand explicit columns: %v", err)
 	}
 
-	// With explicit columns it renders both sides distinctly.
 	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
 	f.queueRows([]string{"id", "src_id"})
 	_, err = From[NodeOK]().With("Related").All(ctx, db)
@@ -1998,11 +2345,6 @@ func TestManyToManyJoinColumnOverrides(t *testing.T) {
 	}
 }
 
-// MySQL counts changed rows, not matched rows: an idempotent Update must not
-// report ErrNotFound. One PK probe resolves the ambiguity; a truly missing
-// row still errors. The probe must be a locking read — a snapshot read under
-// REPEATABLE READ would see a concurrently deleted row and turn the lost
-// write into silent success (AUDIT M5).
 func TestMySQLIdempotentUpdateProbes(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -2025,7 +2367,7 @@ func TestMySQLIdempotentUpdateProbes(t *testing.T) {
 		t.Fatalf("missing row must stay ErrNotFound: %v", err)
 	}
 
-	// PostgreSQL counts matched rows; no probe (and so no FOR UPDATE) happens.
+	// PostgreSQL and SQLite count matched rows and do not need a probe.
 	fp := newFakeDB()
 	dbp := fp.open()
 	fp.queueExec(0, 0)
@@ -2036,7 +2378,6 @@ func TestMySQLIdempotentUpdateProbes(t *testing.T) {
 		t.Fatalf("pg must not probe: %v", fp.logged())
 	}
 
-	// SQLite likewise counts matched rows: zero affected is ErrNotFound.
 	fs := newFakeDB()
 	dbs := fs.open(SQLite)
 	fs.queueExec(0, 0)
@@ -2048,7 +2389,6 @@ func TestMySQLIdempotentUpdateProbes(t *testing.T) {
 	}
 }
 
-// Attach/Detach accept typed id slices spread directly, like SyncRelation.
 func TestAttachDetachTypedIDs(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -2210,14 +2550,19 @@ func TestNullTimeFieldBindsCanonical(t *testing.T) {
 func TestSetOpsRefuseJoinAndOrderBy(t *testing.T) {
 	ctx := context.Background()
 	db := newFakeDB().open()
-	if _, err := From[User]().Join("INNER JOIN orgs ON orgs.id = users.org_id").
-		Where("orgs.active = ?", true).UpdateAll(ctx, db, Set{"age": 5}); err == nil || !strings.Contains(err.Error(), "Join") {
+	_, err := From[User]().
+		Join("INNER JOIN orgs ON orgs.id = users.org_id").
+		Where("orgs.active = ?", true).
+		UpdateAll(ctx, db, Set{"age": 5})
+	if err == nil || !strings.Contains(err.Error(), "Join") {
 		t.Fatalf("UpdateAll+Join must refuse: %v", err)
 	}
-	if _, err := From[User]().Where("age > ?", 1).OrderBy("id DESC").DeleteAll(ctx, db); err == nil || !strings.Contains(err.Error(), "OrderBy") {
+	_, err = From[User]().Where("age > ?", 1).OrderBy("id DESC").DeleteAll(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "OrderBy") {
 		t.Fatalf("DeleteAll+OrderBy must refuse: %v", err)
 	}
-	if _, err := From[User]().Where("age > ?", 1).Join("JOIN x ON 1=1").ForceDeleteAll(ctx, db); err == nil || !strings.Contains(err.Error(), "Join") {
+	_, err = From[User]().Where("age > ?", 1).Join("JOIN x ON 1=1").ForceDeleteAll(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "Join") {
 		t.Fatalf("ForceDeleteAll+Join must refuse: %v", err)
 	}
 }
@@ -2309,7 +2654,8 @@ func TestConcurrentUpdateWhitelistOrder(t *testing.T) {
 func TestCountRefusesHaving(t *testing.T) {
 	ctx := context.Background()
 	db := newFakeDB().open()
-	if _, err := From[User]().Having("count(*) > ?", 5).Count(ctx, db); err == nil || !strings.Contains(err.Error(), "Raw") {
+	_, err := From[User]().Having("count(*) > ?", 5).Count(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "Raw") {
 		t.Fatalf("Count with Having must refuse: %v", err)
 	}
 }
@@ -2842,6 +3188,19 @@ func TestInterfaceFieldRefusedAtPlanTime(t *testing.T) {
 	}
 }
 
+func TestRawInvalidStructDoesNotQuery(t *testing.T) {
+	f := newFakeDB()
+	db := f.open(SQLite)
+
+	_, err := Raw[IfaceScanned]("SELECT id, val FROM iface_scanneds").All(context.Background(), db)
+	if err == nil || !strings.Contains(err.Error(), "interface") {
+		t.Fatalf("Raw invalid struct: %v", err)
+	}
+	if got := len(f.logged()); got != 0 {
+		t.Fatalf("invalid static target must fail before querying, logged %d statement(s)", got)
+	}
+}
+
 // Defense in depth for the same bug: even if a scanScanner codec ever reaches
 // an interface field again, slowScanner must return an error, not panic —
 // panicking under Rows.Scan wedges rows.Close forever.
@@ -2995,11 +3354,6 @@ func TestUnexportedEmbeddedColumnRefusedAtPlanTime(t *testing.T) {
 	}
 }
 
-// --- pre-release audit (fable multi-lens) write-domain regressions ---
-
-// A zero omitzero column is skipped from the INSERT list, so excluded."note"
-// would resolve to the column's DB DEFAULT (NULL without one) and silently
-// reset an existing row's data on conflict — it stays out of the update set.
 type Contact struct {
 	ID    int64
 	Email string
@@ -3029,7 +3383,6 @@ func TestUpsertSkippedOmitzeroColumnStaysOutOfConflictSet(t *testing.T) {
 		t.Fatalf("skipped omitzero column must stay out of the conflict update set: %s", got)
 	}
 
-	// Control: a nonzero omitzero column inserts and updates as usual.
 	f.queueRows(contactCols, []driver.Value{int64(1), "a@x", "n", "kept"})
 	if err := Upsert(ctx, db, &Contact{Email: "a@x", Name: "n", Note: "kept"}, OnConflict("email")); err != nil {
 		t.Fatalf("Upsert nonzero: %v", err)
@@ -3052,16 +3405,19 @@ func TestUpsertDoUpdateNamingSkippedOmitzeroColumnErrors(t *testing.T) {
 		t.Fatalf("nothing may execute, logged %d statements", n)
 	}
 
-	// A nonzero value inserts the column, so the whitelist may reference it.
 	f.queueRows(contactCols, []driver.Value{int64(1), "a@x", "n", "v"})
-	if err := Upsert(ctx, db, &Contact{Email: "a@x", Name: "n", Note: "v"}, OnConflict("email"), DoUpdate("note")); err != nil {
+	err = Upsert(
+		ctx,
+		db,
+		&Contact{Email: "a@x", Name: "n", Note: "v"},
+		OnConflict("email"),
+		DoUpdate("note"),
+	)
+	if err != nil {
 		t.Fatalf("Upsert with nonzero omitzero column: %v", err)
 	}
 }
 
-// UpsertAll pins the documented contrast: the batch path applies no omitzero
-// (one statement, one column list), so zero omitzero columns are inserted and
-// the conflict update writes them — batch zero values are real values.
 func TestUpsertAllBindsZeroOmitzeroColumns(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -3083,9 +3439,6 @@ func TestUpsertAllBindsZeroOmitzeroColumns(t *testing.T) {
 	}
 }
 
-// The conflict branch must refresh updated_at to this call's clock: a loaded
-// entity's stale UpdatedAt must not survive the upsert, matching how entity
-// Update stamps unconditionally.
 func TestUpsertConflictPathRefreshesUpdatedAt(t *testing.T) {
 	ctx := context.Background()
 	stale := testNow.Add(-24 * time.Hour)
@@ -3101,8 +3454,6 @@ func TestUpsertConflictPathRefreshesUpdatedAt(t *testing.T) {
 	if !strings.Contains(stmt.sql, "`updated_at` = _rio_new.`updated_at`") {
 		t.Fatalf("conflict branch must take the new row's stamp: %s", stmt.sql)
 	}
-	// The new-row value the conflict branch references must be this call's
-	// clock, not the stale stamp the loaded struct carried.
 	if bound, ok := stmt.args[7].(time.Time); !ok || !bound.Equal(normalizeTime(testNow)) {
 		t.Fatalf("bound updated_at must be now, got %#v", stmt.args[7])
 	}
@@ -3137,9 +3488,6 @@ func TestUpsertAllConflictPathRefreshesUpdatedAt(t *testing.T) {
 	}
 }
 
-// Audit: normalizeTime truncated only the bound parameter — the struct kept
-// its nanosecond, zoned value while the database stored UTC microseconds, so
-// insert-then-reload never compared Equal for caller-provided times.
 type Meeting struct {
 	ID      int64
 	StartAt time.Time
@@ -3164,15 +3512,13 @@ func TestWritesNormalizeTimeFieldsInPlace(t *testing.T) {
 	if m.StartAt != want {
 		t.Fatalf("StartAt must be normalized in place (UTC, microseconds): %v", m.StartAt)
 	}
-	// Truncation drops sub-microsecond digits by design (the DB never stored
-	// them); everything above stays the same instant.
+	// Normalization may only drop sub-microsecond precision.
 	if d := start.Sub(m.StartAt); d < 0 || d >= time.Microsecond {
 		t.Fatalf("normalization may only drop sub-microsecond precision, moved by %v", d)
 	}
 	if *m.EndAt != normalizeTime(end) {
 		t.Fatalf("pointer time fields normalize in place too: %v", *m.EndAt)
 	}
-	// The zero auto-increment ID is skipped, so start_at binds first.
 	if bound, _ := f.loggedContaining("INSERT")[0].args[0].(time.Time); bound != m.StartAt {
 		t.Fatalf("struct and bound value must agree: %v vs %v", m.StartAt, bound)
 	}
@@ -3193,8 +3539,6 @@ func TestInsertNormalizesCallerProvidedStamps(t *testing.T) {
 	db := f.open(MySQL)
 	f.queueExec(1, 1)
 
-	// stampForInsert honors a nonzero CreatedAt; the honored value must still
-	// come back normalized so a reload compares Equal.
 	at := time.Date(2026, 7, 9, 3, 4, 5, 123456789, time.UTC)
 	u := &User{Email: "t@x", CreatedAt: at}
 	if err := Insert(ctx, db, u); err != nil {
@@ -3214,9 +3558,6 @@ func TestInsertNormalizesCallerProvidedStamps(t *testing.T) {
 	}
 }
 
-// Audit: appendMySQLUpsertAlias ran before the DoNothing branch, so even the
-// no-op assignment — which never references the new row — carried the
-// 8.0.19+ row alias and broke DoNothing on every MariaDB and older MySQL.
 func TestUpsertMySQLDoNothingRendersNoAlias(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -3247,9 +3588,6 @@ func TestUpsertMySQLDoNothingRendersNoAlias(t *testing.T) {
 	}
 }
 
-// AUDIT LB1 regression: First injected LIMIT 1 unconditionally, overriding
-// the caller's Limit — Limit(0).First returned a row All would not return,
-// and disagreed with Compiled.First's ErrNotFound.
 func TestFirstRespectsCallerLimit(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -3281,8 +3619,6 @@ func TestFirstRespectsCallerLimit(t *testing.T) {
 	}
 }
 
-// Sole has the same contract: only inject its LIMIT 2 probe when the caller
-// set no Limit, matching Compiled.Sole running the compiled SQL as-is.
 func TestSoleRespectsCallerLimit(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -3305,15 +3641,14 @@ func TestSoleRespectsCallerLimit(t *testing.T) {
 	}
 }
 
-// RawQuery.Sole: a miss yields ErrNotFound (wrapping sql.ErrNoRows), two rows
-// yield ErrMultipleRows, exactly one returns it.
 func TestRawQuerySoleContract(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
 	db := f.open()
 
 	f.queueRows([]string{"id", "name"})
-	if _, err := Raw[rawStreamRow]("SELECT id, name FROM t WHERE id = ?", 99).Sole(ctx, db); !errors.Is(err, ErrNotFound) || !errors.Is(err, sql.ErrNoRows) {
+	_, err := Raw[rawStreamRow]("SELECT id, name FROM t WHERE id = ?", 99).Sole(ctx, db)
+	if !errors.Is(err, ErrNotFound) || !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("miss must be ErrNotFound wrapping sql.ErrNoRows, got: %v", err)
 	}
 
@@ -3329,12 +3664,11 @@ func TestRawQuerySoleContract(t *testing.T) {
 	}
 }
 
-// Compiled.Sole: same contract, running the compiled SQL as-is.
-func TestCompiledSoleContract(t *testing.T) {
+func TestQueryDeferredSoleContract(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
 	db := f.open()
-	q := MustCompile[User](From[User]().Where("id = ?").Limit(2))
+	q := From[User]().Where("id = ?").Limit(2).Must()
 
 	f.queueRows(userCols)
 	if _, err := q.Sole(ctx, db, 99); !errors.Is(err, ErrNotFound) || !errors.Is(err, sql.ErrNoRows) {
@@ -3353,11 +3687,6 @@ func TestCompiledSoleContract(t *testing.T) {
 	}
 }
 
-// AUDIT LB3 regression: placeholder/argument arity was only checked as a
-// statement-level total, so complementary mismatches across fragments
-// silently shifted bindings — Where("name = ?", "alice", 30).Where("age = ?")
-// bound 30 to the age condition. Each fragment now checks its own arity at
-// build time and the error names the offending fragment.
 func TestCondFragmentArityChecked(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -3374,42 +3703,32 @@ func TestCondFragmentArityChecked(t *testing.T) {
 		t.Fatalf("Having: %v", err)
 	}
 
-	// The set-based writes render through the same WHERE path.
 	_, err = From[User]().Where("age = ?", 1, 2).UpdateAll(ctx, db, Set{"age": 3})
 	if err == nil || !strings.Contains(err.Error(), `Where("age = ?")`) {
 		t.Fatalf("UpdateAll: %v", err)
 	}
 
-	// Compile surfaces the fragment error at the declaration site.
-	if _, err := Compile[User](From[User]().Where("name = ?", "alice", 30)); err == nil ||
+	if err := From[User]().Where("name = ?", "alice", 30).Validate(); err == nil ||
 		!strings.Contains(err.Error(), "1 placeholder(s) but 2 argument(s)") {
-		t.Fatalf("Compile: %v", err)
+		t.Fatalf("Validate: %v", err)
 	}
 
-	// A slice argument counts as one: it expands inside IN (?) at render.
 	f.queueRows(userCols)
 	if _, err := From[User]().Where("id IN (?)", []int64{1, 2, 3}).All(ctx, db); err != nil {
 		t.Fatalf("slice expansion: %v", err)
 	}
 
-	// Correctly paired multi-fragment queries are untouched.
 	f.queueRows(userCols)
 	if _, err := From[User]().Where("age = ?", 30).Where("email = ?", "a@x").All(ctx, db); err != nil {
 		t.Fatalf("paired fragments: %v", err)
 	}
 
-	// Fragments with no arguments stay legal at build time — that is the
-	// compiled exec-parameterized shape; uncompiled they still fail loudly
-	// at the statement-level render check.
 	_, err = From[User]().Where("age = ?").All(ctx, db)
-	if err == nil || !strings.Contains(err.Error(), "has no argument") {
+	if err == nil || !strings.Contains(err.Error(), "deferred argument") {
 		t.Fatalf("zero-arg fragment: %v", err)
 	}
 }
 
-// --- codex audit: confirmed fixes ---
-
-// #5, shape 1: pointer-receiver Scanner + pointer-receiver Valuer.
 type encBoth string
 
 func (e *encBoth) Scan(src any) error {
@@ -3420,15 +3739,12 @@ func (e *encBoth) Scan(src any) error {
 }
 func (e *encBoth) Value() (driver.Value, error) { return "ENC:" + string(*e), nil }
 
-// #5, shape 2: value-receiver Scanner + value-receiver Valuer.
 type encValVal string
 
 func (encValVal) Scan(any) error                 { return nil }
 func (e encValVal) Value() (driver.Value, error) { return "ENC:" + string(e), nil }
 
-// #5, shape 3: value-receiver Scanner + pointer-receiver Valuer — binding the
-// bare value leaves Value() out of the method set database/sql consults, so
-// the pointer must be bound for Value() to run.
+// encValPtr must bind by pointer so database/sql sees Value.
 type encValPtr string
 
 func (encValPtr) Scan(any) error                  { return nil }
@@ -3496,7 +3812,11 @@ func TestNullTimeStaysRioEncoded(t *testing.T) {
 	f := newFakeDB()
 	db := f.open(SQLite)
 	f.queueExec(1, 1)
-	row := nullTimeRow{ID: 1, At: sql.NullTime{Time: testNow, Valid: true}, Gt: sql.Null[time.Time]{V: testNow, Valid: true}}
+	row := nullTimeRow{
+		ID: 1,
+		At: sql.NullTime{Time: testNow, Valid: true},
+		Gt: sql.Null[time.Time]{V: testNow, Valid: true},
+	}
 	if err := Insert(ctx, db, &row); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -3584,10 +3904,12 @@ func TestINExpansionOverBindLimitFailsEarly(t *testing.T) {
 	}
 
 	// Raw and Exec run the same funnel.
-	if _, err := Raw[User]("SELECT * FROM users WHERE id IN (?)", ids).All(ctx, db); err == nil || !strings.Contains(err.Error(), "65535") {
+	_, err = Raw[User]("SELECT * FROM users WHERE id IN (?)", ids).All(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "65535") {
 		t.Fatalf("Raw: %v", err)
 	}
-	if _, err := Exec(ctx, db, "DELETE FROM users WHERE id IN (?)", ids); err == nil || !strings.Contains(err.Error(), "65535") {
+	_, err = Exec(ctx, db, "DELETE FROM users WHERE id IN (?)", ids)
+	if err == nil || !strings.Contains(err.Error(), "65535") {
 		t.Fatalf("Exec: %v", err)
 	}
 

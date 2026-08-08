@@ -24,10 +24,15 @@ type fakeDB struct {
 	prepped     []string
 	closed      []string // SQL of prepared statements whose Close ran
 	rowsClosed  int      // count of driver result-set Close calls
+	columnScan  bool     // serve Go 1.27 driver.RowsColumnScanner rows
+	nextCalls   int      // legacy Rows.Next calls made on columnScan rows
+	scanCalls   int      // direct ScanColumn calls made on columnScan rows
 	// probe, when non-nil, receives the context of every ExecContext and
 	// QueryContext call, so context-propagation tests read the context the
 	// statement executes under at the driver.
-	probe func(context.Context)
+	probe          func(context.Context)
+	prepareStarted chan struct{}
+	prepareBlock   <-chan struct{}
 }
 
 type fakeStmt struct {
@@ -62,6 +67,11 @@ func (f *fakeDB) open(d ...Dialect) *DB {
 
 func (f *fakeDB) openWith(dialect Dialect, opts ...Option) *DB {
 	return New(sql.OpenDB(fakeConnector{f}), dialect, append([]Option{WithClock(fixedClock)}, opts...)...)
+}
+
+func (f *fakeDB) openColumnScanner(dialect Dialect) *DB {
+	f.columnScan = true
+	return f.open(dialect)
 }
 
 // queueRows scripts the next row-returning statement's result.
@@ -214,6 +224,23 @@ func (c *fakeConn) Prepare(query string) (driver.Stmt, error) {
 	return &fakePrepared{f: c.f, sql: query}, nil
 }
 
+func (c *fakeConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	if c.f.prepareStarted != nil {
+		select {
+		case c.f.prepareStarted <- struct{}{}:
+		default:
+		}
+	}
+	if c.f.prepareBlock != nil {
+		select {
+		case <-c.f.prepareBlock:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return c.Prepare(query)
+}
+
 func (c *fakeConn) Close() error { return nil }
 
 func (c *fakeConn) Begin() (driver.Tx, error) {
@@ -228,7 +255,7 @@ func (c *fakeConn) QueryContext(ctx context.Context, query string, args []driver
 	if err := c.f.record(query, values(args)); err != nil {
 		return nil, err
 	}
-	return newFakeRowsIter(c.f, c.f.nextRows()), nil
+	return c.f.rowsIter(c.f.nextRows()), nil
 }
 
 func (c *fakeConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
@@ -284,7 +311,15 @@ func (s *fakePrepared) Query(args []driver.Value) (driver.Rows, error) {
 	if err := s.f.record(s.sql, args); err != nil {
 		return nil, err
 	}
-	return newFakeRowsIter(s.f, s.f.nextRows()), nil
+	return s.f.rowsIter(s.f.nextRows()), nil
+}
+
+func (f *fakeDB) rowsIter(data fakeRows) driver.Rows {
+	rows := newFakeRowsIter(f, data)
+	if f.columnScan {
+		return &fakeRowsColumnIter{fakeRowsIter: rows}
+	}
+	return rows
 }
 
 type fakeRowsIter struct {
@@ -315,7 +350,75 @@ func (r *fakeRowsIter) Next(dest []driver.Value) error {
 	return nil
 }
 
+// fakeRowsColumnIter exercises Go 1.27's driver.RowsColumnScanner path. Its
+// typed setters write directly into rio's colScanner when available; the
+// ConvertAssign fallback matches what a general-purpose driver would do for
+// destinations it does not recognize.
+type fakeRowsColumnIter struct {
+	*fakeRowsIter
+	current []driver.Value
+}
+
+func (r *fakeRowsColumnIter) Next([]driver.Value) error {
+	if r.f != nil {
+		r.f.mu.Lock()
+		r.f.nextCalls++
+		r.f.mu.Unlock()
+	}
+	return fmt.Errorf("fakedb: legacy Next called on RowsColumnScanner")
+}
+
+func (r *fakeRowsColumnIter) NextRow() error {
+	if r.pos >= len(r.data.rows) {
+		return io.EOF
+	}
+	r.current = r.data.rows[r.pos]
+	r.pos++
+	return nil
+}
+
+func (r *fakeRowsColumnIter) ScanColumn(scanCtx driver.ScanContext, index int, dest any) error {
+	if r.f != nil {
+		r.f.mu.Lock()
+		r.f.scanCalls++
+		r.f.mu.Unlock()
+	}
+	v := r.current[index]
+	switch v := v.(type) {
+	case nil:
+		if sink, ok := dest.(interface{ SetNull() error }); ok {
+			return sink.SetNull()
+		}
+	case int64:
+		if sink, ok := dest.(interface{ SetInt64(int64) error }); ok {
+			return sink.SetInt64(v)
+		}
+	case float64:
+		if sink, ok := dest.(interface{ SetFloat64(float64) error }); ok {
+			return sink.SetFloat64(v)
+		}
+	case bool:
+		if sink, ok := dest.(interface{ SetBool(bool) error }); ok {
+			return sink.SetBool(v)
+		}
+	case string:
+		if sink, ok := dest.(interface{ SetString(string) error }); ok {
+			return sink.SetString(v)
+		}
+	case []byte:
+		if sink, ok := dest.(interface{ SetBytes([]byte) error }); ok {
+			return sink.SetBytes(v)
+		}
+	case time.Time:
+		if sink, ok := dest.(interface{ SetTime(time.Time) error }); ok {
+			return sink.SetTime(v)
+		}
+	}
+	return sql.ConvertAssign(scanCtx, dest, v)
+}
+
 var _ driver.Result = fakeExecResult{}
+var _ driver.RowsColumnScanner = (*fakeRowsColumnIter)(nil)
 
 // testNow keeps timestamps deterministic across every fake-driver test.
 var testNow = time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)

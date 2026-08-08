@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,7 +19,7 @@ import (
 
 // The benchmarks compare rio, hand-written database/sql, and GORM on the
 // same in-memory SQLite database (pure Go on both sides), measuring the ORM
-// overhead itself. Run: go test -bench . -benchmem -run=NONE ./...
+// overhead itself. See README.md for methodology and benchstat commands.
 
 type BenchUser struct {
 	ID        int64
@@ -37,6 +38,39 @@ const benchDDL = `CREATE TABLE bench_users (
 	created_at DATETIME NOT NULL,
 	updated_at DATETIME NOT NULL
 )`
+
+const (
+	benchBatchSize       = 100
+	benchMaxInsertedRows = 1000
+	benchResetSQL        = "DELETE FROM bench_users"
+)
+
+func TestBatchInsertSQLShapes(t *testing.T) {
+	sqlite := questionBatchInsertSQL(true)
+	if got := strings.Count(sqlite, "?"); got != benchBatchSize*4 {
+		t.Fatalf("SQLite placeholders = %d, want %d", got, benchBatchSize*4)
+	}
+	if !strings.HasSuffix(sqlite, " RETURNING id") {
+		t.Fatalf("SQLite batch must return generated ids: %s", sqlite)
+	}
+
+	mysql := questionBatchInsertSQL(false)
+	if strings.Contains(mysql, "RETURNING") {
+		t.Fatalf("MySQL batch must not render RETURNING: %s", mysql)
+	}
+
+	postgres := postgresBatchInsertSQL()
+	if got := strings.Count(postgres, "$"); got != benchBatchSize*4 {
+		t.Fatalf("PostgreSQL placeholders = %d, want %d", got, benchBatchSize*4)
+	}
+	if !strings.Contains(postgres, "($397, $398, $399, $400) RETURNING id") {
+		t.Fatalf("PostgreSQL batch tail is malformed: %s", postgres)
+	}
+
+	if got := len(batchInsertArgs(newBenchBatch(), time.Now())); got != benchBatchSize*4 {
+		t.Fatalf("batch args = %d, want %d", got, benchBatchSize*4)
+	}
+}
 
 func benchRawDB(b *testing.B, name string) *sql.DB {
 	b.Helper()
@@ -72,7 +106,7 @@ func benchGorm(b *testing.B, name string) *gorm.DB {
 	if err != nil {
 		b.Fatal(err)
 	}
-	sqlDB, _ := gdb.DB()
+	sqlDB := gormSQLDB(b, gdb)
 	sqlDB.SetMaxOpenConns(1)
 	if _, err := sqlDB.Exec(benchDDL); err != nil {
 		b.Fatal(err)
@@ -86,7 +120,7 @@ func BenchmarkReadOne_Rio(b *testing.B) {
 	seed(b, raw, 100)
 	db := rio.New(raw, rio.SQLite)
 	ctx := context.Background()
-	q := rio.MustCompile[BenchUser](rio.From[BenchUser]().Where("id = ?").Limit(1))
+	q := rio.From[BenchUser]().Where("id = ?").Limit(1).Must()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -129,7 +163,7 @@ func BenchmarkReadOne_Stdlib(b *testing.B) {
 
 func BenchmarkReadOne_Gorm(b *testing.B) {
 	gdb := benchGorm(b, "gorm_read1")
-	sqlDB, _ := gdb.DB()
+	sqlDB := gormSQLDB(b, gdb)
 	seed(b, sqlDB, 100)
 	ctx := context.Background()
 	b.ReportAllocs()
@@ -147,7 +181,7 @@ func BenchmarkReadHundred_Rio(b *testing.B) {
 	seed(b, raw, 100)
 	db := rio.New(raw, rio.SQLite)
 	ctx := context.Background()
-	q := rio.MustCompile[BenchUser](rio.From[BenchUser]().Where("age >= ?"))
+	q := rio.From[BenchUser]().Where("age >= ?").Must()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -161,30 +195,51 @@ func BenchmarkReadHundred_Rio(b *testing.B) {
 func BenchmarkReadHundred_Stdlib(b *testing.B) {
 	raw := benchRawDB(b, "std_read100")
 	seed(b, raw, 100)
+	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rows, err := raw.Query(`SELECT "id", "email", "age", "created_at", "updated_at" FROM bench_users WHERE age >= ?`, 0)
-		if err != nil {
-			b.Fatal(err)
-		}
-		var out []BenchUser
-		for rows.Next() {
-			var u BenchUser
-			if err := rows.Scan(&u.ID, &u.Email, &u.Age, &u.CreatedAt, &u.UpdatedAt); err != nil {
-				b.Fatal(err)
-			}
-			out = append(out, u)
-		}
-		if rows.Close(); len(out) != 100 {
-			b.Fatal(len(out))
+		out, err := readHundredStdlib(
+			ctx,
+			raw,
+			`SELECT "id", "email", "age", "created_at", "updated_at" `+
+				`FROM bench_users WHERE age >= ?`,
+			0,
+		)
+		if err != nil || len(out) != 100 {
+			b.Fatalf("%v %d", err, len(out))
 		}
 	}
 }
 
+// readHundredStdlib intentionally uses the idiomatic Rows.Scan API on every
+// row; its variadic destination boxing is part of the end-to-end baseline.
+func readHundredStdlib(ctx context.Context, db *sql.DB, query string, args ...any) (out []BenchUser, err error) {
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := rows.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	for rows.Next() {
+		var u BenchUser
+		if err := rows.Scan(&u.ID, &u.Email, &u.Age, &u.CreatedAt, &u.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func BenchmarkReadHundred_Gorm(b *testing.B) {
 	gdb := benchGorm(b, "gorm_read100")
-	sqlDB, _ := gdb.DB()
+	sqlDB := gormSQLDB(b, gdb)
 	seed(b, sqlDB, 100)
 	ctx := context.Background()
 	b.ReportAllocs()
@@ -204,6 +259,7 @@ func BenchmarkInsert_Rio(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		resetInsertTable(b, raw, i, 1, benchResetSQL)
 		u := BenchUser{Email: "x@example.com", Age: 30}
 		if err := rio.Insert(ctx, db, &u); err != nil {
 			b.Fatal(err)
@@ -216,6 +272,7 @@ func BenchmarkInsert_Stdlib(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		resetInsertTable(b, raw, i, 1, benchResetSQL)
 		now := time.Now().UTC().Truncate(time.Microsecond).Format("2006-01-02 15:04:05.999999+00:00")
 		res, err := raw.Exec("INSERT INTO bench_users (email, age, created_at, updated_at) VALUES (?, ?, ?, ?)",
 			"x@example.com", 30, now, now)
@@ -230,10 +287,12 @@ func BenchmarkInsert_Stdlib(b *testing.B) {
 
 func BenchmarkInsert_Gorm(b *testing.B) {
 	gdb := benchGorm(b, "gorm_ins")
+	sqlDB := gormSQLDB(b, gdb)
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		resetInsertTable(b, sqlDB, i, 1, benchResetSQL)
 		u := BenchUser{Email: "x@example.com", Age: 30}
 		if err := gdb.WithContext(ctx).Create(&u).Error; err != nil {
 			b.Fatal(err)
@@ -276,7 +335,7 @@ func BenchmarkUpdate_Stdlib(b *testing.B) {
 
 func BenchmarkUpdate_Gorm(b *testing.B) {
 	gdb := benchGorm(b, "gorm_upd")
-	sqlDB, _ := gdb.DB()
+	sqlDB := gormSQLDB(b, gdb)
 	seed(b, sqlDB, 100)
 	ctx := context.Background()
 	var u BenchUser
@@ -300,11 +359,25 @@ func BenchmarkInsertBatch100_Rio(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rows := make([]BenchUser, 100)
-		for j := range rows {
-			rows[j] = BenchUser{Email: "x@example.com", Age: j}
-		}
+		resetInsertTable(b, raw, i, benchBatchSize, benchResetSQL)
+		rows := newBenchBatch()
 		if err := rio.InsertAll(ctx, db, rows); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkInsertBatch100_Stdlib(b *testing.B) {
+	raw := benchRawDB(b, "std_batch")
+	ctx := context.Background()
+	query := questionBatchInsertSQL(true)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resetInsertTable(b, raw, i, benchBatchSize, benchResetSQL)
+		rows := newBenchBatch()
+		now := time.Now().UTC().Truncate(time.Microsecond).Format("2006-01-02 15:04:05.999999+00:00")
+		if err := insertBatchReturningStdlib(ctx, raw, query, batchInsertArgs(rows, now), rows); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -312,16 +385,118 @@ func BenchmarkInsertBatch100_Rio(b *testing.B) {
 
 func BenchmarkInsertBatch100_Gorm(b *testing.B) {
 	gdb := benchGorm(b, "gorm_batch")
+	sqlDB := gormSQLDB(b, gdb)
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rows := make([]BenchUser, 100)
-		for j := range rows {
-			rows[j] = BenchUser{Email: "x@example.com", Age: j}
-		}
+		resetInsertTable(b, sqlDB, i, benchBatchSize, benchResetSQL)
+		rows := newBenchBatch()
 		if err := gdb.WithContext(ctx).Create(&rows).Error; err != nil {
 			b.Fatal(err)
 		}
 	}
+}
+
+func resetInsertTable(b *testing.B, db *sql.DB, iteration, rowsPerIteration int, resetSQL string) {
+	b.Helper()
+	every := max(benchMaxInsertedRows/rowsPerIteration, 1)
+	if iteration == 0 || iteration%every != 0 {
+		return
+	}
+	b.StopTimer()
+	if _, err := db.Exec(resetSQL); err != nil {
+		b.Fatal(err)
+	}
+	b.StartTimer()
+}
+
+func newBenchBatch() []BenchUser {
+	rows := make([]BenchUser, benchBatchSize)
+	for i := range rows {
+		rows[i] = BenchUser{Email: "x@example.com", Age: i}
+	}
+	return rows
+}
+
+func batchInsertArgs(rows []BenchUser, now any) []any {
+	args := make([]any, 0, len(rows)*4)
+	for i := range rows {
+		args = append(args, rows[i].Email, rows[i].Age, now, now)
+	}
+	return args
+}
+
+func questionBatchInsertSQL(returning bool) string {
+	var query strings.Builder
+	query.WriteString("INSERT INTO bench_users (email, age, created_at, updated_at) VALUES ")
+	for i := 0; i < benchBatchSize; i++ {
+		if i > 0 {
+			query.WriteString(", ")
+		}
+		query.WriteString("(?, ?, ?, ?)")
+	}
+	if returning {
+		query.WriteString(" RETURNING id")
+	}
+	return query.String()
+}
+
+func postgresBatchInsertSQL() string {
+	var query strings.Builder
+	query.WriteString("INSERT INTO bench_users (email, age, created_at, updated_at) VALUES ")
+	for i := 0; i < benchBatchSize; i++ {
+		if i > 0 {
+			query.WriteString(", ")
+		}
+		base := i * 4
+		fmt.Fprintf(&query, "($%d, $%d, $%d, $%d)", base+1, base+2, base+3, base+4)
+	}
+	query.WriteString(" RETURNING id")
+	return query.String()
+}
+
+func insertBatchReturningStdlib(
+	ctx context.Context,
+	db *sql.DB,
+	query string,
+	args []any,
+	out []BenchUser,
+) (err error) {
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := rows.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+
+	n := 0
+	for rows.Next() {
+		if n == len(out) {
+			return fmt.Errorf("batch insert returned more than %d ids", len(out))
+		}
+		if err := rows.Scan(&out[n].ID); err != nil {
+			return err
+		}
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if n != len(out) {
+		return fmt.Errorf("batch insert returned %d ids, want %d", n, len(out))
+	}
+	return nil
+}
+
+func gormSQLDB(b *testing.B, db *gorm.DB) *sql.DB {
+	b.Helper()
+	raw, err := db.DB()
+	if err != nil {
+		b.Fatal(err)
+	}
+	return raw
 }

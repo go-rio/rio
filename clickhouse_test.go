@@ -280,7 +280,7 @@ func TestClickHouseFinalGolden(t *testing.T) {
 		t.Fatalf("Exists: %v", err)
 	}
 	f.queueRows([]string{"email"})
-	if _, err := Pluck[string](ctx, db, From[User]().Final(), "email"); err != nil {
+	if _, err := From[User]().Final().Pluck[string](ctx, db, "email"); err != nil {
 		t.Fatalf("Pluck: %v", err)
 	}
 
@@ -315,26 +315,32 @@ func TestClickHouseFinalDoesNotPropagateToPreload(t *testing.T) {
 	}
 }
 
-func TestClickHouseFinalCompiled(t *testing.T) {
+func TestClickHouseFinalReusableQuery(t *testing.T) {
 	ctx := context.Background()
-	q := MustCompile[User](From[User]().Final().Where("age > ?"))
+	q := From[User]().Final().Where("age > ?").Must()
 
 	f := newFakeDB()
 	db := f.open(ClickHouse)
 	f.queueRows(userCols)
 	if _, err := q.All(ctx, db, 1); err != nil {
-		t.Fatalf("compiled All on clickhouse: %v", err)
+		t.Fatalf("reusable Query All on clickhouse: %v", err)
 	}
 	if got := f.logged()[0]; !strings.Contains(got, "FROM `users` FINAL WHERE") {
-		t.Fatalf("compiled exec-mode must render FINAL: %s", got)
+		t.Fatalf("reusable Query must render FINAL: %s", got)
 	}
 
-	// The same compiled value renders per grammar: on postgres it errors at
-	// first use, consistent with "MustCompile passing ≠ execution cannot fail".
+	// The same Query renders per grammar: on postgres it errors at first use,
+	// consistent with "Must passing does not mean execution cannot fail".
 	fpg := newFakeDB()
 	pg := fpg.open(Postgres)
 	_, err := q.All(ctx, pg, 1)
-	requireRejected(t, fpg, err, "rio: Final() requires a dialect with the FINAL table modifier (clickhouse); remove it on postgres")
+	requireRejected(
+		t,
+		fpg,
+		err,
+		"rio: Final() requires a dialect with the FINAL table modifier (clickhouse); "+
+			"remove it on postgres",
+	)
 }
 
 func TestFinalRejectedPerDialect(t *testing.T) {
@@ -351,7 +357,7 @@ func TestFinalRejectedPerDialect(t *testing.T) {
 		db := f.open(tc.d)
 		_, err := From[User]().Final().All(ctx, db)
 		requireRejected(t, f, err, tc.want)
-		_, err = Pluck[string](ctx, db, From[User]().Final(), "email")
+		_, err = From[User]().Final().Pluck[string](ctx, db, "email")
 		requireRejected(t, f, err, tc.want)
 	}
 }
@@ -529,7 +535,8 @@ func TestCapabilityRejectionsAreErrUnsupported(t *testing.T) {
 
 func TestClickHouseForUpdateRejected(t *testing.T) {
 	ctx := context.Background()
-	const want = "rio: ForUpdate is not supported on clickhouse (no row locks); remove it — reads there are lock-free snapshots"
+	const want = "rio: ForUpdate is not supported on clickhouse (no row locks); " +
+		"remove it — reads there are lock-free snapshots"
 
 	f := newFakeDB()
 	db := f.open(ClickHouse)
@@ -538,13 +545,13 @@ func TestClickHouseForUpdateRejected(t *testing.T) {
 
 	f = newFakeDB()
 	db = f.open(ClickHouse)
-	_, err = Pluck[string](ctx, db, From[User]().ForUpdate(), "email")
+	_, err = From[User]().ForUpdate().Pluck[string](ctx, db, "email")
 	requireRejected(t, f, err, want)
 
-	// Exec-mode compiled queries reject at first render for this grammar.
+	// Reusable queries reject at first render for this grammar.
 	f = newFakeDB()
 	db = f.open(ClickHouse)
-	q := MustCompile[User](From[User]().ForUpdate().Where("age > ?"))
+	q := From[User]().ForUpdate().Where("age > ?").Must()
 	_, err = q.All(ctx, db, 1)
 	requireRejected(t, f, err, want)
 }
@@ -566,7 +573,9 @@ func TestClickHouseAllDefaultsInsertRejected(t *testing.T) {
 func TestClickHouseStmtCachePanics(t *testing.T) {
 	defer func() {
 		r := recover()
-		want := "rio: WithStmtCache is not supported on clickhouse (clickhouse-go implements Prepare only for INSERT batching; a prepared SELECT fails on first use)"
+		want := "rio: WithStmtCache is not supported on clickhouse " +
+			"(clickhouse-go implements Prepare only for INSERT batching; " +
+			"a prepared SELECT fails on first use)"
 		if r != want {
 			t.Fatalf("panic:\n got: %v\nwant: %s", r, want)
 		}
@@ -637,7 +646,9 @@ func TestClickHouseDriverBlindRegionsRejected(t *testing.T) {
 	db := f.open(ClickHouse)
 	_, err := Raw[int64]("SELECT $$a?b$$, ?", 1).All(ctx, db)
 	requireRejected(t, f, err,
-		"rio: a ? inside a $...$ heredoc (byte 10) would be rewritten by clickhouse-go's client-side binder; use '...' string syntax or bind the value as an argument")
+		"rio: a ? inside a $...$ heredoc (byte 10) would be rewritten by "+
+			"clickhouse-go's client-side binder; use '...' string syntax "+
+			"or bind the value as an argument")
 
 	f = newFakeDB()
 	db = f.open(ClickHouse)
@@ -650,7 +661,9 @@ func TestClickHouseDriverBlindRegionsRejected(t *testing.T) {
 	db = f.open(ClickHouse)
 	_, err = Exec(ctx, db, "INSERT INTO t VALUES ($$?$$, ?)", 1)
 	requireRejected(t, f, err,
-		"rio: a ? inside a $...$ heredoc (byte 24) would be rewritten by clickhouse-go's client-side binder; use '...' string syntax or bind the value as an argument")
+		"rio: a ? inside a $...$ heredoc (byte 24) would be rewritten by "+
+			"clickhouse-go's client-side binder; use '...' string syntax "+
+			"or bind the value as an argument")
 }
 
 // Argument-free statements pass those same regions untouched: the driver
@@ -784,22 +797,28 @@ func TestClickHouseTimeRangeChecked(t *testing.T) {
 	// Out of range: entity funnel (Insert) rejects before sending.
 	f, err := insertAt(time.Date(1899, 12, 31, 23, 59, 59, 999999999, time.UTC))
 	requireRejected(t, f, err,
-		"rio: time 1899-12-31T23:59:59.999999Z is outside ClickHouse's DateTime64 range [1900-01-01, 2299-12-31] and would be silently clamped")
+		"rio: time 1899-12-31T23:59:59.999999Z is outside ClickHouse's DateTime64 range "+
+			"[1900-01-01, 2299-12-31] and would be silently clamped")
 	f, err = insertAt(time.Date(2300, 1, 1, 0, 0, 0, 0, time.UTC))
 	requireRejected(t, f, err,
-		"rio: time 2300-01-01T00:00:00Z is outside ClickHouse's DateTime64 range [1900-01-01, 2299-12-31] and would be silently clamped")
+		"rio: time 2300-01-01T00:00:00Z is outside ClickHouse's DateTime64 range "+
+			"[1900-01-01, 2299-12-31] and would be silently clamped")
 
 	// The zero time gets the dedicated message — the most common accident.
 	f, err = insertAt(time.Time{})
 	requireRejected(t, f, err,
-		`rio: a zero time.Time is outside ClickHouse's DateTime64 range [1900-01-01, 2299-12-31] and would be silently clamped; use a *time.Time (Nullable column) for "no value"`)
+		"rio: a zero time.Time is outside ClickHouse's DateTime64 range "+
+			"[1900-01-01, 2299-12-31] and would be silently clamped; "+
+			`use a *time.Time (Nullable column) for "no value"`)
 
 	// User-argument funnel (normalizeArgs) applies the same rule.
 	fq := newFakeDB()
 	db := fq.open(ClickHouse)
 	_, err = From[User]().Where("created_at > ?", time.Time{}).All(ctx, db)
 	requireRejected(t, fq, err,
-		`rio: a zero time.Time is outside ClickHouse's DateTime64 range [1900-01-01, 2299-12-31] and would be silently clamped; use a *time.Time (Nullable column) for "no value"`)
+		"rio: a zero time.Time is outside ClickHouse's DateTime64 range "+
+			"[1900-01-01, 2299-12-31] and would be silently clamped; "+
+			`use a *time.Time (Nullable column) for "no value"`)
 
 	// The other dialects are untouched by the range rule.
 	fpg := newFakeDB()
@@ -917,7 +936,11 @@ func TestClickHouseRawAndExecFullPass(t *testing.T) {
 	db := f.open(ClickHouse)
 
 	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
-	if _, err := Raw[int64]("SELECT id FROM t FINAL SAMPLE 0.1 WHERE x = ? SETTINGS max_threads = 2", 1).All(ctx, db); err != nil {
+	_, err := Raw[int64](
+		"SELECT id FROM t FINAL SAMPLE 0.1 WHERE x = ? SETTINGS max_threads = 2",
+		1,
+	).All(ctx, db)
+	if err != nil {
 		t.Fatalf("raw clickhouse SQL: %v", err)
 	}
 	if _, err := Exec(ctx, db, "ALTER TABLE t UPDATE x = ? WHERE id = ?", 1, 2); err != nil {

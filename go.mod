@@ -1,3 +1,3 @@
 module github.com/go-rio/rio
 
-go 1.25.0
+go 1.27rc2

@@ -8,10 +8,7 @@ import (
 	"unsafe"
 )
 
-// lexProfile is the per-dialect lexical grammar the rebinder needs to walk a
-// statement without misreading string, identifier, and comment contents.
-// Getting any of these wrong silently corrupts user SQL, so the profiles are
-// pinned by differential fuzzing against a naive reference.
+// lexProfile describes syntax regions in which ? is not a placeholder.
 type lexProfile struct {
 	backslashEscapes    bool // MySQL/ClickHouse: '\'' does not close the string
 	dollarQuote         bool // PostgreSQL: $$...$$ and $tag$...$tag$
@@ -23,22 +20,13 @@ type lexProfile struct {
 	eStrings            bool // PostgreSQL: E'...' escape strings
 	looseDashComment    bool // PG/SQLite/ClickHouse: -- always comments; MySQL needs whitespace after
 
-	// ClickHouse-only rules, pinned against the server's Lexer.cpp: one
-	// quotedString routine serves ', " and ` (backslash and doubled-quote
-	// escapes work in all three); // opens a line comment; # comments only
-	// before a space or '!' (#x is a lexer error); $tag$...$tag$ heredocs
-	// allow empty and digit-leading tags, and an unterminated heredoc is
-	// not a heredoc at all.
+	// ClickHouse lexer rules differ from PostgreSQL heredocs and comments.
 	quotedIdentBackslash bool // backslashes escape inside "..." and `...` identifiers
 	slashSlashComment    bool // // line comment
 	hashSpaceComment     bool // # comments only when followed by ' ' or '!'
 	heredoc              bool // $tag$...$tag$ string literals
 
-	// backslashQuestion is clickhouse-go's, not the server's: the client-side
-	// binder reads a bare \? as an escaped literal ? and consumes no argument
-	// (rio's ?? escape renders it, but hand-written SQL may carry it too).
-	// Counting that ? as a placeholder would shift every later argument one
-	// position — the driver's accounting is the only correct one to mirror.
+	// clickhouse-go consumes \? as a literal question mark.
 	backslashQuestion bool
 }
 
@@ -59,19 +47,12 @@ type bindStyle int
 const (
 	bindQuestion bindStyle = iota // ? as-is (MySQL, SQLite)
 	bindDollar                    // $1, $2, ... (PostgreSQL)
-	// bindQuestionEsc is bindQuestion for a driver that rewrites ? itself,
-	// client-side (ClickHouse): ?? emits \? — the driver's escape for a
-	// literal ?, unescaped again before the server sees it (its ternary
-	// operator needs one) — and a ? inside a region that driver's scanner
-	// cannot see (heredocs, // comments) is rejected on argument-carrying
-	// statements rather than silently corrupted.
+	// bindQuestionEsc mirrors ClickHouse's client-side placeholder scanner.
 	bindQuestionEsc
 )
 
-// rebind rewrites unified ? placeholders into the dialect's form and expands
-// slice arguments inside IN (?). It is the single component that rewrites
-// user SQL, and it never touches placeholder-lookalikes inside strings,
-// quoted identifiers, or comments.
+// rebind rewrites ? placeholders and expands slice arguments without touching
+// strings, quoted identifiers, or comments.
 //
 // Rules:
 //   - ?? collapses to a literal ? on every dialect (PostgreSQL JSONB
@@ -84,10 +65,7 @@ const (
 //   - Placeholder/argument count mismatches error with both counts and the
 //     byte offset of the offending placeholder.
 //
-// The output is built copy-on-write: while nothing rewrites — question style,
-// scalar arguments, no ?? escape, the MySQL/SQLite common case — the scan
-// only advances positions and the input string itself is returned, so the
-// unchanged path allocates nothing.
+// The unchanged path returns the input and arguments without allocation.
 func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []any, error) {
 	var out []byte // nil until the first rewrite; query[:copied] already appended
 	copied := 0
@@ -96,8 +74,7 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 	argIdx := 0
 	n := 0 // emitted placeholder count
 
-	// rewriteTo starts (or continues) the rewrite buffer, with everything up
-	// to byte i passing through verbatim.
+	// rewriteTo copies the unchanged prefix before a rewrite.
 	rewriteTo := func(i int) {
 		if out == nil {
 			out = make([]byte, 0, len(query)+8)
@@ -117,7 +94,7 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 			outArgs = append(outArgs, arg)
 		}
 	}
-	// switch to the expanded-args regime, copying what was consumed so far
+	// Copy consumed arguments only when expansion begins.
 	startExpanding := func() {
 		if !expanded {
 			expanded = true
@@ -128,15 +105,13 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 	i := 0
 	for i < len(query) {
 		c := query[i]
-		// Quoted and commented regions pass through untouched; they are only
-		// opaque to the ? scan, so skipping is a position move, not a copy.
+		// Quoted and commented regions are opaque to the placeholder scan.
 		switch c {
 		case '\'':
 			i = skipQuoted(query, i, '\'', p.backslashEscapes)
 			continue
 		case '"':
-			// Identifier on PG/SQLite/ClickHouse, string on MySQL; both pass
-			// whole. ClickHouse identifiers honor backslash escapes.
+			// Identifier or string, depending on dialect.
 			i = skipQuoted(query, i, '"', (p.backslashEscapes && p.doubleQuoteIsString) || p.quotedIdentBackslash)
 			continue
 		case '`':
@@ -197,9 +172,7 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 			}
 		case '\\':
 			if p.backslashQuestion && i+1 < len(query) && query[i+1] == '?' {
-				// Already the driver's literal-? escape: pass it through and
-				// bind nothing. The driver looks exactly one byte back, so a
-				// preceding backslash cannot re-arm this one.
+				// Preserve clickhouse-go's literal-question escape.
 				i += 2
 				continue
 			}
@@ -215,11 +188,13 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 				i += 2
 				continue
 			}
-			// A digit straight after ? would glue onto the emitted $N — "$1"
-			// followed by "0" reads back as $10 — and ?N numbered placeholders
-			// are not part of the unified syntax, so reject rather than corrupt.
+			// A following digit would change a rebound $N placeholder.
 			if i+1 < len(query) && '0' <= query[i+1] && query[i+1] <= '9' {
-				return "", nil, fmt.Errorf("rio: placeholder at byte %d is directly followed by a digit; numbered placeholders are not supported", i)
+				return "", nil, fmt.Errorf(
+					"rio: placeholder at byte %d is directly followed by a digit; "+
+						"numbered placeholders are not supported",
+					i,
+				)
 			}
 			if argIdx >= len(args) {
 				return "", nil, fmt.Errorf("rio: placeholder %d (byte %d) has no argument: %d placeholder(s), %d argument(s)",
@@ -227,20 +202,19 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 			}
 			arg := args[argIdx]
 			argIdx++
-			if elems, ok := sliceElems(arg); ok {
-				if len(elems) == 0 {
+			if elems, ok := sliceValue(arg); ok {
+				if elems.Len() == 0 {
 					return "", nil, fmt.Errorf("rio: empty slice for IN placeholder %d (byte %d)", argIdx, i)
 				}
-				// Expansion is flat — "IN (?)" keeps its own parentheses and
-				// becomes "IN ($1, $2)", the sqlx convention.
+				// Expansion is flat; callers provide the surrounding parentheses.
 				startExpanding()
 				rewriteTo(i)
 				copied = i + 1 // the single ? is replaced by the expansion
-				for j, e := range elems {
+				for j := 0; j < elems.Len(); j++ {
 					if j > 0 {
 						out = append(out, ", "...)
 					}
-					emit(e)
+					emit(elems.Index(j).Interface())
 				}
 				i++
 				continue
@@ -271,6 +245,148 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 	}
 	out = append(out, query[copied:]...)
 	return byteString(out), outArgs, nil
+}
+
+// rebindTemplate rewrites placeholder syntax without concrete argument
+// values. Entity CRUD caches use it for fixed statement shapes.
+func rebindTemplate(p lexProfile, style bindStyle, query string) (string, int, error) {
+	var out []byte
+	copied := 0
+	n := 0
+	var blindErr error
+
+	rewriteTo := func(i int) {
+		if out == nil {
+			out = make([]byte, 0, len(query)+8)
+		}
+		out = append(out, query[copied:i]...)
+		copied = i
+	}
+	recordBlind := func(start, end int, region, fix string) {
+		if blindErr != nil || style != bindQuestionEsc {
+			return
+		}
+		blindErr = checkDriverBlindRegion(style, query, start, end, 1, region, fix)
+	}
+	emit := func(i int) error {
+		n++
+		if blindErr != nil {
+			return blindErr
+		}
+		if style == bindDollar {
+			rewriteTo(i)
+			out = append(out, '$')
+			out = strconv.AppendInt(out, int64(n), 10)
+			copied = i + 1
+		}
+		return nil
+	}
+
+	for i := 0; i < len(query); {
+		switch query[i] {
+		case '\'':
+			i = skipQuoted(query, i, '\'', p.backslashEscapes)
+		case '"':
+			i = skipQuoted(query, i, '"', (p.backslashEscapes && p.doubleQuoteIsString) || p.quotedIdentBackslash)
+		case '`':
+			if p.backtickIdent {
+				i = skipQuoted(query, i, '`', p.quotedIdentBackslash)
+			} else {
+				i++
+			}
+		case '[':
+			if p.bracketIdent {
+				i = skipUntilByte(query, i+1, ']')
+			} else {
+				i++
+			}
+		case '$':
+			if p.dollarQuote && !identByteBefore(query, i) {
+				if end, ok := skipDollarQuoted(query, i); ok {
+					i = end
+					continue
+				}
+			}
+			if p.heredoc && !identByteBefore(query, i) {
+				if end, ok := skipHeredoc(query, i); ok {
+					recordBlind(i, end, "a $...$ heredoc", "use '...' string syntax or bind the value as an argument")
+					i = end
+					continue
+				}
+			}
+			i++
+		case '-':
+			if i+1 < len(query) && query[i+1] == '-' && (p.looseDashComment || dashCommentOK(query, i)) {
+				i = skipLineComment(query, i)
+			} else {
+				i++
+			}
+		case '#':
+			if p.hashComment || hashSpaceCommentAt(p, query, i) {
+				i = skipLineComment(query, i)
+			} else {
+				i++
+			}
+		case '/':
+			if p.slashSlashComment && i+1 < len(query) && query[i+1] == '/' {
+				end := skipLineComment(query, i)
+				recordBlind(i, end, "a // comment", "use a -- comment")
+				i = end
+			} else if i+1 < len(query) && query[i+1] == '*' {
+				i = skipBlockComment(query, i, p.nestedBlockComments)
+			} else {
+				i++
+			}
+		case 'E', 'e':
+			if p.eStrings && i+1 < len(query) && query[i+1] == '\'' && !identByteBefore(query, i) {
+				i = skipQuoted(query, i+1, '\'', true)
+			} else {
+				i++
+			}
+		case '\\':
+			if p.backslashQuestion && i+1 < len(query) && query[i+1] == '?' {
+				i += 2
+			} else {
+				i++
+			}
+		case '?':
+			if i+1 < len(query) && query[i+1] == '?' {
+				if style == bindQuestionEsc {
+					rewriteTo(i)
+					out = append(out, '\\', '?')
+				} else {
+					rewriteTo(i + 1)
+				}
+				copied = i + 2
+				i += 2
+				continue
+			}
+			if i+1 < len(query) && '0' <= query[i+1] && query[i+1] <= '9' {
+				if blindErr != nil {
+					return "", 0, blindErr
+				}
+				return "", 0, fmt.Errorf(
+					"rio: placeholder at byte %d is directly followed by a digit; "+
+						"numbered placeholders are not supported",
+					i,
+				)
+			}
+			if err := emit(i); err != nil {
+				return "", 0, err
+			}
+			i++
+		default:
+			i++
+		}
+	}
+	if n > 0 && blindErr != nil {
+		return "", 0, blindErr
+	}
+	if out == nil {
+		return query, n, nil
+	}
+	out = append(out, query[copied:]...)
+	return byteString(out), n, nil
 }
 
 // byteString reinterprets b as a string without copying. The caller must
@@ -401,7 +517,12 @@ func checkDriverBlindRegion(style bindStyle, query string, start, end, argc int,
 	}
 	for j := start; j < end; j++ {
 		if query[j] == '?' {
-			return fmt.Errorf("rio: a ? inside %s (byte %d) would be rewritten by clickhouse-go's client-side binder; %s", region, j, fix)
+			return fmt.Errorf(
+				"rio: a ? inside %s (byte %d) would be rewritten by clickhouse-go's client-side binder; %s",
+				region,
+				j,
+				fix,
+			)
 		}
 	}
 	return nil
@@ -449,34 +570,26 @@ func skipBlockComment(s string, start int, nested bool) int {
 
 var valuerType = reflect.TypeFor[driver.Valuer]()
 
-// sliceElems reports whether arg expands inside IN (?). []byte is a scalar
+// sliceValue reports whether arg expands inside IN (?). []byte is a scalar
 // (BLOB), and driver.Valuer implementations bind as themselves.
-func sliceElems(arg any) ([]any, bool) {
+func sliceValue(arg any) (reflect.Value, bool) {
 	if arg == nil {
-		return nil, false
-	}
-	if _, isBytes := arg.([]byte); isBytes {
-		return nil, false
+		return reflect.Value{}, false
 	}
 	t := reflect.TypeOf(arg)
 	if t.Kind() != reflect.Slice && t.Kind() != reflect.Array {
-		return nil, false
+		return reflect.Value{}, false
 	}
 	if t.Elem().Kind() == reflect.Uint8 {
 		// Byte payloads are one value, not a list — named byte slices
 		// (json.RawMessage) and [16]byte UUIDs alike. Expanding them would
 		// splice a byte-per-placeholder list into "= ?".
-		return nil, false
+		return reflect.Value{}, false
 	}
 	if t.Implements(valuerType) {
-		return nil, false
+		return reflect.Value{}, false
 	}
-	v := reflect.ValueOf(arg)
-	elems := make([]any, v.Len())
-	for i := range elems {
-		elems[i] = v.Index(i).Interface()
-	}
-	return elems, true
+	return reflect.ValueOf(arg), true
 }
 
 // countPlaceholders is used only for error messages.

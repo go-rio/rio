@@ -81,69 +81,6 @@ type relField struct {
 	rerr     error
 }
 
-var plans sync.Map // reflect.Type → *plan | error
-
-func planOf[T any]() (*plan, error) {
-	return planFor(reflect.TypeFor[T]())
-}
-
-func planFor(t reflect.Type) (*plan, error) {
-	if v, ok := plans.Load(t); ok {
-		if p, ok := v.(*plan); ok {
-			return p, nil
-		}
-		return nil, v.(error)
-	}
-	p, err := buildPlan(t)
-	if err != nil {
-		plans.LoadOrStore(t, err)
-		return nil, err
-	}
-	actual, _ := plans.LoadOrStore(t, p)
-	if p, ok := actual.(*plan); ok {
-		return p, nil
-	}
-	return nil, actual.(error)
-}
-
-func buildPlan(t reflect.Type) (*plan, error) {
-	if t.Kind() != reflect.Struct {
-		return nil, fmt.Errorf("rio: model must be a struct, got %s", t)
-	}
-	p := &plan{
-		typ:          t,
-		structName:   t.Name(),
-		defaultTable: tableName(t.Name()),
-		byColumn:     make(map[string]*field),
-		rels:         make(map[string]*relField),
-		counts:       make(map[string][]int),
-	}
-	if tn, ok := reflect.New(t).Interface().(TableNamer); ok {
-		p.tableOverride = tn.TableName()
-	}
-
-	var errs []error
-	if err := p.addFields(t); err != nil {
-		errs = append(errs, err)
-	}
-	for i, f := range p.fields {
-		f.ordinal = i
-		if f.isPK {
-			p.pks = append(p.pks, f)
-		}
-	}
-	errs = append(errs, p.classify()...)
-	if err := errors.Join(errs...); err != nil {
-		return nil, fmt.Errorf("rio: invalid model %s: %w", t.Name(), err)
-	}
-	// Only valid models teach notLoadedPanic their relation field names —
-	// registering earlier would let a rejected model shape poison the hint.
-	for name, rf := range p.rels {
-		registerRelFieldName(t.FieldByIndex(rf.index).Type, name)
-	}
-	return p, nil
-}
-
 // rawField is one struct field as collected before shadowing resolution:
 // every exported field and every anonymous embedded struct, at every depth.
 type rawField struct {
@@ -156,46 +93,28 @@ type rawField struct {
 	flatten bool // anonymous value struct that flattens rather than mapping
 }
 
-func (r *rawField) depth() int { return len(r.index) - 1 }
-
-// collectFields gathers the raw field set depth-first. Only tag syntax errors
-// are reported here; role and mapping validation waits until shadowing has
-// decided which fields exist at all.
-func collectFields(t reflect.Type, prefix []int, baseOffset uintptr, raw *[]rawField, errs *[]error) {
-	for i := 0; i < t.NumField(); i++ {
-		sf := t.Field(i)
-		if !sf.IsExported() {
-			// An embedded struct promotes its exported fields even when the
-			// embedded type's own name is unexported — encoding/json flattens
-			// these too, and silently dropping mapped columns is exactly the
-			// surprise rio refuses. Genuinely private fields stay skipped.
-			embeddedStruct := sf.Anonymous && (sf.Type.Kind() == reflect.Struct ||
-				(sf.Type.Kind() == reflect.Pointer && sf.Type.Elem().Kind() == reflect.Struct))
-			if !embeddedStruct {
-				continue
-			}
-		}
-		tag, opts, err := parseTag(sf)
-		if err != nil {
-			*errs = append(*errs, err)
-			continue
-		}
-		index := append(append([]int(nil), prefix...), i)
-		r := rawField{
-			sf: sf, owner: t, index: index, offset: baseOffset + sf.Offset,
-			tag: tag, opts: opts,
-		}
-		// Anonymous value structs flatten into the parent unless a tag makes
-		// them a column. The embedded field still occupies its Go name: it
-		// shadows, and is shadowed like, any other field.
-		r.flatten = sf.Anonymous && !opts.skip && tag == "" && !opts.json &&
-			sf.Type.Kind() == reflect.Struct && sf.Type != timeType && !isRelContainer(sf.Type)
-		*raw = append(*raw, r)
-		if r.flatten {
-			collectFields(sf.Type, index, r.offset, raw, errs)
-		}
-	}
+type tagOpts struct {
+	skip       bool
+	pk         bool
+	omitZero   bool
+	json       bool
+	version    bool
+	softDelete bool
+	noStamp    bool
+	noAutoIncr bool
+	fk, ref    string
+	join       string
+	countOf    string
 }
+
+var plans sync.Map // reflect.Type → *plan | error
+
+var (
+	timeType    = reflect.TypeFor[time.Time]()
+	timePtrType = reflect.TypeFor[*time.Time]()
+)
+
+func (r *rawField) depth() int { return len(r.index) - 1 }
 
 func (p *plan) addFields(t reflect.Type) error {
 	var errs []error
@@ -287,8 +206,10 @@ func (p *plan) addFields(t reflect.Type) error {
 			// Interface() on unexported embedded fields, and binding would
 			// panic on the first write. Flattening is the only supported use.
 			errs = append(errs, fmt.Errorf(
-				"field %s: an unexported embedded type cannot map to a column itself; export the type or use an exported named field",
-				sf.Name))
+				"field %s: an unexported embedded type cannot map to a column itself; "+
+					"export the type or use an exported named field",
+				sf.Name,
+			))
 			continue
 		}
 
@@ -384,7 +305,12 @@ func (p *plan) classify() []error {
 				// The database wraps the column at 127/255/32767/… while the
 				// struct keeps counting, so every later optimistic Update
 				// misses and reports ErrStaleObject.
-				errs = append(errs, fmt.Errorf("version field %s is %s, too narrow to count updates (wraps at its maximum and then reports ErrStaleObject forever); use int64", f.name, f.typ))
+				errs = append(errs, fmt.Errorf(
+					"version field %s is %s, too narrow to count updates "+
+						"(wraps at its maximum and then reports ErrStaleObject forever); use int64",
+					f.name,
+					f.typ,
+				))
 			default:
 				errs = append(errs, fmt.Errorf("version field %s must be an integer type, got %s", f.name, f.typ))
 			}
@@ -443,19 +369,104 @@ func (p *plan) classify() []error {
 	}
 	return errs
 }
+func planOf[T any]() (*plan, error) {
+	return planFor(reflect.TypeFor[T]())
+}
 
-type tagOpts struct {
-	skip       bool
-	pk         bool
-	omitZero   bool
-	json       bool
-	version    bool
-	softDelete bool
-	noStamp    bool
-	noAutoIncr bool
-	fk, ref    string
-	join       string
-	countOf    string
+func planFor(t reflect.Type) (*plan, error) {
+	if v, ok := plans.Load(t); ok {
+		if p, ok := v.(*plan); ok {
+			return p, nil
+		}
+		return nil, v.(error)
+	}
+	p, err := buildPlan(t)
+	if err != nil {
+		plans.LoadOrStore(t, err)
+		return nil, err
+	}
+	actual, _ := plans.LoadOrStore(t, p)
+	if p, ok := actual.(*plan); ok {
+		return p, nil
+	}
+	return nil, actual.(error)
+}
+
+func buildPlan(t reflect.Type) (*plan, error) {
+	if t.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("rio: model must be a struct, got %s", t)
+	}
+	p := &plan{
+		typ:          t,
+		structName:   t.Name(),
+		defaultTable: tableName(t.Name()),
+		byColumn:     make(map[string]*field),
+		rels:         make(map[string]*relField),
+		counts:       make(map[string][]int),
+	}
+	if tn, ok := reflect.New(t).Interface().(TableNamer); ok {
+		p.tableOverride = tn.TableName()
+	}
+
+	var errs []error
+	if err := p.addFields(t); err != nil {
+		errs = append(errs, err)
+	}
+	for i, f := range p.fields {
+		f.ordinal = i
+		if f.isPK {
+			p.pks = append(p.pks, f)
+		}
+	}
+	errs = append(errs, p.classify()...)
+	if err := errors.Join(errs...); err != nil {
+		return nil, fmt.Errorf("rio: invalid model %s: %w", t.Name(), err)
+	}
+	// Only valid models teach notLoadedPanic their relation field names —
+	// registering earlier would let a rejected model shape poison the hint.
+	for name, rf := range p.rels {
+		registerRelFieldName(t.FieldByIndex(rf.index).Type, name)
+	}
+	return p, nil
+}
+
+// collectFields gathers the raw field set depth-first. Only tag syntax errors
+// are reported here; role and mapping validation waits until shadowing has
+// decided which fields exist at all.
+func collectFields(t reflect.Type, prefix []int, baseOffset uintptr, raw *[]rawField, errs *[]error) {
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if !sf.IsExported() {
+			// An embedded struct promotes its exported fields even when the
+			// embedded type's own name is unexported — encoding/json flattens
+			// these too, and silently dropping mapped columns is exactly the
+			// surprise rio refuses. Genuinely private fields stay skipped.
+			embeddedStruct := sf.Anonymous && (sf.Type.Kind() == reflect.Struct ||
+				(sf.Type.Kind() == reflect.Pointer && sf.Type.Elem().Kind() == reflect.Struct))
+			if !embeddedStruct {
+				continue
+			}
+		}
+		tag, opts, err := parseTag(sf)
+		if err != nil {
+			*errs = append(*errs, err)
+			continue
+		}
+		index := append(append([]int(nil), prefix...), i)
+		r := rawField{
+			sf: sf, owner: t, index: index, offset: baseOffset + sf.Offset,
+			tag: tag, opts: opts,
+		}
+		// Anonymous value structs flatten into the parent unless a tag makes
+		// them a column. The embedded field still occupies its Go name: it
+		// shadows, and is shadowed like, any other field.
+		r.flatten = sf.Anonymous && !opts.skip && tag == "" && !opts.json &&
+			sf.Type.Kind() == reflect.Struct && sf.Type != timeType && !isRelContainer(sf.Type)
+		*raw = append(*raw, r)
+		if r.flatten {
+			collectFields(sf.Type, index, r.offset, raw, errs)
+		}
+	}
 }
 
 func parseTag(sf reflect.StructField) (column string, opts tagOpts, err error) {
@@ -500,11 +511,6 @@ func parseTag(sf reflect.StructField) (column string, opts tagOpts, err error) {
 	}
 	return column, opts, nil
 }
-
-var (
-	timeType    = reflect.TypeFor[time.Time]()
-	timePtrType = reflect.TypeFor[*time.Time]()
-)
 
 func isIntKind(k reflect.Kind) bool {
 	switch k {

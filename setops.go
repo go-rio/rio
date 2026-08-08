@@ -3,55 +3,103 @@ package rio
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
 )
 
-// Set is the column assignment map for UpdateAll. Keys are database column
-// names; assignments render in sorted key order so the SQL is deterministic
-// (stable goldens, stable statement-cache keys). Values bind as parameters
-// unless they are Expr, which is spliced verbatim (see Expr) — never build one
-// from untrusted input.
+// Set maps database column names to UpdateAll values. Expr values are inserted
+// verbatim; never construct them from untrusted input.
 type Set map[string]any
 
-// Expr is a raw SQL fragment used as an UpdateAll value — the escape hatch
-// for database-side arithmetic: rio.Set{"count": rio.Expr("count + 1")}.
-// It is spliced into the statement verbatim; never build one from untrusted
-// input — dynamic identifiers belong in column whitelists or rio.WriteColumns
-// constants.
+// Expr is a verbatim UpdateAll value for database-side expressions. Never
+// construct it from untrusted input; whitelist dynamic identifiers.
 type Expr string
 
-// checkSetOpShape refuses query state a set-based write cannot honor.
-// Silently ignoring a Limit would turn "delete ten rows" into "delete every
-// matching row" — the one place an ORM must fail loudly instead.
-func checkSetOpShape(op string, s *queryState) error {
-	if s.limitSet || s.offsetSet {
-		return fmt.Errorf("rio: %s cannot honor Limit/Offset (UPDATE/DELETE with LIMIT is not portable SQL); select the target rows in Where", op)
-	}
-	if len(s.groups) > 0 || len(s.havings) > 0 {
-		return fmt.Errorf("rio: %s with GroupBy/Having would change which rows match; express the condition in Where or use Raw", op)
-	}
-	if len(s.joins) > 0 {
-		// A set-based write renders only its own table; a Join would leave
-		// its WHERE referencing a table not in the statement. Cross-table
-		// bulk writes are not portable — filter with WhereHas or a subquery.
-		return fmt.Errorf("rio: %s cannot honor Join (UPDATE/DELETE across joined tables is not portable SQL); filter with WhereHas or an IN subquery in Where", op)
-	}
-	if len(s.orders) > 0 {
-		return fmt.Errorf("rio: %s cannot honor OrderBy (a set-based write has no row order); drop it", op)
-	}
-	return nil
+// UpdateAll updates matching rows and returns the affected count. It requires
+// conditions or AllRows. UpdatedAt is maintained unless explicitly assigned;
+// set-based writes do not use optimistic locking.
+func (q Query[T]) UpdateAll(ctx context.Context, db Queryer, set Set, execArgs ...any) (int64, error) {
+	return q.updateAll(ctx, db, set, execArgs, "update")
 }
 
-// UpdateAll updates every matching row in one statement, returning the
-// affected count. It refuses to run without conditions unless AllRows() was
-// called. UpdatedAt is maintained automatically (override by assigning it
-// yourself). Set-based writes bypass the version column; optimistic locking
-// guards entity Update.
-func (q Query[T]) UpdateAll(ctx context.Context, db Queryer, set Set) (int64, error) {
+// DeleteAll deletes matching rows, using soft deletion when configured. It
+// requires conditions or AllRows.
+func (q Query[T]) DeleteAll(ctx context.Context, db Queryer, args ...any) (int64, error) {
+	if len(q.s.wheres) == 0 && len(q.s.hasConds) == 0 && !q.s.allRows {
+		return 0, ErrMissingWhere
+	}
+	if err := checkSetOpShape("DeleteAll", &q.s); err != nil {
+		return 0, err
+	}
+	g := db.gram()
+	p, state, err := prepareQueryState[T](g.d, &q.s, args)
+	if err != nil {
+		return 0, err
+	}
+	// Check before delegation so errors name DeleteAll.
+	if d := g.d; !d.caps().mutations {
+		return 0, checkDeleteWrite(d, "DeleteAll", g.table(p))
+	}
+	if p.softDel != nil {
+		set := Set{p.softDel.column: g.d.bindTime(normalizeTime(db.conf().clock()))}
+		return (Query[T]{s: state}).updateAll(ctx, db, set, nil, "delete")
+	}
+	return q.forceDeleteAll(ctx, db, p, &state)
+}
+
+// ForceDeleteAll permanently deletes matching rows. It requires conditions
+// or AllRows, including on soft-delete models.
+func (q Query[T]) ForceDeleteAll(ctx context.Context, db Queryer, args ...any) (int64, error) {
+	if len(q.s.wheres) == 0 && len(q.s.hasConds) == 0 && !q.s.allRows {
+		return 0, ErrMissingWhere
+	}
+	if err := checkSetOpShape("ForceDeleteAll", &q.s); err != nil {
+		return 0, err
+	}
+	g := db.gram()
+	p, state, err := prepareQueryState[T](g.d, &q.s, args)
+	if err != nil {
+		return 0, err
+	}
+	if d := g.d; !d.caps().mutations {
+		return 0, checkDeleteWrite(d, "ForceDeleteAll", g.table(p))
+	}
+	return q.forceDeleteAll(ctx, db, p, &state)
+}
+
+// RestoreAll restores matching soft-deleted rows. It requires conditions or
+// AllRows.
+func (q Query[T]) RestoreAll(ctx context.Context, db Queryer, args ...any) (int64, error) {
+	p, err := planOf[T]()
+	if err != nil {
+		return 0, err
+	}
+	if p.softDel == nil {
+		return 0, fmt.Errorf("rio: RestoreAll: %s has no softdelete column", p.structName)
+	}
+	if err := checkRestoreWrite(db.gram().d, "RestoreAll"); err != nil {
+		return 0, err
+	}
+	if err := checkSetOpShape("RestoreAll", &q.s); err != nil {
+		return 0, err
+	}
+	if q.s.trashed == trashDefault {
+		q.s.trashed = trashOnly
+	}
+	return q.UpdateAll(ctx, db, Set{p.softDel.column: nil}, args...)
+}
+
+func (q Query[T]) updateAll(
+	ctx context.Context,
+	db Queryer,
+	set Set,
+	execArgs []any,
+	hookOp string,
+) (int64, error) {
 	if len(set) == 0 {
-		return 0, fmt.Errorf("rio: UpdateAll with an empty Set")
+		return 0, errors.New("rio: UpdateAll with an empty Set")
 	}
 	if len(q.s.wheres) == 0 && len(q.s.hasConds) == 0 && !q.s.allRows {
 		return 0, ErrMissingWhere
@@ -59,11 +107,11 @@ func (q Query[T]) UpdateAll(ctx context.Context, db Queryer, set Set) (int64, er
 	if err := checkSetOpShape("UpdateAll", &q.s); err != nil {
 		return 0, err
 	}
-	p, err := planOf[T]()
+	g := db.gram()
+	p, state, err := prepareQueryState[T](g.d, &q.s, execArgs)
 	if err != nil {
 		return 0, err
 	}
-	g := db.gram()
 	d := g.d
 	if err := checkUpdateWrite(d, "UpdateAll", g.table(p)); err != nil {
 		return 0, err
@@ -86,7 +134,7 @@ func (q Query[T]) UpdateAll(ctx context.Context, db Queryer, set Set) (int64, er
 	b = append(b, "UPDATE "...)
 	b = d.quote(b, table)
 	b = append(b, " SET "...)
-	var args []any
+	var bindArgs []any
 	for i, k := range keys {
 		if i > 0 {
 			b = append(b, ", "...)
@@ -100,7 +148,7 @@ func (q Query[T]) UpdateAll(ctx context.Context, db Queryer, set Set) (int64, er
 		v, given := set[k]
 		if !given { // the auto-maintained updated_at
 			b = append(b, '?')
-			args = append(args, d.bindTime(now))
+			bindArgs = append(bindArgs, d.bindTime(now))
 			continue
 		}
 		if expr, isExpr := v.(Expr); isExpr {
@@ -109,93 +157,49 @@ func (q Query[T]) UpdateAll(ctx context.Context, db Queryer, set Set) (int64, er
 		}
 		b = append(b, '?')
 		if f.jsonCol {
-			if v == nil || (reflect.TypeOf(v).Kind() == reflect.Pointer && reflect.ValueOf(v).IsNil()) {
-				args = append(args, nil)
+			isNilPointer := v != nil &&
+				reflect.TypeOf(v).Kind() == reflect.Pointer &&
+				reflect.ValueOf(v).IsNil()
+			if v == nil || isNilPointer {
+				bindArgs = append(bindArgs, nil)
 				continue
 			}
-			// JSON columns take Go values and marshal like entity writes.
+			// Marshal JSON columns consistently with entity writes.
 			data, err := json.Marshal(v)
 			if err != nil {
 				return 0, fmt.Errorf("rio: UpdateAll: column %q: encoding JSON: %w", k, err)
 			}
-			args = append(args, data)
+			bindArgs = append(bindArgs, data)
 			continue
 		}
-		if _, expands := sliceElems(v); expands {
-			// This is a `SET col = ?`, not an `IN (?)`: the rebinder would
-			// expand a bare slice into `SET col = ?, ?`, malformed SQL. Wrap
-			// array values in a driver.Valuer (pq.Array, pgtype) or use Expr.
-			return 0, fmt.Errorf("rio: UpdateAll: column %q value is a slice, which SET cannot expand; wrap it in a driver.Valuer (e.g. pq.Array) or use rio.Expr", k)
+		if _, expands := sliceValue(v); expands {
+			// Slices expand only in placeholder lists, not assignments.
+			return 0, fmt.Errorf(
+				"rio: UpdateAll: column %q value is a slice, which SET cannot expand; "+
+					"wrap it in a driver.Valuer (e.g. pq.Array) or use rio.Expr",
+				k,
+			)
 		}
-		args = append(args, v)
+		bindArgs = append(bindArgs, v)
 	}
 
-	b, args, err = renderWhere(b, args, g, table, p, &q.s)
+	b, bindArgs, err = renderWhere(b, bindArgs, g, table, p, &state)
 	if err != nil {
 		return 0, err
 	}
-	sqlText, outArgs, err := finishSQL(d, b, args)
+	sqlText, outArgs, err := finishSQL(d, b, bindArgs)
 	if err != nil {
 		return 0, err
 	}
-	res, err := run(ctx, db, "update", p.structName, sqlText, outArgs)
+	res, err := run(ctx, db, hookOp, p.structName, sqlText, outArgs)
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
 }
 
-// DeleteAll deletes every matching row in one statement — as an UPDATE
-// setting the deletion timestamp on soft-delete models (already-trashed rows
-// are excluded by the default filter), a real DELETE otherwise. It refuses
-// to run without conditions unless AllRows() was called.
-func (q Query[T]) DeleteAll(ctx context.Context, db Queryer) (int64, error) {
-	if len(q.s.wheres) == 0 && len(q.s.hasConds) == 0 && !q.s.allRows {
-		return 0, ErrMissingWhere
-	}
-	if err := checkSetOpShape("DeleteAll", &q.s); err != nil {
-		return 0, err
-	}
-	p, err := planOf[T]()
-	if err != nil {
-		return 0, err
-	}
-	// Checked here, not left to the delegates: the soft path would otherwise
-	// reject under UpdateAll's name.
-	if d := db.gram().d; !d.caps().mutations {
-		return 0, checkDeleteWrite(d, "DeleteAll", db.gram().table(p))
-	}
-	if p.softDel != nil {
-		set := Set{p.softDel.column: db.gram().d.bindTime(normalizeTime(db.conf().clock()))}
-		return q.UpdateAll(ctx, db, set)
-	}
-	return q.forceDeleteAll(ctx, db, p)
-}
-
-// ForceDeleteAll hard-deletes matching rows even on soft-delete models. Like
-// the other set-based writes it refuses to run without conditions unless
-// AllRows() was called, so emptying the recycle bin is the explicit
-// OnlyTrashed().AllRows().ForceDeleteAll() (AllRows opts into the bulk write;
-// OnlyTrashed scopes it to the trashed rows).
-func (q Query[T]) ForceDeleteAll(ctx context.Context, db Queryer) (int64, error) {
-	if len(q.s.wheres) == 0 && len(q.s.hasConds) == 0 && !q.s.allRows {
-		return 0, ErrMissingWhere
-	}
-	if err := checkSetOpShape("ForceDeleteAll", &q.s); err != nil {
-		return 0, err
-	}
-	p, err := planOf[T]()
-	if err != nil {
-		return 0, err
-	}
-	if d := db.gram().d; !d.caps().mutations {
-		return 0, checkDeleteWrite(d, "ForceDeleteAll", db.gram().table(p))
-	}
-	return q.forceDeleteAll(ctx, db, p)
-}
-
-func (q Query[T]) forceDeleteAll(ctx context.Context, db Queryer, p *plan) (int64, error) {
-	if err := checkSetOpShape("DeleteAll", &q.s); err != nil {
+func (q Query[T]) forceDeleteAll(ctx context.Context, db Queryer, p *plan, state *queryState) (int64, error) {
+	if err := checkSetOpShape("DeleteAll", state); err != nil {
 		return 0, err
 	}
 	g := db.gram()
@@ -205,7 +209,7 @@ func (q Query[T]) forceDeleteAll(ctx context.Context, db Queryer, p *plan) (int6
 	b = append(b, "DELETE FROM "...)
 	b = d.quote(b, table)
 	var args []any
-	b, args, err := renderWhere(b, args, g, table, p, &q.s)
+	b, args, err := renderWhere(b, args, g, table, p, state)
 	if err != nil {
 		return 0, err
 	}
@@ -220,25 +224,32 @@ func (q Query[T]) forceDeleteAll(ctx context.Context, db Queryer, p *plan) (int6
 	return res.RowsAffected()
 }
 
-// RestoreAll clears the deletion timestamp on every matching soft-deleted row
-// — the set-based peer of the entity-form Restore. Conditions are required
-// (or AllRows); combine with OnlyTrashed as needed.
-func (q Query[T]) RestoreAll(ctx context.Context, db Queryer) (int64, error) {
-	p, err := planOf[T]()
-	if err != nil {
-		return 0, err
+// checkSetOpShape rejects query clauses a portable set-based write cannot honor.
+func checkSetOpShape(op string, s *queryState) error {
+	if s.limitSet || s.offsetSet {
+		return fmt.Errorf(
+			"rio: %s cannot honor Limit/Offset (UPDATE/DELETE with LIMIT is not portable SQL); "+
+				"select the target rows in Where",
+			op,
+		)
 	}
-	if p.softDel == nil {
-		return 0, fmt.Errorf("rio: RestoreAll: %s has no softdelete column", p.structName)
+	if len(s.groups) > 0 || len(s.havings) > 0 {
+		return fmt.Errorf(
+			"rio: %s with GroupBy/Having would change which rows match; "+
+				"express the condition in Where or use Raw",
+			op,
+		)
 	}
-	if err := checkRestoreWrite(db.gram().d, "RestoreAll"); err != nil {
-		return 0, err
+	if len(s.joins) > 0 {
+		// The write renders only its own table, so joined references are invalid.
+		return fmt.Errorf(
+			"rio: %s cannot honor Join (UPDATE/DELETE across joined tables is not portable SQL); "+
+				"filter with WhereHas or an IN subquery in Where",
+			op,
+		)
 	}
-	if err := checkSetOpShape("RestoreAll", &q.s); err != nil {
-		return 0, err
+	if len(s.orders) > 0 {
+		return fmt.Errorf("rio: %s cannot honor OrderBy (a set-based write has no row order); drop it", op)
 	}
-	if q.s.trashed == trashDefault {
-		q.s.trashed = trashOnly
-	}
-	return q.UpdateAll(ctx, db, Set{p.softDel.column: nil})
+	return nil
 }

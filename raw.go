@@ -27,37 +27,26 @@ func Raw[T any](sqlText string, args ...any) RawQuery[T] {
 	return RawQuery[T]{sql: sqlText, args: copyArgs(args)}
 }
 
+// Exec runs a hand-written statement through the shared pipeline and returns
+// the driver result.
+func Exec(ctx context.Context, db Queryer, sqlText string, args ...any) (sql.Result, error) {
+	d := db.gram().d
+	rebound, outArgs, err := finishSQLText(d, sqlText, copyArgs(args))
+	if err != nil {
+		return nil, err
+	}
+	return run(ctx, db, "exec", "", rebound, outArgs)
+}
+
 // All runs the query and scans every row.
 func (r RawQuery[T]) All(ctx context.Context, db Queryer) ([]T, error) {
-	d := db.gram().d
-	sqlText, args, err := finishSQLText(d, r.sql, r.args)
-	if err != nil {
-		return nil, err
-	}
-	rows, finish, err := runQuery(ctx, db, "raw", "", sqlText, args)
-	if err != nil {
-		return nil, err
-	}
-	if isScalarType(reflect.TypeFor[T]()) {
-		out, err := scanScalars[T](rows)
-		finishQuery(finish, err)
-		return out, err
-	}
-	p, err := planOf[T]()
-	if err != nil {
-		rows.Close()
-		finishQuery(finish, err)
-		return nil, err
-	}
-	out, err := scanAll[T](rows, p, true)
-	finishQuery(finish, err)
-	return out, err
+	return r.scan(ctx, db, 0)
 }
 
 // First returns the first row or ErrNotFound. rio does not append LIMIT to
 // hand-written SQL; add your own when it matters.
 func (r RawQuery[T]) First(ctx context.Context, db Queryer) (*T, error) {
-	rows, err := r.All(ctx, db)
+	rows, err := r.scan(ctx, db, 1)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +59,7 @@ func (r RawQuery[T]) First(ctx context.Context, db Queryer) (*T, error) {
 // Sole returns the single row, ErrNotFound when none match, and
 // ErrMultipleRows when several do — same contract as Query.Sole.
 func (r RawQuery[T]) Sole(ctx context.Context, db Queryer) (*T, error) {
-	rows, err := r.All(ctx, db)
+	rows, err := r.scan(ctx, db, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -93,6 +82,17 @@ func (r RawQuery[T]) Sole(ctx context.Context, db Queryer) (*T, error) {
 func (r RawQuery[T]) Rows(ctx context.Context, db Queryer) iter.Seq2[T, error] {
 	return func(yield func(T, error) bool) {
 		var zero T
+		tt := reflect.TypeFor[T]()
+		scalar := isScalarType(tt)
+		var p *plan
+		var err error
+		if !scalar {
+			p, err = planOf[T]()
+			if err != nil {
+				yield(zero, err)
+				return
+			}
+		}
 		d := db.gram().d
 		sqlText, args, err := finishSQLText(d, r.sql, r.args)
 		if err != nil {
@@ -104,61 +104,83 @@ func (r RawQuery[T]) Rows(ctx context.Context, db Queryer) iter.Seq2[T, error] {
 			yield(zero, err)
 			return
 		}
-		defer rows.Close() // early-break and panic close; mergeClose folds the error on the normal paths
+		finished := false
+		defer func() {
+			if !finished {
+				_ = finishRows(rows, finish, nil)
+			}
+		}()
 
 		// fields is the per-column scan plan: a synthetic single column for
 		// scalars, else the entity's columns matched by name with full coverage
 		// enforced (namedFields) — the same shapes All scans.
-		tt := reflect.TypeFor[T]()
 		var fields []*field
-		if isScalarType(tt) {
-			f := &field{name: tt.String(), column: "<scalar>", typ: tt}
-			if f.code, err = codecFor(f); err == nil {
+		if scalar {
+			var f *field
+			if f, err = scalarField(tt); err == nil {
 				fields = []*field{f}
 			}
 		} else {
-			var p *plan
-			if p, err = planOf[T](); err == nil {
-				fields, err = namedFields(rows, p)
-			}
+			fields, err = namedFields(rows, p)
 		}
 		if err != nil {
-			mergeClose(rows, &err)
-			finishQuery(finish, err)
+			finished = true
+			err = finishRows(rows, finish, err)
 			yield(zero, err)
 			return
 		}
 		rs := newRowScanner(fields, nil)
 		defer rs.release()
+		var row T
 		for rows.Next() {
-			var row T
+			row = zero
 			if err := rs.scan(rows, unsafe.Pointer(&row)); err != nil {
-				mergeClose(rows, &err)
-				finishQuery(finish, err)
+				finished = true
+				err = finishRows(rows, finish, err)
 				yield(zero, err)
 				return
 			}
 			if !yield(row, nil) {
-				finishQuery(finish, nil)
+				finished = true
+				_ = finishRows(rows, finish, nil)
 				return
 			}
 		}
 		err = rows.Err()
-		mergeClose(rows, &err)
-		finishQuery(finish, err)
+		finished = true
+		err = finishRows(rows, finish, err)
 		if err != nil {
 			yield(zero, err)
 		}
 	}
 }
 
-// Exec runs a hand-written statement through the shared pipeline and returns
-// the driver result.
-func Exec(ctx context.Context, db Queryer, sqlText string, args ...any) (sql.Result, error) {
+func (r RawQuery[T]) scan(ctx context.Context, db Queryer, maxRows int) ([]T, error) {
+	tt := reflect.TypeFor[T]()
+	scalar := isScalarType(tt)
+	var p *plan
+	var err error
+	if !scalar {
+		p, err = planOf[T]()
+		if err != nil {
+			return nil, err
+		}
+	}
 	d := db.gram().d
-	rebound, outArgs, err := finishSQLText(d, sqlText, copyArgs(args))
+	sqlText, args, err := finishSQLText(d, r.sql, r.args)
 	if err != nil {
 		return nil, err
 	}
-	return run(ctx, db, "exec", "", rebound, outArgs)
+	rows, finish, err := runQuery(ctx, db, "raw", "", sqlText, args)
+	if err != nil {
+		return nil, err
+	}
+	if scalar {
+		out, err := scanScalarsN[T](rows, maxRows)
+		finishQuery(finish, err)
+		return out, err
+	}
+	out, err := scanAllN[T](rows, p, true, maxRows)
+	finishQuery(finish, err)
+	return out, err
 }

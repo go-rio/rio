@@ -184,8 +184,13 @@ func NewNative(nc NativeConfig, dialect Dialect, opts ...Option) *DB {
 		opt(cfg)
 	}
 	if cfg.stmtCache {
-		// Construction-time misuse, as in New. (rest duplicates the panic string below)
-		panic("rio: WithStmtCache is not supported on the native channel (no database/sql prepared statements exist here); statement caching belongs to the driver — with pgx, tune the DSN parameter default_query_exec_mode (cache_statement is already its default)")
+		// Construction-time misuse, as in New.
+		panic(
+			"rio: WithStmtCache is not supported on the native channel " +
+				"(no database/sql prepared statements exist here); statement caching belongs to the driver — " +
+				"with pgx, tune the DSN parameter default_query_exec_mode " +
+				"(cache_statement is already its default)",
+		)
 	}
 	return &DB{
 		db:     nc.SQLView,
@@ -194,6 +199,24 @@ func NewNative(nc NativeConfig, dialect Dialect, opts ...Option) *DB {
 		cfg:    cfg,
 		native: nc.Handle,
 	}
+}
+
+// nativeRows adapts the SPI's pgx-shaped result — Close without a return
+// value, errors converging in Err — to the internal rows seam. Close-then-Err
+// keeps mergeClose's promise: a deferred protocol error behind an undrained
+// result surfaces at close time.
+type nativeRows struct {
+	nr NativeRows
+}
+
+func (r *nativeRows) Columns() ([]string, error) { return r.nr.Columns(), nil }
+func (r *nativeRows) Next() bool                 { return r.nr.Next() }
+func (r *nativeRows) Scan(dest ...any) error     { return r.nr.Scan(dest...) }
+func (r *nativeRows) Err() error                 { return r.nr.Err() }
+
+func (r *nativeRows) Close() error {
+	r.nr.Close()
+	return r.nr.Err()
 }
 
 // nativeEngine executes through a NativeDB. It carries no statement cache:
@@ -269,21 +292,3 @@ func (e nativeTxEngine) query(ctx context.Context, sqlText string, args []any) (
 
 func (e nativeTxEngine) commit(ctx context.Context) error   { return e.nt.Commit(ctx) }
 func (e nativeTxEngine) rollback(ctx context.Context) error { return e.nt.Rollback(ctx) }
-
-// nativeRows adapts the SPI's pgx-shaped result — Close without a return
-// value, errors converging in Err — to the internal rows seam. Close-then-Err
-// keeps mergeClose's promise: a deferred protocol error behind an undrained
-// result surfaces at close time.
-type nativeRows struct {
-	nr NativeRows
-}
-
-func (r *nativeRows) Columns() ([]string, error) { return r.nr.Columns(), nil }
-func (r *nativeRows) Next() bool                 { return r.nr.Next() }
-func (r *nativeRows) Scan(dest ...any) error     { return r.nr.Scan(dest...) }
-func (r *nativeRows) Err() error                 { return r.nr.Err() }
-
-func (r *nativeRows) Close() error {
-	r.nr.Close()
-	return r.nr.Err()
-}
