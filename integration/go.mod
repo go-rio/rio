@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.48.0
-	github.com/go-rio/postgres v0.4.0
+	github.com/go-rio/postgres v0.4.1
 	github.com/go-rio/rio v0.10.1
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/jackc/pgx/v5 v5.10.0
