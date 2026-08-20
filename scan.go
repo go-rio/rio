@@ -1016,12 +1016,6 @@ func finishRows(rows rows, finish func(error), err error) error {
 	return err
 }
 
-// scanAll drains rows into a []T. byName selects Raw-style column matching;
-// entity queries use plan order.
-func scanAll[T any](rows rows, p *plan, byName bool) (out []T, err error) {
-	return scanAllCap[T](rows, p, byName, 0, 0)
-}
-
 func scanAllN[T any](rows rows, p *plan, byName bool, maxRows int) (out []T, err error) {
 	return scanAllCap[T](rows, p, byName, maxRows, maxRows)
 }
@@ -1050,12 +1044,6 @@ func scanAllCap[T any](rows rows, p *plan, byName bool, maxRows, capacity int) (
 		return nil, err
 	}
 	return out, nil
-}
-
-// scanScalars drains a single-column result into basic values. The codec is
-// classified once for the whole result, not per row.
-func scanScalars[T any](rows rows) (out []T, err error) {
-	return scanScalarsCap[T](rows, 0, 0)
 }
 
 func scanScalarsN[T any](rows rows, maxRows int) (out []T, err error) {

@@ -48,10 +48,7 @@ func InsertAll[T any](ctx context.Context, db Queryer, rows []T) error {
 		return fmt.Errorf("rio: InsertAll: %s has no insertable columns", p.structName)
 	}
 
-	chunk := d.caps().maxBindParams / len(cols)
-	if chunk < 1 {
-		chunk = 1
-	}
+	chunk := max(d.caps().maxBindParams/len(cols), 1)
 	bn := binder{d: d, now: now}
 	args := make([]any, 0, chunk*len(cols))
 	for start := 0; start < len(rows); start += chunk {
@@ -123,10 +120,7 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 		return err
 	}
 
-	chunk := d.caps().maxBindParams / len(cols)
-	if chunk < 1 {
-		chunk = 1
-	}
+	chunk := max(d.caps().maxBindParams/len(cols), 1)
 	table := g.table(p)
 	bits, cacheable := setBits(p, cols)
 	bn := binder{d: d, now: now}

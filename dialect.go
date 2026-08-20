@@ -176,12 +176,10 @@ func (sqliteDialect) translate(err error) error {
 // type instead of per value.
 const chTimeFormat = "2006-01-02 15:04:05.000000+00:00"
 
-// ClickHouse's DateTime64 range. The server silently clamps values outside
-// it to the boundary — even on INSERT — so rio's bind funnels reject them
-// loudly instead (checkBindTime).
+// ClickHouse 26.7's DateTime64(6) text-binding range.
 var (
-	chTimeMin = time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
-	chTimeMax = time.Date(2299, 12, 31, 23, 59, 59, 999999000, time.UTC)
+	chTimeMin = time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
+	chTimeMax = time.Date(9999, 12, 31, 23, 59, 59, 999999000, time.UTC)
 )
 
 type clickhouseDialect struct{}
@@ -254,22 +252,13 @@ func quoteWith(b []byte, ident string, q byte) []byte {
 	return append(b, q)
 }
 
-// checkBindTime validates a normalized time against the dialect's storable
-// range. Only ClickHouse needs policing: PostgreSQL and MySQL reject
-// out-of-range times loudly on their own, ClickHouse clamps silently.
+// checkBindTime validates a normalized time against the dialect's range.
 func checkBindTime(d Dialect, nt time.Time) error {
 	if d.name() != "clickhouse" || !(nt.Before(chTimeMin) || nt.After(chTimeMax)) {
 		return nil
 	}
-	if nt.IsZero() {
-		return errors.New(
-			"rio: a zero time.Time is outside ClickHouse's DateTime64 range [1900-01-01, 2299-12-31] " +
-				`and would be silently clamped; use a *time.Time (Nullable column) for "no value"`,
-		)
-	}
 	return fmt.Errorf(
-		"rio: time %s is outside ClickHouse's DateTime64 range [1900-01-01, 2299-12-31] "+
-			"and would be silently clamped",
+		"rio: time %s is outside ClickHouse's DateTime64 range [0001-01-01, 9999-12-31]",
 		nt.Format(time.RFC3339Nano),
 	)
 }

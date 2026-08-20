@@ -103,7 +103,7 @@ func TestClickHouseDriverProbes(t *testing.T) {
 			t.Fatalf("scan: %v", err)
 		}
 		if lit != "?" || val != "bound" {
-			t.Fatalf("binder rewrote protected regions: lit=%q val=%q (driver below v2.47.0?)", lit, val)
+			t.Fatalf("binder rewrote protected regions: lit=%q val=%q", lit, val)
 		}
 	})
 
@@ -204,10 +204,16 @@ func TestClickHouseDriverProbes(t *testing.T) {
 		if err != nil {
 			return // rejected at prepare: contract holds
 		}
-		defer stmt.Close()
+		defer func() {
+			if err := stmt.Close(); err != nil {
+				t.Errorf("close prepared SELECT: %v", err)
+			}
+		}()
 		rows, err := stmt.QueryContext(ctx)
 		if err == nil {
-			rows.Close()
+			if err := rows.Close(); err != nil {
+				t.Errorf("close prepared SELECT rows: %v", err)
+			}
 			t.Fatal("driver Prepare changed: a prepared SELECT executed successfully")
 		}
 	})
@@ -288,28 +294,25 @@ func TestClickHouseServerSemantics(t *testing.T) {
 		}
 	})
 
-	// T4: out-of-range times clamp silently — INSERT included. The reason
-	// rio range-checks client-side and refuses.
-	t.Run("T4 server clamps out-of-range silently", func(t *testing.T) {
+	// T4: ClickHouse 26.7 extends DateTime64 text values to years 0001–9999.
+	t.Run("T4 extended DateTime64 range", func(t *testing.T) {
 		lo, err := rio.Raw[string]("SELECT toString(toDateTime64('0001-01-01 00:00:00', 6))").First(ctx, db)
 		if err != nil {
-			t.Fatalf("clamp probe: %v", err)
+			t.Fatalf("lower-bound probe: %v", err)
 		}
-		if !strings.HasPrefix(*lo, "1900-01-01") {
-			t.Fatalf("low clamp moved: %s", *lo)
+		if !strings.HasPrefix(*lo, "0001-01-01") {
+			t.Fatalf("lower bound changed: %s", *lo)
 		}
-		hi, err := rio.Raw[string]("SELECT toString(toDateTime64('2999-01-01 00:00:00', 6))").First(ctx, db)
+		hi, err := rio.Raw[string]("SELECT toString(toDateTime64('9999-12-31 23:59:59.999999', 6))").First(ctx, db)
 		if err != nil {
-			t.Fatalf("clamp probe: %v", err)
+			t.Fatalf("upper-bound probe: %v", err)
 		}
-		if !strings.HasPrefix(*hi, "2299-12-31") {
-			t.Fatalf("high clamp moved: %s", *hi)
+		if !strings.HasPrefix(*hi, "9999-12-31") {
+			t.Fatalf("upper bound changed: %s", *hi)
 		}
-		// Offset-free text keeps T4 about clamping only (T3 owns the
-		// offset-text story).
 		chExec(t, ctx, db, "INSERT INTO sem_tt VALUES (4, '2999-01-01 00:00:00.000000', '2024-01-02 03:04:05.123456', '2024-01-02 03:04:05')")
-		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 4 AND toString(d) LIKE '2299-12-31%'"); n != 1 {
-			t.Fatal("INSERT must clamp too (still silent server-side)")
+		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 4 AND toString(d) LIKE '2999-01-01%'"); n != 1 {
+			t.Fatal("extended-range INSERT must round-trip")
 		}
 	})
 

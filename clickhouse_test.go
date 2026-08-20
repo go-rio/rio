@@ -786,8 +786,8 @@ func TestClickHouseTimeRangeChecked(t *testing.T) {
 
 	// In range: both boundaries store.
 	for _, ok := range []time.Time{
-		time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC),
-		time.Date(2299, 12, 31, 23, 59, 59, 999999999, time.UTC), // truncates to .999999
+		time.Time{},
+		time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC), // truncates to .999999
 	} {
 		if _, err := insertAt(ok); err != nil {
 			t.Fatalf("boundary %v must bind: %v", ok, err)
@@ -795,30 +795,23 @@ func TestClickHouseTimeRangeChecked(t *testing.T) {
 	}
 
 	// Out of range: entity funnel (Insert) rejects before sending.
-	f, err := insertAt(time.Date(1899, 12, 31, 23, 59, 59, 999999999, time.UTC))
-	requireRejected(t, f, err,
-		"rio: time 1899-12-31T23:59:59.999999Z is outside ClickHouse's DateTime64 range "+
-			"[1900-01-01, 2299-12-31] and would be silently clamped")
-	f, err = insertAt(time.Date(2300, 1, 1, 0, 0, 0, 0, time.UTC))
-	requireRejected(t, f, err,
-		"rio: time 2300-01-01T00:00:00Z is outside ClickHouse's DateTime64 range "+
-			"[1900-01-01, 2299-12-31] and would be silently clamped")
-
-	// The zero time gets the dedicated message — the most common accident.
-	f, err = insertAt(time.Time{})
-	requireRejected(t, f, err,
-		"rio: a zero time.Time is outside ClickHouse's DateTime64 range "+
-			"[1900-01-01, 2299-12-31] and would be silently clamped; "+
-			`use a *time.Time (Nullable column) for "no value"`)
+	for _, bad := range []time.Time{
+		time.Date(0, 12, 31, 23, 59, 59, 999999999, time.UTC),
+		time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		f, err := insertAt(bad)
+		requireRejected(t, f, err,
+			"rio: time "+bad.Truncate(time.Microsecond).Format(time.RFC3339Nano)+
+				" is outside ClickHouse's DateTime64 range [0001-01-01, 9999-12-31]")
+	}
 
 	// User-argument funnel (normalizeArgs) applies the same rule.
 	fq := newFakeDB()
 	db := fq.open(ClickHouse)
-	_, err = From[User]().Where("created_at > ?", time.Time{}).All(ctx, db)
-	requireRejected(t, fq, err,
-		"rio: a zero time.Time is outside ClickHouse's DateTime64 range "+
-			"[1900-01-01, 2299-12-31] and would be silently clamped; "+
-			`use a *time.Time (Nullable column) for "no value"`)
+	fq.queueRows(userCols)
+	if _, err := From[User]().Where("created_at > ?", time.Time{}).All(ctx, db); err != nil {
+		t.Fatalf("zero time must bind on ClickHouse 26.7: %v", err)
+	}
 
 	// The other dialects are untouched by the range rule.
 	fpg := newFakeDB()
@@ -835,9 +828,9 @@ func TestClickHouseTimeRangeCoversNullableForms(t *testing.T) {
 	f := newFakeDB()
 	db := f.open(ClickHouse)
 
-	_, err := From[User]().Where("created_at > ?", sql.NullTime{Time: time.Time{}, Valid: true}).All(ctx, db)
-	if err == nil || !strings.Contains(err.Error(), "zero time.Time") {
-		t.Fatalf("valid NullTime zero must hit the zero message: %v", err)
+	f.queueRows(userCols)
+	if _, err := From[User]().Where("created_at > ?", sql.NullTime{Time: time.Time{}, Valid: true}).All(ctx, db); err != nil {
+		t.Fatalf("valid NullTime zero must bind: %v", err)
 	}
 	// Invalid NullTime is NULL, not a range violation.
 	f2 := newFakeDB()

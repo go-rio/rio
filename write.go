@@ -718,7 +718,7 @@ func appendInsertValues(b []byte, d Dialect, n int) []byte {
 		return append(b, " DEFAULT VALUES"...)
 	}
 	b = append(b, " VALUES ("...)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if i > 0 {
 			b = append(b, ", "...)
 		}

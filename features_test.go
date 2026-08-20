@@ -192,14 +192,12 @@ func TestStmtCacheCoalescesConcurrentPrepare(t *testing.T) {
 	errs := make(chan error, workers)
 	var wg sync.WaitGroup
 	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			workerCtx := &observedDoneContext{Context: ctx, observed: joined}
 			_, err := cache.get(workerCtx, "SELECT 1")
 			errs <- err
-		}()
+		})
 	}
 	close(start)
 	select {
@@ -539,12 +537,12 @@ func TestStmtCacheConcurrentEvictionRaceClean(t *testing.T) {
 	start := make(chan struct{})
 	errs := make(chan error, workers)
 	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
 			<-start // release together to widen the concurrent-prepare window
-			for i := 0; i < iters; i++ {
+			for i := range iters {
 				if _, err := Exec(ctx, db, shapes[(w+i)%len(shapes)], i, w); err != nil {
 					errs <- err
 					return
@@ -2625,11 +2623,11 @@ func TestConcurrentUpdateWhitelistOrder(t *testing.T) {
 	db := f.open()
 	orders := [][]string{{"email", "age"}, {"age", "email"}, {"email", "age"}, {"age", "email"}}
 	var wg sync.WaitGroup
-	for g := 0; g < 4; g++ {
+	for g := range 4 {
 		wg.Add(1)
 		go func(cols []string) {
 			defer wg.Done()
-			for i := 0; i < 50; i++ {
+			for range 50 {
 				f.queueExec(0, 1)
 				u := User{ID: 1, Email: "e@x", Age: 42}
 				if err := Update(ctx, db, &u, cols...); err != nil {

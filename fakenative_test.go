@@ -888,8 +888,7 @@ func TestNativeErrorTranslationApplies(t *testing.T) {
 	if !errors.Is(err, ErrDuplicateKey) {
 		t.Fatalf("dialect SQLSTATE fallback must run on the native channel: %v", err)
 	}
-	var raw sqlStateErr
-	if !errors.As(err, &raw) {
+	if _, ok := errors.AsType[sqlStateErr](err); !ok {
 		t.Fatalf("driver error must stay in the chain: %v", err)
 	}
 }

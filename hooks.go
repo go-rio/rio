@@ -2,6 +2,7 @@ package rio
 
 import (
 	"context"
+	"slices"
 	"time"
 )
 
@@ -79,8 +80,8 @@ func (c *config) afterQuery(ctx context.Context, e *QueryEvent, start time.Time,
 	e.Err = err
 	e.Duration = time.Since(start)
 	e.RowsAffected = rows
-	for i := len(c.hooks) - 1; i >= 0; i-- {
-		c.hooks[i].AfterQuery(ctx, e)
+	for _, v := range slices.Backward(c.hooks) {
+		v.AfterQuery(ctx, e)
 	}
 }
 

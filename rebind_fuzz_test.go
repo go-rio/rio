@@ -509,8 +509,8 @@ func FuzzRebind(f *testing.F) {
 		"SELECT /* /* ? */ ? */ ?",
 	}
 	for _, q := range seeds {
-		for prof := uint8(0); prof < 4; prof++ {
-			for style := uint8(0); style < 3; style++ {
+		for prof := range uint8(4) {
+			for style := range uint8(3) {
 				for _, n := range []uint8{0, 1, 2, 3} {
 					f.Add(q, n, prof, style, uint8(0))
 				}
@@ -529,8 +529,8 @@ func FuzzRebind(f *testing.F) {
 		"? ? ? ? ?",
 	}
 	for _, q := range sliceSeeds {
-		for prof := uint8(0); prof < 4; prof++ {
-			for style := uint8(0); style < 3; style++ {
+		for prof := range uint8(4) {
+			for style := range uint8(3) {
 				for _, n := range []uint8{1, 2, 3, 5} {
 					for _, sb := range []uint8{1, 2, 3, 0b101, 0b1000, 0xff} {
 						f.Add(q, n, prof, style, sb)

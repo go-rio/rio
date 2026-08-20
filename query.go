@@ -8,6 +8,7 @@ import (
 	"iter"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 )
@@ -695,14 +696,14 @@ func queryCapacity(limit int, isSet bool) int {
 }
 
 func pkColumns(p *plan) string {
-	s := ""
+	var s strings.Builder
 	for i, pk := range p.pks {
 		if i > 0 {
-			s += ", "
+			s.WriteString(", ")
 		}
-		s += pk.column
+		s.WriteString(pk.column)
 	}
-	return s
+	return s.String()
 }
 
 // renderSelect qualifies entity columns so JOINs cannot make them ambiguous.

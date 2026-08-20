@@ -963,12 +963,12 @@ func TestQueryImmutability(t *testing.T) {
 func TestQueryConcurrentDerivation(t *testing.T) {
 	base := From[User]().Where("age > ?", 18)
 	done := make(chan Query[User], 64)
-	for i := 0; i < 64; i++ {
+	for i := range 64 {
 		go func(i int) {
 			done <- base.Where("id > ?", i).OrderBy("id").Limit(i)
 		}(i)
 	}
-	for i := 0; i < 64; i++ {
+	for range 64 {
 		q := <-done
 		if len(q.s.wheres) != 2 {
 			t.Fatalf("derived query has %d conditions", len(q.s.wheres))

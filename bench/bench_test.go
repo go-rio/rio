@@ -89,7 +89,7 @@ func benchRawDB(b *testing.B, name string) *sql.DB {
 func seed(b *testing.B, raw *sql.DB, n int) {
 	b.Helper()
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.999999+00:00")
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if _, err := raw.Exec("INSERT INTO bench_users (email, age, created_at, updated_at) VALUES (?, ?, ?, ?)",
 			fmt.Sprintf("u%d@example.com", i), 20+i%50, now, now); err != nil {
 			b.Fatal(err)
@@ -430,7 +430,7 @@ func batchInsertArgs(rows []BenchUser, now any) []any {
 func questionBatchInsertSQL(returning bool) string {
 	var query strings.Builder
 	query.WriteString("INSERT INTO bench_users (email, age, created_at, updated_at) VALUES ")
-	for i := 0; i < benchBatchSize; i++ {
+	for i := range benchBatchSize {
 		if i > 0 {
 			query.WriteString(", ")
 		}
@@ -445,7 +445,7 @@ func questionBatchInsertSQL(returning bool) string {
 func postgresBatchInsertSQL() string {
 	var query strings.Builder
 	query.WriteString("INSERT INTO bench_users (email, age, created_at, updated_at) VALUES ")
-	for i := 0; i < benchBatchSize; i++ {
+	for i := range benchBatchSize {
 		if i > 0 {
 			query.WriteString(", ")
 		}

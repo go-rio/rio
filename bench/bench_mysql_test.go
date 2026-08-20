@@ -70,7 +70,7 @@ func benchMySQLRaw(b *testing.B) *sql.DB {
 func seedMySQL(b *testing.B, raw *sql.DB, n int) {
 	b.Helper()
 	now := time.Now().UTC().Truncate(time.Microsecond)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if _, err := raw.Exec("INSERT INTO bench_users (email, age, created_at, updated_at) VALUES (?, ?, ?, ?)",
 			fmt.Sprintf("u%d@example.com", i), 20+i%50, now, now); err != nil {
 			b.Fatal(err)

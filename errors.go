@@ -6,6 +6,11 @@ import (
 	"fmt"
 )
 
+type sqlStateCoder interface {
+	error
+	SQLState() string
+}
+
 var (
 	// ErrNotFound reports that no row matched. It wraps sql.ErrNoRows.
 	ErrNotFound = fmt.Errorf("rio: record not found (%w)", sql.ErrNoRows)
@@ -58,8 +63,7 @@ func translateErr(err error, cfg *config, d Dialect) error {
 
 // sqlState returns the SQLSTATE code exposed by pgx and lib/pq errors.
 func sqlState(err error) string {
-	var coder interface{ SQLState() string }
-	if errors.As(err, &coder) {
+	if coder, ok := errors.AsType[sqlStateCoder](err); ok {
 		return coder.SQLState()
 	}
 	return ""

@@ -456,12 +456,12 @@ func collectFields(t reflect.Type, prefix []int, baseOffset uintptr, raw *[]rawF
 		r := rawField{
 			sf: sf, owner: t, index: index, offset: baseOffset + sf.Offset,
 			tag: tag, opts: opts,
-		}
-		// Anonymous value structs flatten into the parent unless a tag makes
-		// them a column. The embedded field still occupies its Go name: it
-		// shadows, and is shadowed like, any other field.
-		r.flatten = sf.Anonymous && !opts.skip && tag == "" && !opts.json &&
-			sf.Type.Kind() == reflect.Struct && sf.Type != timeType && !isRelContainer(sf.Type)
+
+			// Anonymous value structs flatten into the parent unless a tag makes
+			// them a column. The embedded field still occupies its Go name: it
+			// shadows, and is shadowed like, any other field.
+			flatten: sf.Anonymous && !opts.skip && tag == "" && !opts.json &&
+				sf.Type.Kind() == reflect.Struct && sf.Type != timeType && !isRelContainer(sf.Type)}
 		*raw = append(*raw, r)
 		if r.flatten {
 			collectFields(sf.Type, index, r.offset, raw, errs)

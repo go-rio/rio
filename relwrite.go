@@ -152,10 +152,7 @@ func SyncRelation[T any, K any](ctx context.Context, db Queryer, row *T, relatio
 func insertJoinRows(ctx context.Context, db Queryer, p *plan, res *resolvedRel, ownerKey any, ids []any) error {
 	g := db.gram()
 	d := g.d
-	chunk := d.caps().maxBindParams / 2
-	if chunk < 1 {
-		chunk = 1
-	}
+	chunk := max(d.caps().maxBindParams/2, 1)
 	for start := 0; start < len(ids); start += chunk {
 		end := min(start+chunk, len(ids))
 		part := ids[start:end]
@@ -198,10 +195,7 @@ func insertJoinRows(ctx context.Context, db Queryer, p *plan, res *resolvedRel, 
 // deleteJoinRows removes join rows in dialect-sized chunks.
 func deleteJoinRows(ctx context.Context, db Queryer, p *plan, res *resolvedRel, ownerKey any, ids []any) error {
 	d := db.gram().d
-	chunk := d.caps().maxBindParams - 1
-	if chunk < 1 {
-		chunk = 1
-	}
+	chunk := max(d.caps().maxBindParams-1, 1)
 	for start := 0; start < len(ids); start += chunk {
 		end := min(start+chunk, len(ids))
 

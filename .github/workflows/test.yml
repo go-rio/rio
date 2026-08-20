@@ -8,7 +8,7 @@ jobs:
   test:
     strategy:
       matrix:
-        go: [ "oldstable", "stable" ]
+        go: ["stable"]
         platform: [ ubuntu-latest, macos-latest, windows-latest ]
     runs-on: ${{ matrix.platform }}
     steps:
@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:18.6-alpine
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: rio_test
@@ -42,7 +42,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       mysql:
-        image: mysql:8.4
+        image: mysql:9.7
         env:
           MYSQL_ROOT_PASSWORD: root
           MYSQL_DATABASE: rio_test
@@ -50,6 +50,20 @@ jobs:
           - 3306:3306
         options: >-
           --health-cmd "mysqladmin ping -uroot -proot --silent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.7-alpine
+        env:
+          CLICKHOUSE_DB: rio_test
+          CLICKHOUSE_USER: rio
+          CLICKHOUSE_PASSWORD: rio
+        ports:
+          - 9000:9000
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --user rio --password rio --query 'SELECT 1'"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
@@ -61,7 +75,7 @@ jobs:
         with:
           cache: true
           go-version: 'stable'
-      - name: Run integration tests against Postgres and MySQL
+      - name: Run integration tests against Postgres, MySQL, and ClickHouse
         working-directory: integration
         run: go test -race -timeout 10m ./...
         env:
@@ -69,6 +83,7 @@ jobs:
           # parseTime=true makes go-sql-driver return DATETIME columns as
           # time.Time, which rio's scanner expects for time fields.
           RIO_MYSQL_DSN: root:root@tcp(localhost:3306)/rio_test?parseTime=true
+          RIO_CLICKHOUSE_DSN: clickhouse://rio:rio@localhost:9000/rio_test
   coverage:
     runs-on: ubuntu-latest
     steps:

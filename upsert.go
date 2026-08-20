@@ -526,12 +526,7 @@ func upsertUpdateSet(p *plan, spec *upsertSpec, skipped []*field) ([]*field, err
 
 // fieldIn reports membership by identity; plan fields are canonical pointers.
 func fieldIn(fs []*field, f *field) bool {
-	for _, s := range fs {
-		if s == f {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(fs, f)
 }
 
 // appendConflictClause omits parentheses for targetless DoNothing.
