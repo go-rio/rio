@@ -253,16 +253,10 @@ func keyFamily(t reflect.Type) any {
 	return t
 }
 
-// preloadInto loads relation paths into rows of one plan.
-func preloadInto[T any](ctx context.Context, db Queryer, p *plan, rows []T, specs []preloadSpec) error {
-	if len(rows) == 0 || len(specs) == 0 {
-		return nil
-	}
-	return preloadValues(ctx, db, p, reflect.ValueOf(rows), specs)
-}
-
-// preloadValues is the reflection core shared by the generic entry point and
-// nested recursion. rows is a []T value; slice elements are addressable.
+// preloadValues loads relation paths into one nested layer's buffered rows.
+// rows is a []T value; slice elements are addressable. The top layer runs
+// through collectRelationLayer directly so its statements merge into the
+// owning query's relation batch.
 func preloadValues(ctx context.Context, db Queryer, p *plan, rows reflect.Value, specs []preloadSpec) error {
 	stmts, finishes, err := collectRelationLayer(db, p, rows, specs)
 	if err != nil {
