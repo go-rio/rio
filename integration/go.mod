@@ -42,5 +42,3 @@ require (
 )
 
 replace github.com/go-rio/rio => ../
-
-replace github.com/go-rio/postgres => ../../postgres
