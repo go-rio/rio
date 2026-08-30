@@ -387,24 +387,35 @@ func finishQuery(finish func(error, int64), err error, returned int64) {
 	finish(missIsSuccess(err), returned)
 }
 
-// relStatement is one derived relation-loading statement; consume owns
+// relStatement is one derived relation-loading statement; its loader owns
 // draining and closing the rows.
 type relStatement struct {
 	phase   string
 	model   string
 	sqlText string
 	args    []any
-	consume func(rows) (int64, error)
+	load    relConsumer
+}
+
+// relConsumer drains one derived statement's rows into its loader's buffer;
+// one loader serves every chunk statement of its relation.
+type relConsumer interface {
+	consume(rows) (int64, error)
+}
+
+// relFinisher assembles a loader's buffered rows once its layer ran.
+type relFinisher interface {
+	finish(context.Context) error
 }
 
 // runRelLayer runs a relation layer's statements first, then its finishes,
 // so nested layers start only once their parents' buffers are complete.
-func runRelLayer(ctx context.Context, q Queryer, stmts []relStatement, finishes []func(context.Context) error) error {
+func runRelLayer(ctx context.Context, q Queryer, stmts []relStatement, finishes []relFinisher) error {
 	if err := runRelStatements(ctx, q, stmts); err != nil {
 		return err
 	}
-	for _, finish := range finishes {
-		if err := finish(ctx); err != nil {
+	for _, f := range finishes {
+		if err := f.finish(ctx); err != nil {
 			return err
 		}
 	}
@@ -425,7 +436,7 @@ func runRelStatements(ctx context.Context, q Queryer, stmts []relStatement) erro
 		if err != nil {
 			return err
 		}
-		n, err := st.consume(rows)
+		n, err := st.load.consume(rows)
 		finishQuery(finish, err, n)
 		if err != nil {
 			return err
@@ -480,7 +491,7 @@ func runRelBatch(ctx context.Context, q Queryer, b NativeBatcher, stmts []relSta
 			break
 		}
 		nrw.nr = nr
-		n, cerr := stmts[i].consume(&nrw)
+		n, cerr := stmts[i].load.consume(&nrw)
 		cerr = translateErr(cerr, cfg, d)
 		after(i, cerr, n)
 		consumed++

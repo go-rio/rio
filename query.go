@@ -648,16 +648,16 @@ func loadQueryRelations[T any](
 	}
 	rv := reflect.ValueOf(rows)
 	queried, reusable := splitCounts(p, withs, counts)
-	stmts, finishes, err := collectRelationLayer(db, p, rv, withs)
+	stmts := make([]relStatement, 0, len(withs)+len(queried))
+	finishes := make([]relFinisher, 0, len(withs)+len(queried))
+	stmts, finishes, err := collectRelationLayer(db, p, rv, withs, stmts, finishes)
 	if err != nil {
 		return err
 	}
-	countStmts, countFinishes, err := prepareCountLoads(db, p, rv, queried)
+	stmts, finishes, err = prepareCountLoads(db, p, rv, queried, stmts, finishes)
 	if err != nil {
 		return err
 	}
-	stmts = append(stmts, countStmts...)
-	finishes = append(finishes, countFinishes...)
 	if err := runRelLayer(ctx, db, stmts, finishes); err != nil {
 		return err
 	}
