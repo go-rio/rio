@@ -50,7 +50,9 @@ func InsertAll[T any](ctx context.Context, db Queryer, rows []T) error {
 
 	chunk := max(d.caps().maxBindParams/len(cols), 1)
 	bn := binder{d: d, now: now}
-	args := make([]any, 0, chunk*len(cols))
+	// Size by the actual batch: a full chunk on PG/MySQL is 65535 binds, and
+	// a three-row insert should not pay a ~1 MiB buffer for it.
+	args := make([]any, 0, min(chunk, len(rows))*len(cols))
 	for start := 0; start < len(rows); start += chunk {
 		end := min(start+chunk, len(rows))
 		if err := insertChunk(
@@ -124,7 +126,9 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 	table := g.table(p)
 	bits, cacheable := setBits(p, cols)
 	bn := binder{d: d, now: now}
-	args := make([]any, 0, chunk*len(cols))
+	// Size by the actual batch, as in InsertAll: never a full-chunk buffer
+	// for a handful of rows.
+	args := make([]any, 0, min(chunk, len(rows))*len(cols))
 	for start := 0; start < len(rows); start += chunk {
 		end := min(start+chunk, len(rows))
 		part := rows[start:end]
@@ -142,79 +146,17 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 			func() []byte {
 				b := renderInsertHead(g, p, cols)
 				b = append(b, " VALUES "...)
-				for r := range part {
-					if r > 0 {
-						b = append(b, ", "...)
-					}
-					b = append(b, '(')
-					for i := range cols {
-						if i > 0 {
-							b = append(b, ", "...)
-						}
-						b = append(b, '?')
-					}
-					b = append(b, ')')
-				}
-				if d.caps().conflictTarget {
-					b = appendConflictClause(b, d, &spec)
-					if spec.doNothing {
-						b = append(b, "DO NOTHING"...)
-					} else {
-						b = append(b, "DO UPDATE SET "...)
-						b = appendConflictSets(
-							b,
-							d,
-							table,
-							p,
-							update,
-							&spec,
-							"excluded",
-						)
-					}
-					return b
-				}
-				// The MySQL row alias is required only for DoUpdate.
-				if !spec.doNothing {
-					b = appendMySQLUpsertAlias(b)
-				}
-				b = append(b, " ON DUPLICATE KEY UPDATE "...)
-				if spec.doNothing {
-					col := p.fields[0].column
-					if len(p.pks) > 0 {
-						col = p.pks[0].column
-					}
-					b = d.quote(b, col)
-					b = append(b, " = "...)
-					b = d.quote(b, col)
-				} else {
-					b = appendConflictSets(
-						b,
-						d,
-						table,
-						p,
-						update,
-						&spec,
-						mysqlUpsertAlias,
-					)
-				}
-				return b
+				b = appendValuesTuples(b, len(part), len(cols))
+				return appendConflictBranch(b, d, table, p, update, &spec)
 			},
 		)
 		if err != nil {
 			return err
 		}
 
-		args = args[:0]
-		for r := range part {
-			rv := reflect.ValueOf(&part[r]).Elem()
-			base := rv.Addr().UnsafePointer()
-			for _, f := range cols {
-				a, err := fieldValue(f, base, rv, &bn)
-				if err != nil {
-					return err
-				}
-				args = append(args, a)
-			}
+		args, err = bindRowArgs(args[:0], part, cols, &bn)
+		if err != nil {
+			return err
 		}
 		if _, err := run(
 			ctx,
@@ -289,19 +231,7 @@ func insertChunk[T any](
 		func() []byte {
 			b := renderInsertHead(g, p, cols)
 			b = append(b, " VALUES "...)
-			for r := range rows {
-				if r > 0 {
-					b = append(b, ", "...)
-				}
-				b = append(b, '(')
-				for i := range cols {
-					if i > 0 {
-						b = append(b, ", "...)
-					}
-					b = append(b, '?')
-				}
-				b = append(b, ')')
-			}
+			b = appendValuesTuples(b, len(rows), len(cols))
 			if returning {
 				b = append(b, " RETURNING "...)
 				b = d.quote(b, p.autoIncr.column)
@@ -312,17 +242,9 @@ func insertChunk[T any](
 	if err != nil {
 		return err
 	}
-	args = args[:0]
-	for r := range rows {
-		rv := reflect.ValueOf(&rows[r]).Elem()
-		base := rv.Addr().UnsafePointer()
-		for _, f := range cols {
-			a, err := fieldValue(f, base, rv, bn)
-			if err != nil {
-				return err
-			}
-			args = append(args, a)
-		}
+	args, err = bindRowArgs(args[:0], rows, cols, bn)
+	if err != nil {
+		return err
 	}
 
 	if returning {
@@ -369,4 +291,39 @@ func insertChunk[T any](
 		args,
 	)
 	return err
+}
+
+// appendValuesTuples renders nRows placeholder tuples: (?, ?), (?, ?), …
+func appendValuesTuples(b []byte, nRows, nCols int) []byte {
+	for r := range nRows {
+		if r > 0 {
+			b = append(b, ", "...)
+		}
+		b = append(b, '(')
+		for i := range nCols {
+			if i > 0 {
+				b = append(b, ", "...)
+			}
+			b = append(b, '?')
+		}
+		b = append(b, ')')
+	}
+	return b
+}
+
+// bindRowArgs appends every row's column values in plan order, matching the
+// tuples appendValuesTuples rendered.
+func bindRowArgs[T any](args []any, rows []T, cols []*field, bn *binder) ([]any, error) {
+	for r := range rows {
+		rv := reflect.ValueOf(&rows[r]).Elem()
+		base := rv.Addr().UnsafePointer()
+		for _, f := range cols {
+			a, err := fieldValue(f, base, rv, bn)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, a)
+		}
+	}
+	return args, nil
 }

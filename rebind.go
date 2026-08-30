@@ -446,7 +446,7 @@ func identByteBefore(s string, i int) bool {
 
 // skipDollarQuoted matches $tag$...$tag$ starting at the $ and returns the
 // index after the closing delimiter. $1-style placeholders do not match: a
-// tag is empty or starts with a letter or underscore.
+// tag is empty or starts with a letter (ASCII or not) or underscore.
 func skipDollarQuoted(s string, start int) (int, bool) {
 	i := start + 1
 	for i < len(s) && isTagByte(s[i], i == start+1) {
@@ -465,7 +465,10 @@ func skipDollarQuoted(s string, start int) (int, bool) {
 }
 
 func isTagByte(c byte, first bool) bool {
-	if c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+	// Bytes >= 0x80 count as letters, mirroring identByteBefore: PostgreSQL's
+	// scanner classes the tag as [A-Za-z\200-\377_] plus digits after the
+	// first byte, so $å$...$å$ is a real dollar quote and must be skipped.
+	if c == '_' || c >= 0x80 || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
 		return true
 	}
 	return !first && c >= '0' && c <= '9'

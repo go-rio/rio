@@ -52,8 +52,12 @@ type sqlEngine struct {
 	stmts *stmtCache // nil unless WithStmtCache
 }
 
-func (e *sqlEngine) stmt(ctx context.Context, sqlText string) (*sql.Stmt, bool, error) {
-	if e.stmts == nil {
+// stmt decides whether a statement runs prepared: never without a cache, and
+// never with zero args — preparing buys nothing without binds, a one-off DDL
+// text would pin an LRU slot, and a multi-command script cannot be prepared
+// at all. The Tx engine below inlines the same condition.
+func (e *sqlEngine) stmt(ctx context.Context, sqlText string, nargs int) (*sql.Stmt, bool, error) {
+	if e.stmts == nil || nargs == 0 {
 		return nil, false, nil
 	}
 	st, err := e.stmts.get(ctx, sqlText)
@@ -64,7 +68,7 @@ func (e *sqlEngine) stmt(ctx context.Context, sqlText string) (*sql.Stmt, bool, 
 }
 
 func (e *sqlEngine) exec(ctx context.Context, sqlText string, args []any) (sql.Result, error) {
-	if st, ok, err := e.stmt(ctx, sqlText); err != nil {
+	if st, ok, err := e.stmt(ctx, sqlText, len(args)); err != nil {
 		return nil, err
 	} else if ok {
 		res, err := st.ExecContext(ctx, args...)
@@ -79,7 +83,7 @@ func (e *sqlEngine) exec(ctx context.Context, sqlText string, args []any) (sql.R
 }
 
 func (e *sqlEngine) query(ctx context.Context, sqlText string, args []any) (rows, error) {
-	if st, ok, err := e.stmt(ctx, sqlText); err != nil {
+	if st, ok, err := e.stmt(ctx, sqlText, len(args)); err != nil {
 		return nil, err
 	} else if ok {
 		rs, err := st.QueryContext(ctx, args...)
@@ -141,6 +145,8 @@ type sqlTxEngine struct {
 }
 
 func (e *sqlTxEngine) exec(ctx context.Context, sqlText string, args []any) (sql.Result, error) {
+	// Zero-arg statements (SAVEPOINT control among them) skip the cache,
+	// exactly as the DB engine's stmt() decides.
 	if e.stmts == nil || len(args) == 0 {
 		return e.tx.ExecContext(ctx, sqlText, args...)
 	}

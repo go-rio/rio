@@ -172,6 +172,27 @@ func TestStmtCache(t *testing.T) {
 	}
 }
 
+// Zero-arg statements bypass the cache on both engines: preparing buys
+// nothing without binds, a one-off DDL text would pin an LRU slot, and a
+// multi-command script cannot be prepared at all.
+func TestStmtCacheSkipsZeroArgStatements(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.openWith(SQLite, WithStmtCache(2))
+
+	f.queueExec(0, 0)
+	if _, err := Exec(ctx, db, "CREATE TABLE t (id INTEGER); CREATE INDEX i ON t (id)"); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	f.queueRows([]string{"n"}, []driver.Value{int64(1)})
+	if _, err := Raw[int64]("SELECT 1").First(ctx, db); err != nil {
+		t.Fatalf("Raw: %v", err)
+	}
+	if len(f.prepped) != 0 {
+		t.Fatalf("zero-arg statements must bypass the cache, prepared: %v", f.prepped)
+	}
+}
+
 func TestStmtCacheCoalescesConcurrentPrepare(t *testing.T) {
 	f := newFakeDB()
 	started := make(chan struct{}, 1)
@@ -973,15 +994,48 @@ func TestPreloadRelWhereBindLimit(t *testing.T) {
 	}
 }
 
-func TestExistsIgnoresUserLimit(t *testing.T) {
+// Exists probes for one row, so a Limit >= 1 collapses to LIMIT 1 — but
+// Limit(0) means "no rows" (as on All) and Offset shifts which row must
+// exist: Offset(10).Exists asks "is there an 11th row", the paging probe,
+// and dropping it would answer a different question.
+func TestExistsHonorsOffsetAndZeroLimit(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
 	db := f.open()
+
+	f.queueRows([]string{"1"})
+	_, _ = From[Org]().Limit(10).Exists(ctx, db)
+	got := f.logged()[0]
+	if !strings.HasSuffix(got, "LIMIT 1") || strings.Count(got, "LIMIT") != 1 {
+		t.Fatalf("Limit >= 1 collapses to the probe LIMIT: %s", got)
+	}
+
 	f.queueRows([]string{"1"})
 	_, _ = From[Org]().Limit(10).Offset(5).Exists(ctx, db)
-	got := f.logged()[0]
-	if strings.Count(got, "LIMIT") != 1 || strings.Contains(got, "OFFSET") {
-		t.Fatalf("Exists renders exactly one probe LIMIT: %s", got)
+	got = f.logged()[1]
+	if !strings.HasSuffix(got, "LIMIT 1 OFFSET 5") {
+		t.Fatalf("Offset must shift the probe row: %s", got)
+	}
+
+	f.queueRows([]string{"1"})
+	_, _ = From[Org]().Limit(0).Exists(ctx, db)
+	got = f.logged()[2]
+	if !strings.HasSuffix(got, "LIMIT 0") {
+		t.Fatalf("Limit(0) means no rows, as it does on All: %s", got)
+	}
+}
+
+func TestCountRefusesLimitOffset(t *testing.T) {
+	ctx := context.Background()
+	db := newFakeDB().open()
+
+	_, err := From[Org]().Limit(10).Count(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "Count cannot honor Limit/Offset") {
+		t.Fatalf("Count with Limit: %v", err)
+	}
+	_, err = From[Org]().Offset(5).Count(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "Count cannot honor Limit/Offset") {
+		t.Fatalf("Count with Offset: %v", err)
 	}
 }
 
@@ -1012,6 +1066,34 @@ func TestUpsertDoNothingBackfill(t *testing.T) {
 	}
 }
 
+type upsertJSONRow struct {
+	ID       int64
+	Email    string
+	Settings map[string]string `rio:",json"`
+}
+
+func TestUpsertScanBackReplacesJSONWholesale(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+
+	// Conflict branch with settings outside the DoUpdate whitelist: the row
+	// keeps its stored JSON and RETURNING hands it back. json.Unmarshal into
+	// the caller's non-nil map would merge the two states; the struct must
+	// hold exactly what the database stores.
+	f.queueRows(
+		[]string{"id", "email", "settings"},
+		[]driver.Value{int64(7), "a@x", []byte(`{"theme":"dark"}`)},
+	)
+	u := &upsertJSONRow{Email: "a@x", Settings: map[string]string{"lang": "en"}}
+	if err := Upsert(ctx, db, u, OnConflict("email"), DoUpdate("email")); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if len(u.Settings) != 1 || u.Settings["theme"] != "dark" {
+		t.Fatalf("scan-back merged the caller's map with the stored JSON: %v", u.Settings)
+	}
+}
+
 func TestRestoreEntity(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1024,7 +1106,7 @@ func TestRestoreEntity(t *testing.T) {
 		t.Fatalf("Restore: %v", err)
 	}
 	got := f.logged()[0]
-	want := `UPDATE "users" SET "deleted_at" = NULL, "updated_at" = ?, "version" = "version" + 1 WHERE "id" = ? AND "version" = ?`
+	want := `UPDATE "users" SET "deleted_at" = NULL, "updated_at" = ?, "version" = "version" + 1 WHERE "id" = ? AND "version" = ? AND "deleted_at" IS NOT NULL`
 	if got != want {
 		t.Fatalf("sql:\n got: %s\nwant: %s", got, want)
 	}
@@ -1951,6 +2033,49 @@ func TestWriteColumnsRefusesDuplicateFieldNames(t *testing.T) {
 	}
 }
 
+// A role tag on a flattened embedded struct would silently vanish — the pk
+// below would never become a key and Find/Update/Delete would use the ID
+// convention instead. The plan must refuse it.
+func TestRoleTagOnFlattenedEmbedRefused(t *testing.T) {
+	type compositeKey struct {
+		Region string
+		Code   string
+	}
+	type routed struct {
+		compositeKey `rio:",pk"`
+		Name         string
+	}
+	_, err := planOf[routed]()
+	if err == nil || !strings.Contains(err.Error(), "does not apply to a flattened embedded struct") {
+		t.Fatalf("pk on a flattened embed must refuse: %v", err)
+	}
+}
+
+func TestDuplicateCountOfTargetRefused(t *testing.T) {
+	type doubleCounted struct {
+		ID         int64
+		Posts      HasMany[Post]
+		PostCount  int64 `rio:",countof:Posts"`
+		PostsTotal int64 `rio:",countof:Posts"`
+	}
+	_, err := planOf[doubleCounted]()
+	if err == nil || !strings.Contains(err.Error(), "both declare countof:Posts") {
+		t.Fatalf("duplicate countof targets must refuse: %v", err)
+	}
+}
+
+func TestCountOfWithColumnNameRefused(t *testing.T) {
+	type namedCount struct {
+		ID        int64
+		Posts     HasMany[Post]
+		PostCount int64 `rio:"post_count,countof:Posts"`
+	}
+	_, err := planOf[namedCount]()
+	if err == nil || !strings.Contains(err.Error(), "countof targets take no column name") {
+		t.Fatalf("countof with a column name must refuse: %v", err)
+	}
+}
+
 // --- post-v0.3.0 self-review hardening ---
 
 // Reusable Query.All must run WithCount after the main query.
@@ -2010,6 +2135,22 @@ func TestSetOpsRefuseLimitOffsetGroupBy(t *testing.T) {
 	_, err = From[User]().Where("age > ?", 1).Limit(3).RestoreAll(ctx, db)
 	if err == nil || !strings.Contains(err.Error(), "RestoreAll cannot honor Limit/Offset") {
 		t.Fatalf("Restore with Limit: %v", err)
+	}
+	_, err = From[User]().Where("age > ?", 1).With("Posts").UpdateAll(ctx, db, Set{"age": 2})
+	if err == nil || !strings.Contains(err.Error(), "UpdateAll cannot honor With/WithCount") {
+		t.Fatalf("UpdateAll with With: %v", err)
+	}
+	_, err = From[User]().Where("age > ?", 1).WithCount("Posts").DeleteAll(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "DeleteAll cannot honor With/WithCount") {
+		t.Fatalf("DeleteAll with WithCount: %v", err)
+	}
+	_, err = From[User]().Where("age > ?", 1).ForUpdate().UpdateAll(ctx, db, Set{"age": 2})
+	if err == nil || !strings.Contains(err.Error(), "UpdateAll cannot honor ForUpdate") {
+		t.Fatalf("UpdateAll with ForUpdate: %v", err)
+	}
+	_, err = From[User]().Where("age > ?", 1).Final().DeleteAll(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "DeleteAll cannot honor Final") {
+		t.Fatalf("DeleteAll with Final: %v", err)
 	}
 }
 
@@ -2539,6 +2680,31 @@ func TestNullTimeFieldBindsCanonical(t *testing.T) {
 	}
 	if got := f.loggedContaining("INSERT")[1].args[1]; got != nil {
 		t.Fatalf("invalid NullTime must bind NULL: %#v", got)
+	}
+}
+
+// The read side mirrors that ownership: a TEXT column (or an expression
+// column with no decltype for the driver to convert) hands back rio's own
+// format, which sql.NullTime's Scan alone would reject.
+func TestNullTimeFieldScansTextForm(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite)
+
+	f.queueRows([]string{"id", "remind"},
+		[]driver.Value{int64(1), "2026-07-09 03:04:05.123456+00:00"},
+		[]driver.Value{int64(2), nil},
+	)
+	rows, err := Raw[Reminder]("SELECT id, remind FROM reminders").All(ctx, db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	want := time.Date(2026, 7, 9, 3, 4, 5, 123456000, time.UTC)
+	if !rows[0].Remind.Valid || !rows[0].Remind.Time.Equal(want) {
+		t.Fatalf("the text form must parse into NullTime: %+v", rows[0].Remind)
+	}
+	if rows[1].Remind.Valid {
+		t.Fatalf("NULL must scan Valid=false: %+v", rows[1].Remind)
 	}
 }
 

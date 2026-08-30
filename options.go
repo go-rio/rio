@@ -49,6 +49,12 @@ func WithErrorTranslator(f func(error) error) Option {
 
 // WithTableNamer overrides conventional table names for this handle. A model's
 // TableName method takes precedence, and SQL caches remain handle-specific.
+//
+// The function must be a pure, stable mapping: rendered SQL is cached per
+// handle, so a namer that reads mutable state (a request-scoped tenant
+// variable) would leave earlier shapes pointing at the old names. Dynamic
+// tenancy is a handle decision — construct one *DB per naming universe and
+// pick at the call site, exactly as with read/write splitting.
 func WithTableNamer(f func(structName string) string) Option {
 	return func(c *config) { c.tableNamer = f }
 }

@@ -632,12 +632,10 @@ func scanRel(
 	var keyCell colScanner
 	var extras []any
 	if keyed {
-		kf := &field{name: "join key", column: res.joinFK, typ: res.ref.typ}
-		codec, err := codecFor(kf)
+		kf, err := synthField("join key", res.joinFK, res.ref.typ)
 		if err != nil {
 			return buf, nil, err
 		}
-		kf.code = codec
 		keyCell.f = kf
 		extras = []any{&keyCell}
 	}
@@ -927,12 +925,10 @@ func countRelation(ctx context.Context, db Queryer, owner *plan, name string, ro
 func scanCounts(rows rows, keyType reflect.Type, byKey map[any]int64) (err error) {
 	defer mergeClose(rows, &err)
 	keyBuf := reflect.New(keyType)
-	kf := &field{name: "count key", column: "<key>", typ: keyType}
-	codec, err := codecFor(kf)
+	kf, err := synthField("count key", "<key>", keyType)
 	if err != nil {
 		return err
 	}
-	kf.code = codec
 	// One escaping box carries the cell, the count slot, and their dest
 	// slice: a fresh variadic slice at the interface call would otherwise
 	// heap-allocate per row (see scanScalars).

@@ -149,7 +149,7 @@ func newCachedQuery(
 				// Normalization dereferences *time.Time, so its result is not stable.
 				return false
 			}
-			if d.name() == "clickhouse" {
+			if d.caps().bindBytesAsString {
 				if _, ok := value.([]byte); ok {
 					return false
 				}

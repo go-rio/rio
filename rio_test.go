@@ -329,6 +329,68 @@ func TestDeleteSoftAndForce(t *testing.T) {
 	}
 }
 
+// The trash predicates make Delete and Restore idempotent on every dialect:
+// a second Delete keeps the original deletion stamp, restoring a live row
+// bumps nothing, and the idempotent paths adopt what the database stores.
+func TestSoftDeleteAndRestoreIdempotent(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+
+	// Delete of an already-trashed row: zero matched, the probe sees the
+	// stored stamp — success, adopting stamp and version, never re-stamping.
+	stored := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	f.queueExec(0, 0)
+	f.queueRows([]string{"deleted_at", "version"}, []driver.Value{stored, int64(7)})
+	u := &User{ID: 5, Version: 6}
+	if err := Delete(ctx, db, u); err != nil {
+		t.Fatalf("repeat Delete must be idempotent: %v", err)
+	}
+	if got := f.logged()[0]; !strings.Contains(got, `AND "deleted_at" IS NULL`) {
+		t.Fatalf("soft delete must target live rows only: %s", got)
+	}
+	if got := f.logged()[1]; !strings.HasPrefix(got, `SELECT "deleted_at", "version" FROM "users" WHERE "id" = $1`) {
+		t.Fatalf("the probe must read stamp and version by PK only: %s", got)
+	}
+	if u.DeletedAt == nil || !u.DeletedAt.Equal(stored) || u.Version != 7 {
+		t.Fatalf("the struct must adopt the stored state: %+v", u)
+	}
+
+	// Restore of a live row: zero matched, the probe sees NULL — success,
+	// version adopted rather than bumped, UpdatedAt untouched.
+	f.queueExec(0, 0)
+	f.queueRows([]string{"deleted_at", "version"}, []driver.Value{nil, int64(7)})
+	v := &User{ID: 5, Version: 7, DeletedAt: &stored}
+	if err := Restore(ctx, db, v); err != nil {
+		t.Fatalf("Restore of a live row must be idempotent: %v", err)
+	}
+	if got := f.logged()[2]; !strings.Contains(got, `AND "deleted_at" IS NOT NULL`) {
+		t.Fatalf("restore must target trashed rows only: %s", got)
+	}
+	if v.DeletedAt != nil || v.Version != 7 {
+		t.Fatalf("the struct must adopt the live state without a bump: %+v", v)
+	}
+
+	// A live row under a stale version is still a version conflict.
+	f.queueExec(0, 0)
+	f.queueRows([]string{"deleted_at", "version"}, []driver.Value{nil, int64(9)})
+	if err := Delete(ctx, db, &User{ID: 5, Version: 1}); !errors.Is(err, ErrStaleObject) {
+		t.Fatalf("stale delete of a live row: %v", err)
+	}
+
+	// Missing rows keep the stale/missing contract.
+	f.queueExec(0, 0)
+	f.queueRows([]string{"deleted_at", "version"})
+	if err := Delete(ctx, db, &User{ID: 99, Version: 1}); !errors.Is(err, ErrStaleObject) {
+		t.Fatalf("versioned delete of a missing row: %v", err)
+	}
+	f.queueExec(0, 0)
+	f.queueRows([]string{"deleted_at"})
+	if err := Delete(ctx, db, &Sub{ID: 99}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("versionless delete of a missing row: %v", err)
+	}
+}
+
 func TestSoftDeleteFilterModes(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()

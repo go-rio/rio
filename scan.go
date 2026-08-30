@@ -284,6 +284,9 @@ func (s *colScanner) SetUint64(v uint64) error {
 		if n, err = srcInt(v, s.f); err == nil {
 			err = storeInt(s.f, p, bits, n)
 		}
+	case scanFloat:
+		// Mirrors Scan(uint64(v)): srcFloat widens every integer to float64.
+		err = storeFloat(s.f, p, bits, float64(v))
 	default:
 		return s.sinkSlow(v)
 	}
@@ -479,6 +482,20 @@ func (s *colScanner) scanNull() error {
 
 func (s *colScanner) slowScanner(src any) error {
 	f := s.f
+	// rio owns the null-time types' encoding on both sides: the write path
+	// binds the dialect's text form, so a text column (SQLite TEXT, or an
+	// expression column with no decltype for the driver to convert) must
+	// parse back here — sql.NullTime's own Scan rejects strings.
+	if f.typ == nullTimeType || f.typ == nullTimeGenericType {
+		switch src.(type) {
+		case string, []byte:
+			t, err := srcTime(src, f)
+			if err != nil {
+				return err
+			}
+			src = t
+		}
+	}
 	p := unsafe.Add(s.base, f.offset)
 	v := reflect.NewAt(f.typ, p)
 	if sc, ok := v.Interface().(sql.Scanner); ok {
@@ -731,6 +748,11 @@ func storeBytes(p unsafe.Pointer, v []byte) {
 
 func storeJSON(f *field, p unsafe.Pointer, data []byte) error {
 	dst := reflect.NewAt(f.typ, p)
+	// Unmarshal merges into a non-nil map and overwrites only the keys
+	// present in the JSON of a struct. Scan-back targets (Upsert reloading
+	// the winning row into the caller's struct) still hold the caller's
+	// previous value, which would blend with what the database stored.
+	dst.Elem().SetZero()
 	if err := json.Unmarshal(data, dst.Interface()); err != nil {
 		return fmt.Errorf("rio: column %q: decoding JSON into %s: %w", f.column, f.typ, err)
 	}
@@ -810,6 +832,14 @@ func srcUint(src any, f *field) (uint64, error) {
 	switch v := src.(type) {
 	case int64:
 		return uintFromInt64(f, v)
+	case int:
+		return uintFromInt64(f, int64(v))
+	case int32:
+		return uintFromInt64(f, int64(v))
+	case int16:
+		return uintFromInt64(f, int64(v))
+	case int8:
+		return uintFromInt64(f, int64(v))
 	case uint64:
 		return v, nil
 	case uint:
@@ -845,6 +875,22 @@ func srcFloat(src any, f *field) (float64, error) {
 		return float64(v), nil
 	case int64:
 		return float64(v), nil
+	case int:
+		return float64(v), nil
+	case int32:
+		return float64(v), nil
+	case int16:
+		return float64(v), nil
+	case int8:
+		return float64(v), nil
+	case uint64:
+		return float64(v), nil
+	case uint32:
+		return float64(v), nil
+	case uint16:
+		return float64(v), nil
+	case uint8:
+		return float64(v), nil
 	case []byte:
 		fl, err := strconv.ParseFloat(string(v), 64)
 		if err != nil {
@@ -866,6 +912,11 @@ func srcBool(src any, f *field) (bool, error) {
 	case bool:
 		return v, nil
 	case int64:
+		return v != 0, nil
+	case uint8:
+		// ClickHouse Bool is UInt8 on the wire; Int8 mirrors it.
+		return v != 0, nil
+	case int8:
 		return v != 0, nil
 	case []byte:
 		return parseBool(string(v), f)
@@ -1101,20 +1152,26 @@ func scanScalarOne[T any](rows rows) (out T, found bool, err error) {
 	return out, true, rows.Err()
 }
 
+// synthField builds an ad-hoc scan field outside any plan — name and column
+// only label errors; the codec comes from the type alone, and the zero
+// offset makes the cell scan into a standalone buffer.
+func synthField(name, column string, t reflect.Type) (*field, error) {
+	f := &field{name: name, column: column, typ: t}
+	codec, err := codecFor(f)
+	if err != nil {
+		return nil, err
+	}
+	f.code = codec
+	return f, nil
+}
+
 func scalarField(t reflect.Type) (*field, error) {
 	if cached, ok := scalarFields.Load(t); ok {
 		result := cached.(*scalarFieldResult)
 		return result.field, result.err
 	}
-	f := &field{name: t.String(), column: "<scalar>", typ: t}
-	codec, err := codecFor(f)
-	result := &scalarFieldResult{field: f, err: err}
-	if err != nil {
-		result.field = nil
-	} else {
-		f.code = codec
-	}
-	actual, _ := scalarFields.LoadOrStore(t, result)
+	f, err := synthField(t.String(), "<scalar>", t)
+	actual, _ := scalarFields.LoadOrStore(t, &scalarFieldResult{field: f, err: err})
 	stored := actual.(*scalarFieldResult)
 	return stored.field, stored.err
 }
@@ -1184,10 +1241,7 @@ func bindArgFast(f *field, base unsafe.Pointer, b *binder) (any, bool, error) {
 		if bs == nil {
 			return nil, true, nil
 		}
-		if b.d.name() == "clickhouse" {
-			// clickhouse-go interpolates a []byte argument as an Array(UInt8)
-			// literal; String is ClickHouse's byte container, so byte
-			// payloads bind as strings there.
+		if b.d.caps().bindBytesAsString {
 			return string(bs), true, nil
 		}
 		return bs, true, nil
@@ -1308,8 +1362,7 @@ func bindArg(f *field, v reflect.Value, b *binder) (any, error) {
 		if err != nil {
 			return nil, fmt.Errorf("rio: field %s: encoding JSON: %w", f.name, err)
 		}
-		if b.d.name() == "clickhouse" {
-			// clickhouse-go interpolates []byte as an Array(UInt8) literal;
+		if b.d.caps().bindBytesAsString {
 			// JSON is UTF-8 text and must land in a String column as a string.
 			return string(data), nil
 		}
@@ -1381,8 +1434,7 @@ func bindArg(f *field, v reflect.Value, b *binder) (any, error) {
 			return bindOverflowUint(b.d, n)
 		}
 	}
-	if b.d.name() == "clickhouse" && v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-		// Byte payloads bind as strings on ClickHouse.
+	if b.d.caps().bindBytesAsString && v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 		return string(v.Bytes()), nil
 	}
 	return v.Interface(), nil

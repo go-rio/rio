@@ -68,7 +68,7 @@ func naiveRebind(p lexProfile, style bindStyle, query string, args []any) (strin
 				j := i + 1
 				for j < len(query) {
 					cj := query[j]
-					if cj == '_' || (cj >= 'a' && cj <= 'z') || (cj >= 'A' && cj <= 'Z') ||
+					if cj == '_' || cj >= 0x80 || (cj >= 'a' && cj <= 'z') || (cj >= 'A' && cj <= 'Z') ||
 						(j > i+1 && cj >= '0' && cj <= '9') {
 						j++
 						continue

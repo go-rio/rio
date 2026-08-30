@@ -343,6 +343,23 @@ func run(
 	return res, err
 }
 
+// runAffected executes a write through run and reports its affected-row
+// count; the write paths branch on that count, never on the raw Result.
+func runAffected(
+	ctx context.Context,
+	q Queryer,
+	op string,
+	model string,
+	sqlText string,
+	args []any,
+) (int64, error) {
+	res, err := run(ctx, q, op, model, sqlText, args)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // runQuery executes a row-returning statement through the shared pipeline.
 // The statement — and the row consumption its context governs — runs under
 // the context BeforeQuery returned (hooks.go). The returned finish callback

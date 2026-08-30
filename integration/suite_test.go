@@ -795,6 +795,56 @@ func runHardDelete(t *testing.T, db *rio.DB, dialect string) {
 	if remaining, err := rio.From[Gadget]().WithTrashed().Count(ctx, db); err != nil || remaining != 0 {
 		t.Fatalf("ForceDeleteAll must remove trashed rows too: remaining=%d err=%v", remaining, err)
 	}
+
+	// Delete and Restore are idempotent end-to-end: a second Delete keeps
+	// the original stamp, restoring a live row bumps nothing.
+	g := &Gadget{Name: "twice"}
+	if err := rio.Insert(ctx, db, g); err != nil {
+		t.Fatalf("insert gadget: %v", err)
+	}
+	if err := rio.Delete(ctx, db, g); err != nil {
+		t.Fatalf("first Delete: %v", err)
+	}
+	firstStamp := *g.DeletedAt
+	again := &Gadget{ID: g.ID, Name: "twice"}
+	if err := rio.Delete(ctx, db, again); err != nil {
+		t.Fatalf("repeat Delete must be idempotent: %v", err)
+	}
+	if again.DeletedAt == nil || !again.DeletedAt.Equal(firstStamp) {
+		t.Fatalf("repeat Delete must adopt the original stamp: got %v, want %v", again.DeletedAt, firstStamp)
+	}
+	if err := rio.Restore(ctx, db, g); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if err := rio.Restore(ctx, db, g); err != nil {
+		t.Fatalf("repeat Restore must be idempotent: %v", err)
+	}
+
+	// The versioned model keeps its version across the idempotent paths.
+	u := &User{Email: "idem@x.dev", Age: 30}
+	if err := rio.Insert(ctx, db, u); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	if err := rio.Delete(ctx, db, u); err != nil {
+		t.Fatalf("delete user: %v", err)
+	}
+	afterDelete := u.Version
+	if err := rio.Delete(ctx, db, u); err != nil {
+		t.Fatalf("repeat versioned Delete must be idempotent: %v", err)
+	}
+	if u.Version != afterDelete {
+		t.Fatalf("repeat Delete must not bump the version: %d -> %d", afterDelete, u.Version)
+	}
+	if err := rio.Restore(ctx, db, u); err != nil {
+		t.Fatalf("restore user: %v", err)
+	}
+	afterRestore := u.Version
+	if err := rio.Restore(ctx, db, u); err != nil {
+		t.Fatalf("repeat Restore must be idempotent: %v", err)
+	}
+	if u.Version != afterRestore || u.DeletedAt != nil {
+		t.Fatalf("repeat Restore must not bump the version: %d -> %d (deleted %v)", afterRestore, u.Version, u.DeletedAt)
+	}
 }
 
 func validateQueryTemplates(t *testing.T) {

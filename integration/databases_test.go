@@ -40,6 +40,48 @@ func TestSQLiteV02Suite(t *testing.T) {
 	runHardDelete(t, db, "sqlite")
 }
 
+// sql.NullTime round-trips through a TEXT column: the write side binds rio's
+// own text encoding, and without a DATETIME decltype the driver hands the
+// text straight back — the read side must parse it, not delegate to
+// NullTime.Scan (which rejects strings). Storage parity with time.Time no
+// longer depends on the column's declared type.
+func TestSQLiteNullTimeTextColumnRoundTrip(t *testing.T) {
+	db := sqliteDB(t)
+	ctx := context.Background()
+	if _, err := rio.Exec(ctx, db, "CREATE TABLE null_time_rows (id INTEGER PRIMARY KEY, maybe TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+
+	type nullTimeRow struct {
+		ID    int64
+		Maybe sql.NullTime
+	}
+	at := time.Date(2026, 7, 9, 3, 4, 5, 123456000, time.UTC)
+	if err := rio.Insert(ctx, db, &nullTimeRow{ID: 1, Maybe: sql.NullTime{Time: at, Valid: true}}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := rio.Insert(ctx, db, &nullTimeRow{ID: 2}); err != nil {
+		t.Fatalf("insert null: %v", err)
+	}
+
+	rows, err := rio.Raw[nullTimeRow]("SELECT id, maybe FROM null_time_rows ORDER BY id").All(ctx, db)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if !rows[0].Maybe.Valid || !rows[0].Maybe.Time.Equal(at) {
+		t.Fatalf("TEXT column must round-trip: %+v", rows[0].Maybe)
+	}
+	if rows[1].Maybe.Valid {
+		t.Fatalf("NULL must stay invalid: %+v", rows[1].Maybe)
+	}
+
+	// An expression column has no decltype either; MAX() carries the text.
+	got, err := rio.Raw[sql.NullTime]("SELECT MAX(maybe) FROM null_time_rows").First(ctx, db)
+	if err != nil || !got.Valid || !got.Time.Equal(at) {
+		t.Fatalf("expression column must parse too: %+v err=%v", got, err)
+	}
+}
+
 // TestSQLiteRawRowsStream is a leak smoke for RawQuery.Rows: stream a few rows,
 // break early, and prove the connection was returned by running more work on
 // the same single-connection in-memory database afterwards — a leaked cursor

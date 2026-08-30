@@ -269,12 +269,10 @@ func selectJoinRefs(
 func scanJoinRefs(rows rows, res *resolvedRel) (keys []any, vals []any, set map[any]struct{}, err error) {
 	defer mergeClose(rows, &err)
 	// res.fk is the target's PK — the type the join column's values are.
-	kf := &field{name: "join key", column: res.joinRef, typ: res.fk.typ}
-	codec, err := codecFor(kf)
+	kf, err := synthField("join key", res.joinRef, res.fk.typ)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	kf.code = codec
 	// The cell and its dest slot share one escaping box (see scanScalars).
 	var box struct {
 		cell colScanner
@@ -304,7 +302,12 @@ func scanJoinRefs(rows rows, res *resolvedRel) (keys []any, vals []any, set map[
 }
 
 // joinWriteTarget resolves the ManyToMany wiring and the owner's key value.
-func joinWriteTarget[T any](op string, db Queryer, row *T, relation string) (*plan, *relField, *resolvedRel, any, error) {
+func joinWriteTarget[T any](
+	op string,
+	db Queryer,
+	row *T,
+	relation string,
+) (*plan, *relField, *resolvedRel, any, error) {
 	p, err := planOf[T]()
 	if err != nil {
 		return nil, nil, nil, nil, err

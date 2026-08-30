@@ -191,11 +191,7 @@ func (q Query[T]) updateAll(
 	if err != nil {
 		return 0, err
 	}
-	res, err := run(ctx, db, hookOp, p.structName, sqlText, outArgs)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
+	return runAffected(ctx, db, hookOp, p.structName, sqlText, outArgs)
 }
 
 func (q Query[T]) forceDeleteAll(ctx context.Context, db Queryer, p *plan, state *queryState) (int64, error) {
@@ -217,11 +213,7 @@ func (q Query[T]) forceDeleteAll(ctx context.Context, db Queryer, p *plan, state
 	if err != nil {
 		return 0, err
 	}
-	res, err := run(ctx, db, "delete", p.structName, sqlText, outArgs)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
+	return runAffected(ctx, db, "delete", p.structName, sqlText, outArgs)
 }
 
 // checkSetOpShape rejects query clauses a portable set-based write cannot honor.
@@ -250,6 +242,15 @@ func checkSetOpShape(op string, s *queryState) error {
 	}
 	if len(s.orders) > 0 {
 		return fmt.Errorf("rio: %s cannot honor OrderBy (a set-based write has no row order); drop it", op)
+	}
+	if len(s.withs) > 0 || len(s.counts) > 0 {
+		return fmt.Errorf("rio: %s cannot honor With/WithCount (a set-based write returns no entities to load into); drop them", op)
+	}
+	if s.forUpdate {
+		return fmt.Errorf("rio: %s cannot honor ForUpdate (the write takes its own row locks); drop it", op)
+	}
+	if s.final {
+		return fmt.Errorf("rio: %s cannot honor Final (FINAL modifies reads, and ClickHouse rejects set-based writes anyway); drop it", op)
 	}
 	return nil
 }

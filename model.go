@@ -162,7 +162,17 @@ func (p *plan) addFields(t reflect.Type) error {
 		if st.winner != i {
 			continue // shadowed by a shallower field, exactly as a Go selector resolves
 		}
-		if r.opts.skip || r.flatten {
+		if r.opts.skip {
+			continue
+		}
+		if r.flatten {
+			// A role tag on a flattened embed would silently vanish — a pk
+			// that never became a key — so it is a plan error, not a no-op.
+			if opt := roleOptName(r.opts); opt != "" {
+				errs = append(errs, fmt.Errorf(
+					"field %s: %s does not apply to a flattened embedded struct; tag the embedded type's fields",
+					r.sf.Name, opt))
+			}
 			continue // flattened embeds contributed their inner fields in collect
 		}
 		sf, tag, opts := r.sf, r.tag, r.opts
@@ -183,8 +193,18 @@ func (p *plan) addFields(t reflect.Type) error {
 		if opts.countOf != "" {
 			// A count target is populated by WithCount, never mapped to a
 			// column of its own.
+			if tag != "" {
+				errs = append(errs, fmt.Errorf("field %s: countof targets take no column name", sf.Name))
+				continue
+			}
 			if sf.Type.Kind() != reflect.Int64 {
 				errs = append(errs, fmt.Errorf("field %s: countof targets must be int64, got %s", sf.Name, sf.Type))
+				continue
+			}
+			if prev, dup := p.counts[opts.countOf]; dup {
+				errs = append(errs, fmt.Errorf(
+					"fields %s and %s both declare countof:%s; a count has one target",
+					p.typ.FieldByIndex(prev).Name, sf.Name, opts.countOf))
 				continue
 			}
 			p.counts[opts.countOf] = r.index
@@ -467,6 +487,33 @@ func collectFields(t reflect.Type, prefix []int, baseOffset uintptr, raw *[]rawF
 			collectFields(sf.Type, index, r.offset, raw, errs)
 		}
 	}
+}
+
+// roleOptName names the first role option set on a tag, "" when none is set.
+func roleOptName(o tagOpts) string {
+	switch {
+	case o.pk:
+		return "pk"
+	case o.omitZero:
+		return "omitzero"
+	case o.version:
+		return "version"
+	case o.softDelete:
+		return "softdelete"
+	case o.noStamp:
+		return "nostamp"
+	case o.noAutoIncr:
+		return "noautoincr"
+	case o.fk != "":
+		return "fk"
+	case o.ref != "":
+		return "ref"
+	case o.join != "":
+		return "join"
+	case o.countOf != "":
+		return "countof"
+	}
+	return ""
 }
 
 func parseTag(sf reflect.StructField) (column string, opts tagOpts, err error) {

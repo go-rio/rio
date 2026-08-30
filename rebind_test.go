@@ -73,6 +73,8 @@ func TestRebind(t *testing.T) {
 		{"fresh dollar tag does quote", pgLex, bindDollar, "SELECT $y$ ? $y$", nil, "SELECT $y$ ? $y$", nil, ""},
 		{"existing $N passes through", pgLex, bindDollar, "SELECT $1 + $2", nil, "SELECT $1 + $2", nil, ""},
 		{"unterminated dollar quote", pgLex, bindDollar, "SELECT $$ ?", nil, "SELECT $$ ?", nil, ""},
+		{"non-ASCII dollar tag", pgLex, bindDollar, "SELECT $å$ ?? $å$ , ?", []any{1}, "SELECT $å$ ?? $å$ , $1", []any{1}, ""},
+		{"non-ASCII mixed tag", pgLex, bindDollar, "SELECT $café_1$x = ?$café_1$", nil, "SELECT $café_1$x = ?$café_1$", nil, ""},
 
 		// Double-quoted identifiers (strings on MySQL): skipped whole either way.
 		{"? inside double quotes", pgLex, bindDollar, `SELECT "a?b" , ?`, []any{1}, `SELECT "a?b" , $1`, []any{1}, ""},

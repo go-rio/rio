@@ -317,10 +317,16 @@ func (q Query[T]) Sole(ctx context.Context, db Queryer, args ...any) (*T, error)
 }
 
 // Count returns the number of matching rows. GroupBy and Having projections
-// are rejected; use Raw for those queries.
+// are rejected, and so are Limit/Offset — COUNT aggregates before LIMIT
+// applies, so honoring them needs a subquery; use Raw for those queries.
 func (q Query[T]) Count(ctx context.Context, db Queryer, args ...any) (int64, error) {
 	if len(q.s.groups) > 0 || len(q.s.havings) > 0 {
 		return 0, errors.New("rio: Count with GroupBy/Having is a projection (rows or groups?); use Raw")
+	}
+	if q.s.limitSet || q.s.offsetSet {
+		// Silently counting the whole match would answer a different
+		// question than the windowed query the caller described.
+		return 0, errors.New("rio: Count cannot honor Limit/Offset (COUNT aggregates before LIMIT applies); drop them, or count the window with Raw")
 	}
 	g := db.gram()
 	key := queryCacheKey{grammar: g, op: queryCacheCount}
@@ -794,7 +800,18 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 			return "", nil, err
 		}
 	case selectExists:
-		b = append(b, " LIMIT 1"...)
+		// One probe row decides the answer, so any Limit >= 1 collapses to
+		// LIMIT 1 — but Limit(0) means "no rows", exactly as it does on All,
+		// and Offset shifts which row must exist (paging probes ask "is
+		// there a row past this page"), so both render.
+		probe := *s
+		if !probe.limitSet || probe.limit > 1 {
+			probe.limit, probe.limitSet = 1, true
+		}
+		b, err = appendLimitOffset(b, d, &probe)
+		if err != nil {
+			return "", nil, err
+		}
 	}
 	// PostgreSQL rejects row locks on aggregate counts.
 	if s.forUpdate && shape != selectCount {
@@ -1108,17 +1125,16 @@ func normalizeArgs(d Dialect, args []any) ([]any, error) {
 			}
 			v = strconv.FormatUint(uint64(t), 10)
 		case []byte:
-			if d.name() != "clickhouse" {
+			if !d.caps().bindBytesAsString {
 				continue
 			}
-			// clickhouse-go otherwise interpolates []byte as Array(UInt8).
 			if t == nil {
 				v = nil
 			} else {
 				v = string(t)
 			}
 		default:
-			if d.name() != "clickhouse" {
+			if !d.caps().bindBytesAsString {
 				continue
 			}
 			nv, ok := chByteArg(a)

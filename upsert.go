@@ -136,61 +136,20 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 		func() []byte {
 			b := renderInsertHead(g, p, cols)
 			b = appendInsertValues(b, d, len(cols))
-			if d.caps().conflictTarget {
-				b = appendConflictClause(b, d, &spec)
-				if spec.doNothing {
-					b = append(b, "DO NOTHING"...)
-				} else {
-					b = append(b, "DO UPDATE SET "...)
-					b = appendConflictSets(
-						b,
-						d,
-						table,
-						p,
-						update,
-						&spec,
-						"excluded",
-					)
-				}
-				if returning && !spec.doNothing {
-					b = appendReturning(b, d, table, p)
-				}
-				if returning && spec.doNothing && len(back) > 0 {
-					// DoNothing returns generated columns only for a fresh insert.
-					b = append(b, " RETURNING "...)
-					for i, f := range back {
-						if i > 0 {
-							b = append(b, ", "...)
-						}
-						b = d.quote(b, f.column)
+			b = appendConflictBranch(b, d, table, p, update, &spec)
+			// returning is false on MySQL, whose branch above ends the statement.
+			if returning && !spec.doNothing {
+				b = appendReturning(b, d, table, p)
+			}
+			if returning && spec.doNothing && len(back) > 0 {
+				// DoNothing returns generated columns only for a fresh insert.
+				b = append(b, " RETURNING "...)
+				for i, f := range back {
+					if i > 0 {
+						b = append(b, ", "...)
 					}
+					b = d.quote(b, f.column)
 				}
-				return b
-			}
-			// The DoUpdate row alias requires MySQL 8.0.19 or later.
-			if !spec.doNothing {
-				b = appendMySQLUpsertAlias(b)
-			}
-			b = append(b, " ON DUPLICATE KEY UPDATE "...)
-			if spec.doNothing {
-				// A no-op assignment still needs one mapped column.
-				col := p.fields[0].column
-				if len(p.pks) > 0 {
-					col = p.pks[0].column
-				}
-				b = d.quote(b, col)
-				b = append(b, " = "...)
-				b = d.quote(b, col)
-			} else {
-				b = appendConflictSets(
-					b,
-					d,
-					table,
-					p,
-					update,
-					&spec,
-					mysqlUpsertAlias,
-				)
 			}
 			return b
 		},
@@ -437,6 +396,38 @@ func upsertSpecKey(spec *upsertSpec, update []*field) upsertCacheKey {
 	}
 	key.overflow = byteString(b)
 	return key
+}
+
+// appendConflictBranch renders the dialect's conflict clause and update set:
+// ON CONFLICT … DO NOTHING/DO UPDATE on conflict-target dialects, otherwise
+// MySQL's ON DUPLICATE KEY UPDATE — where DoNothing still needs one no-op
+// assignment, keyed by the PK when the model has one. Upsert and UpsertAll
+// share this tail verbatim.
+func appendConflictBranch(b []byte, d Dialect, table string, p *plan, update []*field, spec *upsertSpec) []byte {
+	if d.caps().conflictTarget {
+		b = appendConflictClause(b, d, spec)
+		if spec.doNothing {
+			return append(b, "DO NOTHING"...)
+		}
+		b = append(b, "DO UPDATE SET "...)
+		return appendConflictSets(b, d, table, p, update, spec, "excluded")
+	}
+	// The DoUpdate row alias requires MySQL 8.0.19 or later.
+	if !spec.doNothing {
+		b = appendMySQLUpsertAlias(b)
+	}
+	b = append(b, " ON DUPLICATE KEY UPDATE "...)
+	if spec.doNothing {
+		// A no-op assignment still needs one mapped column.
+		col := p.fields[0].column
+		if len(p.pks) > 0 {
+			col = p.pks[0].column
+		}
+		b = d.quote(b, col)
+		b = append(b, " = "...)
+		return d.quote(b, col)
+	}
+	return appendConflictSets(b, d, table, p, update, spec, mysqlUpsertAlias)
 }
 
 func appendMySQLUpsertAlias(b []byte) []byte {

@@ -122,13 +122,7 @@ func Update[T any](ctx context.Context, db Queryer, row *T, cols ...string) erro
 			b = d.quote(b, f.column)
 			b = append(b, " = ?"...)
 		}
-		if p.version != nil {
-			b = append(b, ", "...)
-			b = d.quote(b, p.version.column)
-			b = append(b, " = "...)
-			b = d.quote(b, p.version.column)
-			b = append(b, " + 1"...)
-		}
+		b = appendVersionBump(b, d, p)
 		return appendPKWhereSQL(b, d, p)
 	})
 	if err != nil {
@@ -139,11 +133,7 @@ func Update[T any](ctx context.Context, db Queryer, row *T, cols ...string) erro
 	if err != nil {
 		return err
 	}
-	res, err := run(ctx, db, "update", p.structName, sqlText, args)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
+	n, err := runAffected(ctx, db, "update", p.structName, sqlText, args)
 	if err != nil {
 		return err
 	}
@@ -226,46 +216,34 @@ func Restore[T any](ctx context.Context, db Queryer, row *T) error {
 			b = d.quote(b, p.updated.column)
 			b = append(b, " = ?"...)
 		}
-		if p.version != nil {
-			b = append(b, ", "...)
-			b = d.quote(b, p.version.column)
-			b = append(b, " = "...)
-			b = d.quote(b, p.version.column)
-			b = append(b, " + 1"...)
-		}
-		return appendPKWhereSQL(b, d, p)
+		b = appendVersionBump(b, d, p)
+		b = appendPKWhereSQL(b, d, p)
+		// Only a trashed row restores: restoring a live row must not bump
+		// its version or refresh its UpdatedAt.
+		b = append(b, " AND "...)
+		b = d.quote(b, p.softDel.column)
+		return append(b, " IS NOT NULL"...)
 	})
 	if err != nil {
 		return err
 	}
 	bn := binder{d: d, now: now}
-	var args []any
+	args := make([]any, 0, 1+len(p.pks)+1) // updated_at + PKs + version
 	if p.updated != nil {
 		args = append(args, bn.time(now))
 	}
 	if args, err = appendKeyArgs(args, p, rv, &bn); err != nil {
 		return err
 	}
-	res, err := run(ctx, db, "update", p.structName, sqlText, args)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
+	n, err := runAffected(ctx, db, "update", p.structName, sqlText, args)
 	if err != nil {
 		return err
 	}
 	if n == 0 {
-		if p.version != nil {
-			return ErrStaleObject
-		}
-		missing, perr := zeroAffectedMeansMissing(ctx, db, p, rv)
-		if perr != nil {
-			return perr
-		}
-		if missing {
-			return ErrNotFound
-		}
-		// Restoring an already live row is idempotent.
+		// The IS NOT NULL predicate makes "already live" a zero-affected
+		// outcome on every dialect: idempotent success adopts the stored
+		// state instead of bumping the version or refreshing UpdatedAt.
+		return resolveSoftNoop(ctx, db, p, rv, false)
 	}
 	clearTime(p.softDel, rv)
 	if p.updated != nil {
@@ -303,46 +281,35 @@ func softDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 			b = d.quote(b, p.updated.column)
 			b = append(b, " = ?"...)
 		}
-		if p.version != nil {
-			b = append(b, ", "...)
-			b = d.quote(b, p.version.column)
-			b = append(b, " = "...)
-			b = d.quote(b, p.version.column)
-			b = append(b, " + 1"...)
-		}
-		return appendPKWhereSQL(b, d, p)
+		b = appendVersionBump(b, d, p)
+		b = appendPKWhereSQL(b, d, p)
+		// Only a live row deletes: an already-trashed row keeps its original
+		// deletion stamp (and version) instead of being re-stamped.
+		b = append(b, " AND "...)
+		b = d.quote(b, p.softDel.column)
+		return append(b, " IS NULL"...)
 	})
 	if err != nil {
 		return err
 	}
 	bn := binder{d: d, now: now}
-	args := []any{bn.time(now)}
+	args := make([]any, 0, 2+len(p.pks)+1) // deleted_at + updated_at + PKs + version
+	args = append(args, bn.time(now))
 	if p.updated != nil {
 		args = append(args, bn.time(now))
 	}
 	if args, err = appendKeyArgs(args, p, rv, &bn); err != nil {
 		return err
 	}
-	res, err := run(ctx, db, "delete", p.structName, sqlText, args)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
+	n, err := runAffected(ctx, db, "delete", p.structName, sqlText, args)
 	if err != nil {
 		return err
 	}
 	if n == 0 {
-		if p.version != nil {
-			return ErrStaleObject
-		}
-		missing, perr := zeroAffectedMeansMissing(ctx, db, p, rv)
-		if perr != nil {
-			return perr
-		}
-		if missing {
-			return ErrNotFound
-		}
-		// A same-instant repeated delete is idempotent.
+		// The IS NULL predicate makes "already trashed" a zero-affected
+		// outcome on every dialect: idempotent success adopts the stored
+		// stamp — re-stamping would erase the original deletion time.
+		return resolveSoftNoop(ctx, db, p, rv, true)
 	}
 	setTime(p.softDel, rv, now)
 	if p.updated != nil {
@@ -382,11 +349,7 @@ func hardDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 	if err != nil {
 		return err
 	}
-	res, err := run(ctx, db, "delete", p.structName, sqlText, args)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
+	n, err := runAffected(ctx, db, "delete", p.structName, sqlText, args)
 	if err != nil {
 		return err
 	}
@@ -804,6 +767,19 @@ func setBits(p *plan, fields []*field) (uint64, bool) {
 // appendPKWhereSQL renders the WHERE pk [AND version] tail, placeholders in
 // unified ? form — the render half of appendPKWhere, cacheable per grammar.
 func appendPKWhereSQL(b []byte, d Dialect, p *plan) []byte {
+	b = appendPKOnlyWhere(b, d, p)
+	if p.version != nil {
+		b = append(b, " AND "...)
+		b = d.quote(b, p.version.column)
+		b = append(b, " = ?"...)
+	}
+	return b // still in unified ? form; crudSQL rebinds the whole statement
+}
+
+// appendPKOnlyWhere renders the primary-key predicate without the version
+// clause appendPKWhereSQL adds: probes ask about the row itself, not the
+// caller's snapshot of it.
+func appendPKOnlyWhere(b []byte, d Dialect, p *plan) []byte {
 	for i, pk := range p.pks {
 		if i == 0 {
 			b = append(b, " WHERE "...)
@@ -813,17 +789,11 @@ func appendPKWhereSQL(b []byte, d Dialect, p *plan) []byte {
 		b = d.quote(b, pk.column)
 		b = append(b, " = ?"...)
 	}
-	if p.version != nil {
-		b = append(b, " AND "...)
-		b = d.quote(b, p.version.column)
-		b = append(b, " = ?"...)
-	}
-	return b // still in unified ? form; crudSQL rebinds the whole statement
+	return b
 }
 
 // zeroAffectedMeansMissing distinguishes a missing MySQL row from an
-// idempotent versionless update. Its locking probe must use the same current
-// read semantics as UPDATE under InnoDB REPEATABLE READ.
+// idempotent versionless update.
 func zeroAffectedMeansMissing(ctx context.Context, db Queryer, p *plan, rv reflect.Value) (bool, error) {
 	g := db.gram()
 	if g.d.name() != "mysql" {
@@ -834,15 +804,14 @@ func zeroAffectedMeansMissing(ctx context.Context, db Queryer, p *plan, rv refle
 		b := make([]byte, 0, 96)
 		b = append(b, "SELECT 1 FROM "...)
 		b = d.quote(b, g.table(p))
-		b = appendPKWhereSQL(b, d, p) // version is nil on this path: PKs only
-		// MySQL current-read probe; autocommit releases the lock immediately.
-		return append(b, " LIMIT 1 FOR UPDATE"...)
+		b = appendPKOnlyWhere(b, d, p)
+		return appendCurrentReadProbeTail(b, d)
 	})
 	if err != nil {
 		return false, err
 	}
 	bn := binder{d: d}
-	args, err := appendKeyArgs(nil, p, rv, &bn)
+	args, err := appendPKOnlyArgs(nil, p, rv, &bn)
 	if err != nil {
 		return false, err
 	}
@@ -857,18 +826,160 @@ func zeroAffectedMeansMissing(ctx context.Context, db Queryer, p *plan, rv refle
 	return !exists, err
 }
 
+// appendVersionBump renders ", version = version + 1" when the plan has an
+// optimistic-lock column; Update, Restore, and softDelete all bump it.
+func appendVersionBump(b []byte, d Dialect, p *plan) []byte {
+	if p.version == nil {
+		return b
+	}
+	b = append(b, ", "...)
+	b = d.quote(b, p.version.column)
+	b = append(b, " = "...)
+	b = d.quote(b, p.version.column)
+	return append(b, " + 1"...)
+}
+
+// appendCurrentReadProbeTail locks a zero-affected probe on MySQL: under
+// InnoDB REPEATABLE READ a plain SELECT reads the snapshot, and the answer
+// must match the UPDATE's current-read view; autocommit releases the lock
+// immediately. Other dialects read committed state without it.
+func appendCurrentReadProbeTail(b []byte, d Dialect) []byte {
+	if d.name() != "mysql" {
+		return b
+	}
+	return append(b, " LIMIT 1 FOR UPDATE"...)
+}
+
+// softProbeState is the row state probeSoftState scans back: the current
+// softdelete stamp and, when the model has one, the current version.
+type softProbeState struct {
+	found   bool
+	deleted reflect.Value // *T of the softdelete field's type
+	version reflect.Value // *T of the version field's type; zero Value without one
+}
+
+// trashed reports whether the probed stamp marks the row deleted: a non-nil
+// pointer, or (the NULL↔zero-time exception) a non-zero time.Time.
+func (st softProbeState) trashed() bool {
+	v := st.deleted.Elem()
+	if v.Kind() == reflect.Pointer {
+		return !v.IsNil()
+	}
+	return !v.Interface().(time.Time).IsZero()
+}
+
+// probeCell scans f into the standalone buffer dst (a *T): colScanner writes
+// to base+offset, so the field copy zeroes the struct offset.
+func probeCell(f *field, dst reflect.Value) *colScanner {
+	cf := *f
+	cf.offset = 0
+	return &colScanner{f: &cf, base: dst.UnsafePointer()}
+}
+
+// probeSoftState reads the softdelete stamp (and version) by primary key —
+// primary key only, never the caller's version: the probe asks about the row,
+// not the caller's snapshot of it. It serves the cold zero-affected paths of
+// Delete and Restore, whose trash predicates make "already in the target
+// state" a zero-matched outcome on every dialect.
+func probeSoftState(ctx context.Context, db Queryer, p *plan, rv reflect.Value) (softProbeState, error) {
+	g := db.gram()
+	d := g.d
+	sqlText, err := crudSQL(g, p, "softprobe", 0, true, func() []byte {
+		b := make([]byte, 0, 128)
+		b = append(b, "SELECT "...)
+		b = d.quote(b, p.softDel.column)
+		if p.version != nil {
+			b = append(b, ", "...)
+			b = d.quote(b, p.version.column)
+		}
+		b = append(b, " FROM "...)
+		b = d.quote(b, g.table(p))
+		b = appendPKOnlyWhere(b, d, p)
+		return appendCurrentReadProbeTail(b, d)
+	})
+	if err != nil {
+		return softProbeState{}, err
+	}
+	bn := binder{d: d}
+	args, err := appendPKOnlyArgs(nil, p, rv, &bn)
+	if err != nil {
+		return softProbeState{}, err
+	}
+	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
+	if err != nil {
+		return softProbeState{}, err
+	}
+	st := softProbeState{deleted: reflect.New(p.softDel.typ)}
+	cells := []any{probeCell(p.softDel, st.deleted)}
+	if p.version != nil {
+		st.version = reflect.New(p.version.typ)
+		cells = append(cells, probeCell(p.version, st.version))
+	}
+	if rows.Next() {
+		st.found = true
+		err = rows.Scan(cells...)
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	mergeClose(rows, &err)
+	finishQuery(finish, err)
+	if err != nil {
+		return softProbeState{}, err
+	}
+	return st, nil
+}
+
+// resolveSoftNoop resolves a zero-affected soft write: it adopts the stored
+// state when the row is already in the wanted trash state (idempotent
+// success), and otherwise reports the version conflict or the missing row.
+func resolveSoftNoop(ctx context.Context, db Queryer, p *plan, rv reflect.Value, wantTrashed bool) error {
+	st, err := probeSoftState(ctx, db, p, rv)
+	if err != nil {
+		return err
+	}
+	if st.found && st.trashed() == wantTrashed {
+		adoptSoftState(p, rv, st)
+		return nil
+	}
+	if p.version != nil {
+		return ErrStaleObject
+	}
+	return ErrNotFound
+}
+
+// adoptSoftState writes the probed stamp and version into the caller's
+// struct, so the idempotent paths keep the invariant that the struct holds
+// exactly what the database stores.
+func adoptSoftState(p *plan, rv reflect.Value, st softProbeState) {
+	rv.FieldByIndex(p.softDel.index).Set(st.deleted.Elem())
+	if p.version != nil {
+		rv.FieldByIndex(p.version.index).Set(st.version.Elem())
+	}
+}
+
 // appendKeyArgs binds the PK (+version) values matching appendPKWhereSQL.
 func appendKeyArgs(args []any, p *plan, rv reflect.Value, b *binder) ([]any, error) {
-	base := rv.Addr().UnsafePointer()
-	for _, pk := range p.pks {
-		a, err := fieldValue(pk, base, rv, b)
+	args, err := appendPKOnlyArgs(args, p, rv, b)
+	if err != nil {
+		return nil, err
+	}
+	if p.version != nil {
+		a, err := fieldValue(p.version, rv.Addr().UnsafePointer(), rv, b)
 		if err != nil {
 			return nil, err
 		}
 		args = append(args, a)
 	}
-	if p.version != nil {
-		a, err := fieldValue(p.version, base, rv, b)
+	return args, nil
+}
+
+// appendPKOnlyArgs binds just the primary-key values, matching
+// appendPKOnlyWhere.
+func appendPKOnlyArgs(args []any, p *plan, rv reflect.Value, b *binder) ([]any, error) {
+	base := rv.Addr().UnsafePointer()
+	for _, pk := range p.pks {
+		a, err := fieldValue(pk, base, rv, b)
 		if err != nil {
 			return nil, err
 		}

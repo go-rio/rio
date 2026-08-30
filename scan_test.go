@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -232,6 +233,32 @@ func TestEntityColumnMismatchErrors(t *testing.T) {
 			t.Fatalf("err = %v", err)
 		}
 	})
+}
+
+// clickhouse-go bypasses database/sql's canonical value set, so every native
+// integer width must convert in every direction: into uint (sign-checked),
+// float, and — for UInt8/Int8, ClickHouse's Bool on the wire — bool.
+func TestSrcConvertersAcceptNativeWidths(t *testing.T) {
+	f := &field{name: "N", column: "n", typ: reflect.TypeFor[uint64]()}
+
+	if n, err := srcUint(int32(7), f); err != nil || n != 7 {
+		t.Fatalf("srcUint(int32): %d %v", n, err)
+	}
+	if _, err := srcUint(int8(-1), f); err == nil {
+		t.Fatal("a negative int8 into a uint field must refuse")
+	}
+	if fl, err := srcFloat(int16(3), f); err != nil || fl != 3 {
+		t.Fatalf("srcFloat(int16): %v %v", fl, err)
+	}
+	if fl, err := srcFloat(uint32(9), f); err != nil || fl != 9 {
+		t.Fatalf("srcFloat(uint32): %v %v", fl, err)
+	}
+	if b, err := srcBool(uint8(1), f); err != nil || !b {
+		t.Fatalf("srcBool(uint8): %v %v", b, err)
+	}
+	if b, err := srcBool(int8(0), f); err != nil || b {
+		t.Fatalf("srcBool(int8): %v %v", b, err)
+	}
 }
 
 // Codex audit #2, read side: scanOne stops after its single row, so the

@@ -46,6 +46,11 @@ type dialectCaps struct {
 	autoIncrPK     bool          // the database can generate the conventional ID
 	stmtPrepare    bool          // the driver prepares arbitrary statements (stmt cache)
 	finalTable     bool          // FROM t FINAL merges row versions at read (ClickHouse)
+
+	// bindBytesAsString rebinds []byte arguments as strings: clickhouse-go
+	// interpolates a []byte as an Array(UInt8) literal, while String is
+	// ClickHouse's byte container.
+	bindBytesAsString bool
 }
 
 // Built-in dialects. Driver modules re-export the matching value from their
@@ -200,7 +205,7 @@ func (clickhouseDialect) caps() dialectCaps {
 	// is interpolated into the statement client-side: 8192 keeps IN
 	// expansions under the server's default 256 KiB max_query_size, while
 	// multi-VALUES INSERT data is exempt from that limit entirely.
-	return dialectCaps{forUpdate: forUpdateReject, maxBindParams: 8192, finalTable: true}
+	return dialectCaps{forUpdate: forUpdateReject, maxBindParams: 8192, finalTable: true, bindBytesAsString: true}
 }
 
 func (clickhouseDialect) quote(b []byte, ident string) []byte {
