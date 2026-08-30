@@ -33,6 +33,16 @@ type QueryEvent struct {
 	// (row-returning queries, or the driver failed to report it — the
 	// failure is then in Err). After only.
 	RowsAffected int64
+	// RowsReturned is how many rows the statement handed back through row
+	// consumption, -1 for statements that return none (writes, transaction
+	// control). Count and Exists report their result-set rows (one), not
+	// the value they carry. After only.
+	RowsReturned int64
+	// Phase distinguishes the statements one logical operation issues: ""
+	// for the operation's main statement, "preload" and "count" for the
+	// relation queries With and WithCount add, "probe" for the internal
+	// zero-affected write probes.
+	Phase string
 }
 
 // QueryHook observes statement execution. The context BeforeQuery returns is
@@ -73,13 +83,20 @@ func (c *config) beforeQuery(ctx context.Context, e *QueryEvent) context.Context
 	return ctx
 }
 
-func (c *config) afterQuery(ctx context.Context, e *QueryEvent, start time.Time, err error, rows int64) {
+func (c *config) afterQuery(
+	ctx context.Context,
+	e *QueryEvent,
+	start time.Time,
+	err error,
+	affected, returned int64,
+) {
 	if len(c.hooks) == 0 {
 		return
 	}
 	e.Err = err
 	e.Duration = time.Since(start)
-	e.RowsAffected = rows
+	e.RowsAffected = affected
+	e.RowsReturned = returned
 	for _, v := range slices.Backward(c.hooks) {
 		v.AfterQuery(ctx, e)
 	}

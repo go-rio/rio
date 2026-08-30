@@ -2,8 +2,10 @@ package rio
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
+	"weak"
 )
 
 type queryCache struct {
@@ -22,8 +24,11 @@ const (
 	queryCachePluck
 )
 
+// queryCacheKey identifies one rendered shape: the executing handle's
+// grammar (weakly, so a package-level Must query never pins a closed
+// handle's grammar and crud cache), the terminal, and Pluck's column.
 type queryCacheKey struct {
-	grammar *grammar
+	grammar weak.Pointer[grammar]
 	op      queryCacheOp
 	column  string
 }
@@ -60,7 +65,7 @@ func (c *queryCache) load(key queryCacheKey, d Dialect, execArgs []any) (*cached
 
 func (c *queryCache) store(
 	key queryCacheKey,
-	d Dialect,
+	g *grammar,
 	p *plan,
 	original *queryState,
 	execArgs []any,
@@ -70,12 +75,23 @@ func (c *queryCache) store(
 	if c == nil || hasExpandableExecArg(execArgs) {
 		return sqlText, args, nil
 	}
+	d := g.d
 	entry, ok := newCachedQuery(d, p, original, execArgs, sqlText, args)
 	if !ok {
 		return sqlText, args, nil
 	}
 	actual, loaded := c.entries.LoadOrStore(key, entry)
 	if !loaded {
+		// The weak key alone leaves a dead grammar's entry in the map, so the
+		// first store arms a cleanup: when the grammar is collected, drop its
+		// entry. The cleanup holds the cache weakly too — a discarded Query
+		// must not live until every handle it ever ran on dies.
+		cache := weak.Make(c)
+		runtime.AddCleanup(g, func(k queryCacheKey) {
+			if qc := cache.Value(); qc != nil {
+				qc.entries.Delete(k)
+			}
+		}, key)
 		return sqlText, args, nil
 	}
 	winner := actual.(*cachedQuery)
@@ -259,6 +275,6 @@ func prepareCachedSelect[T any](
 	if err != nil {
 		return nil, queryState{}, "", nil, err
 	}
-	sqlText, args, err = cache.store(key, g.d, p, original, execArgs, sqlText, args)
+	sqlText, args, err = cache.store(key, g, p, original, execArgs, sqlText, args)
 	return p, state, sqlText, args, err
 }

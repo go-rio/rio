@@ -3,6 +3,7 @@ package rio
 import (
 	"sync"
 	"time"
+	"weak"
 )
 
 // config carries the per-DB settings frozen at New time.
@@ -83,6 +84,12 @@ type grammar struct {
 	d          Dialect
 	tableNamer func(string) string
 
+	// weakSelf keys Must-query render caches without pinning the grammar:
+	// a package-level Query outlives any one handle, and a strong key would
+	// keep every closed handle's grammar — and its crud cache — reachable
+	// forever. Made once here so the hot path never calls weak.Make.
+	weakSelf weak.Pointer[grammar]
+
 	// crud caches rendered entity-CRUD SQL by crudKey.
 	crud sync.Map
 }
@@ -143,5 +150,7 @@ func defaultConfig() *config {
 }
 
 func newGrammar(d Dialect, cfg *config) *grammar {
-	return &grammar{d: d, tableNamer: cfg.tableNamer}
+	g := &grammar{d: d, tableNamer: cfg.tableNamer}
+	g.weakSelf = weak.Make(g)
+	return g
 }

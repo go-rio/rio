@@ -1061,9 +1061,9 @@ func mergeClose(rows rows, err *error) {
 	}
 }
 
-func finishRows(rows rows, finish func(error), err error) error {
+func finishRows(rows rows, finish func(error, int64), err error, returned int64) error {
 	mergeClose(rows, &err)
-	finishQuery(finish, err)
+	finishQuery(finish, err, returned)
 	return err
 }
 

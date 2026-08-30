@@ -296,7 +296,7 @@ func observe(
 	hctx := cfg.beforeQuery(ctx, ev)
 	start := time.Now()
 	err := translateErr(fn(hctx), cfg, d)
-	cfg.afterQuery(hctx, ev, start, err, -1)
+	cfg.afterQuery(hctx, ev, start, err, -1, -1)
 	return err
 }
 
@@ -339,7 +339,7 @@ func run(
 			hookErr = aerr
 		}
 	}
-	cfg.afterQuery(hctx, ev, start, hookErr, rows)
+	cfg.afterQuery(hctx, ev, start, hookErr, rows, -1)
 	return res, err
 }
 
@@ -364,8 +364,8 @@ func runAffected(
 // The statement — and the row consumption its context governs — runs under
 // the context BeforeQuery returned (hooks.go). The returned finish callback
 // (nil without hooks — the hot path stays allocation-free) fires AfterQuery
-// once the rows are consumed, so hooks see scan errors and a duration that
-// includes row consumption.
+// once the rows are consumed, so hooks see scan errors, the returned row
+// count, and a duration that includes row consumption.
 func runQuery(
 	ctx context.Context,
 	q Queryer,
@@ -373,7 +373,22 @@ func runQuery(
 	model string,
 	sqlText string,
 	args []any,
-) (rows, func(error), error) {
+) (rows, func(error, int64), error) {
+	return runQueryPhase(ctx, q, "", op, model, sqlText, args)
+}
+
+// runQueryPhase is runQuery for the secondary statements a logical operation
+// issues — preloads, WithCount queries, write probes — labeled so hooks can
+// group them under the main statement.
+func runQueryPhase(
+	ctx context.Context,
+	q Queryer,
+	phase string,
+	op string,
+	model string,
+	sqlText string,
+	args []any,
+) (rows, func(error, int64), error) {
 	cfg := q.conf()
 	if len(cfg.hooks) == 0 {
 		rs, err := q.eng().query(ctx, sqlText, args)
@@ -381,6 +396,7 @@ func runQuery(
 	}
 	ev := &QueryEvent{
 		Op:    op,
+		Phase: phase,
 		Model: model,
 		Query: sqlText,
 		Args:  args,
@@ -390,24 +406,35 @@ func runQuery(
 	rs, err := q.eng().query(hctx, sqlText, args)
 	err = translateErr(err, cfg, q.gram().d)
 	if err != nil {
-		cfg.afterQuery(hctx, ev, start, err, -1)
+		cfg.afterQuery(hctx, ev, start, err, -1, -1)
 		return nil, nil, err
 	}
-	finish := func(scanErr error) {
-		cfg.afterQuery(hctx, ev, start, scanErr, -1)
+	finish := func(scanErr error, returned int64) {
+		cfg.afterQuery(hctx, ev, start, scanErr, -1, returned)
 	}
 	return rs, finish, nil
 }
 
+// oneIf converts a single-row outcome into its consumed-row count: one when
+// the row was scanned, zero otherwise (a miss consumed nothing, and a failed
+// scan's count is not meaningful).
+func oneIf(scanned bool) int64 {
+	if scanned {
+		return 1
+	}
+	return 0
+}
+
 // finishQuery fires a runQuery finish callback, tolerating the no-hook nil.
-// A miss (ErrNotFound) is a successfully executed query, not a failure —
-// telemetry would otherwise count every First/Find miss as an error.
-func finishQuery(finish func(error), err error) {
+// returned is the consumed row count. A miss (ErrNotFound) is a successfully
+// executed query, not a failure — telemetry would otherwise count every
+// First/Find miss as an error.
+func finishQuery(finish func(error, int64), err error, returned int64) {
 	if finish == nil {
 		return
 	}
 	if errors.Is(err, ErrNotFound) {
 		err = nil
 	}
-	finish(err)
+	finish(err, returned)
 }

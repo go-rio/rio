@@ -105,9 +105,10 @@ func (r RawQuery[T]) Rows(ctx context.Context, db Queryer) iter.Seq2[T, error] {
 			return
 		}
 		finished := false
+		var yielded int64
 		defer func() {
 			if !finished {
-				_ = finishRows(rows, finish, nil)
+				_ = finishRows(rows, finish, nil, yielded)
 			}
 		}()
 
@@ -125,7 +126,7 @@ func (r RawQuery[T]) Rows(ctx context.Context, db Queryer) iter.Seq2[T, error] {
 		}
 		if err != nil {
 			finished = true
-			err = finishRows(rows, finish, err)
+			err = finishRows(rows, finish, err, 0)
 			yield(zero, err)
 			return
 		}
@@ -136,19 +137,20 @@ func (r RawQuery[T]) Rows(ctx context.Context, db Queryer) iter.Seq2[T, error] {
 			row = zero
 			if err := rs.scan(rows, unsafe.Pointer(&row)); err != nil {
 				finished = true
-				err = finishRows(rows, finish, err)
+				err = finishRows(rows, finish, err, yielded)
 				yield(zero, err)
 				return
 			}
+			yielded++
 			if !yield(row, nil) {
 				finished = true
-				_ = finishRows(rows, finish, nil)
+				_ = finishRows(rows, finish, nil, yielded)
 				return
 			}
 		}
 		err = rows.Err()
 		finished = true
-		err = finishRows(rows, finish, err)
+		err = finishRows(rows, finish, err, yielded)
 		if err != nil {
 			yield(zero, err)
 		}
@@ -177,10 +179,10 @@ func (r RawQuery[T]) scan(ctx context.Context, db Queryer, maxRows int) ([]T, er
 	}
 	if scalar {
 		out, err := scanScalarsN[T](rows, maxRows)
-		finishQuery(finish, err)
+		finishQuery(finish, err, int64(len(out)))
 		return out, err
 	}
 	out, err := scanAllN[T](rows, p, true, maxRows)
-	finishQuery(finish, err)
+	finishQuery(finish, err, int64(len(out)))
 	return out, err
 }

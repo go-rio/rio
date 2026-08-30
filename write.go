@@ -69,7 +69,7 @@ func Insert[T any](ctx context.Context, db Queryer, row *T) error {
 			return err
 		}
 		err = scanBackCols(rows, back, unsafe.Pointer(row))
-		finishQuery(finish, err)
+		finishQuery(finish, err, oneIf(err == nil))
 		return err
 	}
 	res, err := run(ctx, db, "insert", p.structName, sqlText, args)
@@ -815,14 +815,14 @@ func zeroAffectedMeansMissing(ctx context.Context, db Queryer, p *plan, rv refle
 	if err != nil {
 		return false, err
 	}
-	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
+	rows, finish, err := runQueryPhase(ctx, db, "probe", "select", p.structName, sqlText, args)
 	if err != nil {
 		return false, err
 	}
 	exists := rows.Next()
 	err = rows.Err()
 	mergeClose(rows, &err) // the probe row leaves the result undrained
-	finishQuery(finish, err)
+	finishQuery(finish, err, oneIf(exists))
 	return !exists, err
 }
 
@@ -905,7 +905,7 @@ func probeSoftState(ctx context.Context, db Queryer, p *plan, rv reflect.Value) 
 	if err != nil {
 		return softProbeState{}, err
 	}
-	rows, finish, err := runQuery(ctx, db, "select", p.structName, sqlText, args)
+	rows, finish, err := runQueryPhase(ctx, db, "probe", "select", p.structName, sqlText, args)
 	if err != nil {
 		return softProbeState{}, err
 	}
@@ -923,7 +923,7 @@ func probeSoftState(ctx context.Context, db Queryer, p *plan, rv reflect.Value) 
 		err = rows.Err()
 	}
 	mergeClose(rows, &err)
-	finishQuery(finish, err)
+	finishQuery(finish, err, oneIf(st.found))
 	if err != nil {
 		return softProbeState{}, err
 	}

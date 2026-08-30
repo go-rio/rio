@@ -395,12 +395,13 @@ func loadRelation(
 			if err != nil {
 				return err
 			}
-			sqlRows, finish, err := runQuery(ctx, db, "select", target.structName, sqlText, args)
+			sqlRows, finish, err := runQueryPhase(ctx, db, "preload", "select", target.structName, sqlText, args)
 			if err != nil {
 				return err
 			}
+			before := buf.Len()
 			part, partKeys, err := scanRel(sqlRows, target, buf, keyed, res)
-			finishQuery(finish, err)
+			finishQuery(finish, err, int64(part.Len()-before))
 			if err != nil {
 				return err
 			}
@@ -903,12 +904,12 @@ func countRelation(ctx context.Context, db Queryer, owner *plan, name string, ro
 		if err != nil {
 			return err
 		}
-		sqlRows, finish, err := runQuery(ctx, db, "select", res.target.structName, sqlText, outArgs)
+		sqlRows, finish, err := runQueryPhase(ctx, db, "count", "select", res.target.structName, sqlText, outArgs)
 		if err != nil {
 			return err
 		}
-		err = scanCounts(sqlRows, res.ref.typ, byKey)
-		finishQuery(finish, err)
+		scanned, err := scanCounts(sqlRows, res.ref.typ, byKey)
+		finishQuery(finish, err, scanned)
 		if err != nil {
 			return err
 		}
@@ -921,13 +922,14 @@ func countRelation(ctx context.Context, db Queryer, owner *plan, name string, ro
 	return nil
 }
 
-// scanCounts drains (key, count) pairs into the grouping map.
-func scanCounts(rows rows, keyType reflect.Type, byKey map[any]int64) (err error) {
+// scanCounts drains (key, count) pairs into the grouping map and reports how
+// many it read.
+func scanCounts(rows rows, keyType reflect.Type, byKey map[any]int64) (scanned int64, err error) {
 	defer mergeClose(rows, &err)
 	keyBuf := reflect.New(keyType)
 	kf, err := synthField("count key", "<key>", keyType)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	// One escaping box carries the cell, the count slot, and their dest
 	// slice: a fresh variadic slice at the interface call would otherwise
@@ -941,11 +943,12 @@ func scanCounts(rows rows, keyType reflect.Type, byKey map[any]int64) (err error
 	box.dest[0], box.dest[1] = &box.cell, &box.n
 	for rows.Next() {
 		if err := rows.Scan(box.dest[:]...); err != nil {
-			return err
+			return scanned, err
 		}
 		byKey[canonKey(keyBuf.Elem())] = box.n
+		scanned++
 	}
-	return rows.Err()
+	return scanned, rows.Err()
 }
 
 // renderRelSelectLimited wraps the preload in a window subquery so the limit

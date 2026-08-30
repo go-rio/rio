@@ -99,7 +99,9 @@ Three mechanisms cover structure, rendering, and preparation:
      runtime slices and function-valued relation options bypass it. The same
      Query can run across DBs, transactions, dialects, table namers, and
      argument values. Dialect capabilities and driver execution remain runtime
-     checks.
+     checks. Cache entries key their handle weakly and are reclaimed when the
+     handle's grammar is collected, so a package-level query over churning
+     short-lived handles stays bounded.
    - Limit/Offset take int values and are not parameterizable; rebuild paged
      queries per page (builder cost is negligible).
 3. **`rio.WithStmtCache()`** (opt-in, **default off**) caches `*sql.Stmt` per

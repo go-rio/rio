@@ -260,7 +260,7 @@ func insertChunk[T any](
 			return err
 		}
 		ids, err := scanScalarsCap[int64](sqlRows, 0, len(rows))
-		finishQuery(finish, err)
+		finishQuery(finish, err, int64(len(ids)))
 		if err != nil {
 			return err
 		}

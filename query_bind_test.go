@@ -493,7 +493,7 @@ func BenchmarkQueryDeferredTemplate(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		key := queryCacheKey{grammar: g, op: queryCacheAll}
+		key := queryCacheKey{grammar: g.weakSelf, op: queryCacheAll}
 		_, _, sqlText, args, err := prepareCachedSelect[User](q.cache, key, g, &q.s, selectRows, execArgs)
 		if err != nil {
 			b.Fatal(err)

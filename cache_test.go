@@ -3,8 +3,10 @@ package rio
 import (
 	"context"
 	"database/sql/driver"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // chunkRow has three always-bound columns (noautoincr keeps explicit IDs off
@@ -361,5 +363,42 @@ func TestUpsertAllFullChunksCached(t *testing.T) {
 	logged := f.logged()
 	if got := logged[len(logged)-1]; got != "SENTINEL UPSERT CHUNK" {
 		t.Fatalf("full upsert chunk re-rendered instead of hitting the cache: %s", got)
+	}
+}
+
+// A package-level Must query outlives any one handle. The render cache keys
+// per grammar weakly and the first store arms a cleanup, so churning
+// short-lived handles (dynamic tenants, per-test databases) must neither
+// grow the cache without bound nor pin dead grammars and their crud caches.
+func TestMustCacheReleasesDeadHandles(t *testing.T) {
+	q := From[User]().Where("age > ?").Must()
+	ctx := context.Background()
+
+	for range 32 {
+		f := newFakeDB()
+		db := f.open()
+		f.queueRows(userCols)
+		if _, err := q.All(ctx, db, 1); err != nil {
+			t.Fatal(err)
+		}
+		_ = db.Close()
+	}
+
+	entries := func() int {
+		n := 0
+		q.cache.entries.Range(func(_, _ any) bool { n++; return true })
+		return n
+	}
+	if entries() < 32 {
+		t.Fatalf("expected one entry per handle before GC, got %d", entries())
+	}
+	// The cleanups run once the grammars are collected; poll a few cycles.
+	deadline := time.Now().Add(5 * time.Second)
+	for entries() > 2 && time.Now().Before(deadline) {
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := entries(); n > 2 {
+		t.Fatalf("dead handles must release their cache entries, %d remain", n)
 	}
 }

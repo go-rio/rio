@@ -172,7 +172,7 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 				return err
 			}
 			err = scanBackRow(rows, p, unsafe.Pointer(row))
-			finishQuery(finish, err)
+			finishQuery(finish, err, oneIf(err == nil))
 			return err
 		}
 		if returning && spec.doNothing && len(back) > 0 {
@@ -187,8 +187,8 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 			if err != nil {
 				return err
 			}
-			_, err = scanBackColsIfRow(rows, back, unsafe.Pointer(row))
-			finishQuery(finish, err)
+			scanned, err := scanBackColsIfRow(rows, back, unsafe.Pointer(row))
+			finishQuery(finish, err, oneIf(scanned))
 			return err
 		}
 		_, err = run(

@@ -98,7 +98,7 @@ func SyncRelation[T any, K any](ctx context.Context, db Queryer, row *T, relatio
 				return err
 			}
 			err = rows.Close()
-			finishQuery(finish, err)
+			finishQuery(finish, err, 0)
 			if err != nil {
 				return err
 			}
@@ -259,7 +259,7 @@ func selectJoinRefs(
 		return nil, nil, nil, err
 	}
 	keys, vals, set, err = scanJoinRefs(rows, res)
-	finishQuery(finish, err)
+	finishQuery(finish, err, int64(len(keys)))
 	if err != nil {
 		return nil, nil, nil, err
 	}

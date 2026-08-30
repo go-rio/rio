@@ -230,7 +230,7 @@ func (q Query[T]) First(ctx context.Context, db Queryer, args ...any) (*T, error
 		one.s.limit, one.s.limitSet = 1, true
 	}
 	g := db.gram()
-	key := queryCacheKey{grammar: g, op: queryCacheFirst}
+	key := queryCacheKey{grammar: g.weakSelf, op: queryCacheFirst}
 	p, state, sqlText, bound, err := prepareCachedSelect[T](
 		one.cache,
 		key,
@@ -254,7 +254,7 @@ func (q Query[T]) First(ctx context.Context, db Queryer, args ...any) (*T, error
 		return nil, err
 	}
 	out, err := scanOne[T](rows, p)
-	finishQuery(finish, err)
+	finishQuery(finish, err, oneIf(err == nil))
 	if err != nil {
 		return nil, err
 	}
@@ -276,7 +276,7 @@ func (q Query[T]) Sole(ctx context.Context, db Queryer, args ...any) (*T, error)
 		probe.s.limit, probe.s.limitSet = 2, true
 	}
 	g := db.gram()
-	key := queryCacheKey{grammar: g, op: queryCacheSole}
+	key := queryCacheKey{grammar: g.weakSelf, op: queryCacheSole}
 	p, state, sqlText, bound, err := prepareCachedSelect[T](
 		probe.cache,
 		key,
@@ -300,7 +300,7 @@ func (q Query[T]) Sole(ctx context.Context, db Queryer, args ...any) (*T, error)
 		return nil, err
 	}
 	rows, err := scanAllN[T](sqlRows, p, false, 2)
-	finishQuery(finish, err)
+	finishQuery(finish, err, int64(len(rows)))
 	if err != nil {
 		return nil, err
 	}
@@ -329,7 +329,7 @@ func (q Query[T]) Count(ctx context.Context, db Queryer, args ...any) (int64, er
 		return 0, errors.New("rio: Count cannot honor Limit/Offset (COUNT aggregates before LIMIT applies); drop them, or count the window with Raw")
 	}
 	g := db.gram()
-	key := queryCacheKey{grammar: g, op: queryCacheCount}
+	key := queryCacheKey{grammar: g.weakSelf, op: queryCacheCount}
 	p, _, sqlText, bound, err := prepareCachedSelect[T](
 		q.cache,
 		key,
@@ -353,7 +353,7 @@ func (q Query[T]) Count(ctx context.Context, db Queryer, args ...any) (int64, er
 		return 0, err
 	}
 	n, found, err := scanScalarOne[int64](rows)
-	finishQuery(finish, err)
+	finishQuery(finish, err, oneIf(found))
 	if err != nil {
 		return 0, err
 	}
@@ -366,7 +366,7 @@ func (q Query[T]) Count(ctx context.Context, db Queryer, args ...any) (int64, er
 // Exists reports whether any row matches.
 func (q Query[T]) Exists(ctx context.Context, db Queryer, args ...any) (bool, error) {
 	g := db.gram()
-	key := queryCacheKey{grammar: g, op: queryCacheExists}
+	key := queryCacheKey{grammar: g.weakSelf, op: queryCacheExists}
 	p, _, sqlText, bound, err := prepareCachedSelect[T](
 		q.cache,
 		key,
@@ -390,7 +390,7 @@ func (q Query[T]) Exists(ctx context.Context, db Queryer, args ...any) (bool, er
 		return false, err
 	}
 	_, found, err := scanScalarOne[int64](rows)
-	finishQuery(finish, err)
+	finishQuery(finish, err, oneIf(found))
 	if err != nil {
 		return false, err
 	}
@@ -408,7 +408,7 @@ func (q Query[T]) Rows(ctx context.Context, db Queryer, args ...any) iter.Seq2[T
 			return
 		}
 		g := db.gram()
-		key := queryCacheKey{grammar: g, op: queryCacheRows}
+		key := queryCacheKey{grammar: g.weakSelf, op: queryCacheRows}
 		p, _, sqlText, bound, err := prepareCachedSelect[T](
 			q.cache,
 			key,
@@ -434,16 +434,17 @@ func (q Query[T]) Rows(ctx context.Context, db Queryer, args ...any) iter.Seq2[T
 			return
 		}
 		finished := false
+		var yielded int64
 		defer func() {
 			if !finished {
-				_ = finishRows(rows, finish, nil)
+				_ = finishRows(rows, finish, nil, yielded)
 			}
 		}()
 
 		fields, err := entityFields(rows, p, 0)
 		if err != nil {
 			finished = true
-			err = finishRows(rows, finish, err)
+			err = finishRows(rows, finish, err, 0)
 			yield(zero, err)
 			return
 		}
@@ -454,19 +455,20 @@ func (q Query[T]) Rows(ctx context.Context, db Queryer, args ...any) iter.Seq2[T
 			row = zero
 			if err := rs.scan(rows, unsafe.Pointer(&row)); err != nil {
 				finished = true
-				err = finishRows(rows, finish, err)
+				err = finishRows(rows, finish, err, yielded)
 				yield(zero, err)
 				return
 			}
+			yielded++
 			if !yield(row, nil) {
 				finished = true
-				_ = finishRows(rows, finish, nil)
+				_ = finishRows(rows, finish, nil, yielded)
 				return
 			}
 		}
 		err = rows.Err()
 		finished = true
-		err = finishRows(rows, finish, err)
+		err = finishRows(rows, finish, err, yielded)
 		if err != nil {
 			yield(zero, err)
 		}
@@ -481,7 +483,7 @@ func (q Query[T]) Pluck[V any](ctx context.Context, db Queryer, column string, a
 		return nil, errors.New("rio: Pluck with GroupBy/Having is a projection; use Raw")
 	}
 	g := db.gram()
-	key := queryCacheKey{grammar: g, op: queryCachePluck, column: column}
+	key := queryCacheKey{grammar: g.weakSelf, op: queryCachePluck, column: column}
 	entry, outArgs, cached, err := q.cache.load(key, g.d, args)
 	if err != nil {
 		return nil, err
@@ -504,7 +506,7 @@ func (q Query[T]) Pluck[V any](ctx context.Context, db Queryer, column string, a
 		if err != nil {
 			return nil, err
 		}
-		sqlText, outArgs, err = q.cache.store(key, g.d, p, &q.s, args, sqlText, outArgs)
+		sqlText, outArgs, err = q.cache.store(key, g, p, &q.s, args, sqlText, outArgs)
 		if err != nil {
 			return nil, err
 		}
@@ -521,7 +523,7 @@ func (q Query[T]) Pluck[V any](ctx context.Context, db Queryer, column string, a
 		return nil, err
 	}
 	out, err := scanScalarsCap[V](rows, 0, queryCapacity(q.s.limit, q.s.limitSet))
-	finishQuery(finish, err)
+	finishQuery(finish, err, int64(len(out)))
 	return out, err
 }
 
@@ -595,13 +597,13 @@ func Find[T any](ctx context.Context, db Queryer, key ...any) (*T, error) {
 		return nil, err
 	}
 	out, err := scanOne[T](rows, p)
-	finishQuery(finish, err)
+	finishQuery(finish, err, oneIf(err == nil))
 	return out, err
 }
 
 func (q Query[T]) all(ctx context.Context, db Queryer, op queryCacheOp, args []any) ([]T, error) {
 	g := db.gram()
-	key := queryCacheKey{grammar: g, op: op}
+	key := queryCacheKey{grammar: g.weakSelf, op: op}
 	p, state, sqlText, bound, err := prepareCachedSelect[T](
 		q.cache,
 		key,
@@ -625,7 +627,7 @@ func (q Query[T]) all(ctx context.Context, db Queryer, op queryCacheOp, args []a
 		return nil, err
 	}
 	out, err := scanAllCap[T](rows, p, false, 0, queryCapacity(state.limit, state.limitSet))
-	finishQuery(finish, err)
+	finishQuery(finish, err, int64(len(out)))
 	if err != nil {
 		return nil, err
 	}
