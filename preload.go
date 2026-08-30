@@ -363,7 +363,11 @@ func loadRelation(
 
 	target := res.target
 	elemType := target.typ
-	buf := reflect.MakeSlice(reflect.SliceOf(elemType), 0, len(keys))
+	// The buffer lives in an addressable cell: scanRel grows it in place
+	// with Grow+SetLen instead of reflect.Append, which allocates on every
+	// row (it dominated the preload allocation profile).
+	buf := reflect.New(reflect.SliceOf(elemType)).Elem()
+	buf.Set(reflect.MakeSlice(reflect.SliceOf(elemType), 0, len(keys)))
 	var bufKeys []any
 
 	if len(keys) > 0 {
@@ -433,17 +437,22 @@ func loadRelation(
 	} else {
 		// res.fk is the child-side column for HasMany/HasOne and the
 		// target-side referenced column for BelongsTo — either way, the
-		// grouping key on the buffered rows.
+		// grouping key on the buffered rows. The canonical keys are kept for
+		// the placement pass below: canonKey boxes into an interface, and
+		// computing each row's key once instead of twice halves what was a
+		// quarter of the preload allocation profile.
 		keyField := res.fk
+		bufKeys = make([]any, buf.Len())
 		for i := 0; i < buf.Len(); i++ {
 			kv := buf.Index(i).FieldByIndex(keyField.index)
 			if kv.Kind() == reflect.Pointer {
 				if kv.IsNil() {
-					continue
+					continue // bufKeys[i] stays nil, skipped below
 				}
 				kv = kv.Elem()
 			}
 			k := canonKey(kv)
+			bufKeys[i] = k
 			span := byKey[k]
 			span.end++
 			byKey[k] = span
@@ -457,24 +466,12 @@ func loadRelation(
 		byKey[k] = span
 		offset += count
 	}
-	if rel.kind == relManyToMany {
+	{
+		// Both kinds now carry one canonical key per buffered row.
 		for i, k := range bufKeys {
-			span := byKey[k]
-			grouped[span.next] = i
-			span.next++
-			byKey[k] = span
-		}
-	} else {
-		keyField := res.fk
-		for i := 0; i < buf.Len(); i++ {
-			kv := buf.Index(i).FieldByIndex(keyField.index)
-			if kv.Kind() == reflect.Pointer {
-				if kv.IsNil() {
-					continue
-				}
-				kv = kv.Elem()
+			if k == nil {
+				continue // a NULL child-side key groups under no parent
 			}
-			k := canonKey(kv)
 			span := byKey[k]
 			grouped[span.next] = i
 			span.next++
@@ -492,9 +489,9 @@ func loadRelation(
 		}
 		switch rel.kind {
 		case relHasMany, relManyToMany:
-			out := reflect.MakeSlice(reflect.SliceOf(elemType), 0, len(matches))
-			for _, idx := range matches {
-				out = reflect.Append(out, buf.Index(idx)) // value copy per parent
+			out := reflect.MakeSlice(reflect.SliceOf(elemType), len(matches), len(matches))
+			for k, idx := range matches {
+				out.Index(k).Set(buf.Index(idx)) // value copy per child, no allocation
 			}
 			container.setLoaded(out)
 		case relHasOne, relBelongsTo:
@@ -644,10 +641,13 @@ func scanRel(
 	rs := newRowScanner(fields, extras)
 	defer rs.release()
 	keyBuf := reflect.New(res.ref.typ) // cell the key scans into
-	elemType := p.typ
 	for rows.Next() {
-		buf = reflect.Append(buf, reflect.Zero(elemType))
-		elem := buf.Index(buf.Len() - 1)
+		n := buf.Len()
+		if n == buf.Cap() {
+			buf.Grow(1) // amortized doubling, one allocation per growth step
+		}
+		buf.SetLen(n + 1)
+		elem := buf.Index(n)
 		if keyed {
 			keyCell.base = keyBuf.UnsafePointer()
 		}

@@ -20,6 +20,7 @@ type fieldCodec struct {
 	bits          int  // integer/float width for overflow checks
 	bindValuer    bool // bind the field value itself so Value() runs
 	bindPtrValuer bool // bind the field address so pointer-receiver Value() runs
+	nullTimeText  bool // sql.NullTime/sql.Null[time.Time]: parse rio's text form before Scan
 
 	// elemKind/elemBits are scanPtr's element strategy, classified at plan
 	// time like everything else: the per-cell path then allocates only the
@@ -485,8 +486,9 @@ func (s *colScanner) slowScanner(src any) error {
 	// rio owns the null-time types' encoding on both sides: the write path
 	// binds the dialect's text form, so a text column (SQLite TEXT, or an
 	// expression column with no decltype for the driver to convert) must
-	// parse back here — sql.NullTime's own Scan rejects strings.
-	if f.typ == nullTimeType || f.typ == nullTimeGenericType {
+	// parse back here — sql.NullTime's own Scan rejects strings. The type
+	// test happened at plan time, like every other classification.
+	if f.code.nullTimeText {
 		switch src.(type) {
 		case string, []byte:
 			t, err := srcTime(src, f)
@@ -608,7 +610,8 @@ func codecFor(f *field) (fieldCodec, error) {
 		// types are excluded: rio owns their encoding (bindArg normalizes and
 		// dialect-encodes the inner time), and their value-receiver Value()
 		// must not preempt that.
-		if t != nullTimeType && t != nullTimeGenericType {
+		c.nullTimeText = t == nullTimeType || t == nullTimeGenericType
+		if !c.nullTimeText {
 			if t.Implements(valuerType) {
 				c.bindValuer = true
 			} else if reflect.PointerTo(t).Implements(valuerType) {
