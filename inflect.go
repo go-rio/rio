@@ -95,8 +95,8 @@ func isConsonant(c byte) bool {
 	return isASCIILower(c)
 }
 
-// irregularPlural maps nouns whose plural no spelling rule can derive; it is
-// consulted before every rule (quiz → quizzes, not quizes).
+// irregularPlural maps nouns whose plural no spelling rule can derive; it
+// is consulted before every rule.
 var irregularPlural = map[string]string{
 	"person":      "people",
 	"child":       "children",
