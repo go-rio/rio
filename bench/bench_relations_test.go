@@ -16,6 +16,7 @@ type BenchAuthor struct {
 	ID        int64
 	Name      string
 	Posts     rio.HasMany[BenchArticle]
+	Reviews   rio.HasMany[BenchReview]
 	PostCount int64 `rio:",countof:Posts"`
 }
 
@@ -28,6 +29,14 @@ type BenchArticle struct {
 }
 
 func (BenchArticle) TableName() string { return "bench_articles" }
+
+type BenchReview struct {
+	ID            int64
+	BenchAuthorID int64
+	Stars         int64
+}
+
+func (BenchReview) TableName() string { return "bench_reviews" }
 
 func benchRelationDB(b *testing.B, name string) *sql.DB {
 	b.Helper()

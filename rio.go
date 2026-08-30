@@ -448,3 +448,112 @@ func finishQuery(finish func(error, int64), err error, returned int64) {
 	}
 	finish(err, returned)
 }
+
+// relStatement is one derived statement of a relation-loading layer — a
+// preload or count query — carrying its consumer. consume owns draining and
+// closing the rows and reports the consumed row count for hooks.
+type relStatement struct {
+	phase   string
+	model   string
+	sqlText string
+	args    []any
+	consume func(rows) (int64, error)
+}
+
+// runRelStatements executes one layer's derived statements: in a single
+// driver round trip when the channel batches (NativeBatcher), one by one
+// otherwise. Semantics are identical either way — the same per-statement
+// hook events, the same first-error-stops contract.
+func runRelStatements(ctx context.Context, q Queryer, stmts []relStatement) error {
+	if be, ok := q.eng().(batchEngine); ok && len(stmts) > 1 {
+		if err, handled := runRelBatch(ctx, q, be, stmts); handled {
+			return err
+		}
+	}
+	for i := range stmts {
+		st := &stmts[i]
+		rows, finish, err := runQueryPhase(ctx, q, st.phase, "select", st.model, st.sqlText, st.args)
+		if err != nil {
+			return err
+		}
+		n, err := st.consume(rows)
+		finishQuery(finish, err, n)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// runRelBatch is the batched leg. Hooks still see one event per statement;
+// since the round trip is shared, every BeforeQuery fires before the send and
+// their contexts chain into the one execution context — a tracing span from
+// any hook covers the whole batch — and each Duration runs from the send to
+// that statement's consumption.
+func runRelBatch(ctx context.Context, q Queryer, be batchEngine, stmts []relStatement) (error, bool) {
+	cfg := q.conf()
+	d := q.gram().d
+	batch := make([]BatchStatement, len(stmts))
+	for i, st := range stmts {
+		batch[i] = BatchStatement{SQL: st.sqlText, Args: st.args}
+	}
+	var evs []*QueryEvent
+	hctx := ctx
+	if len(cfg.hooks) > 0 {
+		evs = make([]*QueryEvent, len(stmts))
+		for i, st := range stmts {
+			ev := &QueryEvent{Op: "select", Phase: st.phase, Model: st.model, Query: st.sqlText, Args: st.args}
+			hctx = cfg.beforeQuery(hctx, ev)
+			evs[i] = ev
+		}
+	}
+	start := time.Now()
+	res, ok, err := be.queryBatch(hctx, batch)
+	if !ok {
+		return nil, false
+	}
+	after := func(i int, err error, n int64) {
+		if evs != nil {
+			cfg.afterQuery(hctx, evs[i], start, err, -1, n)
+		}
+	}
+	if err != nil {
+		err = translateErr(err, cfg, d)
+		for i := range stmts {
+			after(i, err, -1)
+		}
+		return err, true
+	}
+	var firstErr error
+	consumed := 0
+	for i := range stmts {
+		nr, done, rerr := res.Rows()
+		if rerr != nil || done {
+			if rerr == nil {
+				rerr = errors.New("rio: batch returned fewer results than statements")
+			}
+			firstErr = translateErr(rerr, cfg, d)
+			break
+		}
+		n, cerr := stmts[i].consume(&nativeRows{nr: nr})
+		cerr = translateErr(cerr, cfg, d)
+		after(i, cerr, n)
+		consumed++
+		if cerr != nil {
+			firstErr = cerr
+			break
+		}
+	}
+	closeErr := translateErr(res.Close(), cfg, d)
+	if firstErr == nil {
+		firstErr = closeErr
+	}
+	// Statements the abort skipped still close their events, so hooks stay
+	// paired; they carry the batch's failure.
+	for i := consumed; i < len(stmts); i++ {
+		if firstErr != nil {
+			after(i, firstErr, -1)
+		}
+	}
+	return firstErr, true
+}

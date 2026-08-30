@@ -6,11 +6,18 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"time"
 )
 
 // InsertAll inserts rows in chunks within the dialect's bind limit. Chunks
 // commit independently unless the caller supplies a transaction. It backfills
 // generated keys only where ordering is reliable; omitzero does not apply.
+//
+// On a native channel whose driver streams bulk loads (go-rio/postgres via
+// COPY), an explicit-key batch — no generated keys to backfill — goes
+// through the copy protocol instead: one exchange, atomic as a whole, and
+// several times faster at scale. Values bind through the same encoding
+// either way.
 func InsertAll[T any](ctx context.Context, db Queryer, rows []T) error {
 	if len(rows) == 0 {
 		return nil
@@ -48,8 +55,15 @@ func InsertAll[T any](ctx context.Context, db Queryer, rows []T) error {
 		return fmt.Errorf("rio: InsertAll: %s has no insertable columns", p.structName)
 	}
 
-	chunk := max(d.caps().maxBindParams/len(cols), 1)
 	bn := binder{d: d, now: now}
+	if !backfill {
+		if ce, ok := db.eng().(copyEngine); ok {
+			if done, err := copyInsertAll(ctx, db, ce, p, cols, rows, &bn); done {
+				return err
+			}
+		}
+	}
+	chunk := max(d.caps().maxBindParams/len(cols), 1)
 	// Size by the actual batch: a full chunk on PG/MySQL is 65535 binds, and
 	// a three-row insert should not pay a ~1 MiB buffer for it.
 	args := make([]any, 0, min(chunk, len(rows))*len(cols))
@@ -170,6 +184,68 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 		}
 	}
 	return nil
+}
+
+// copyInsertAll streams an explicit-key batch through the channel's copy
+// protocol: one protocol exchange, atomic as a whole — the fast path COPY
+// exists for. done is false when the driver declined (no copier), sending
+// the caller down the chunked multi-VALUES path.
+func copyInsertAll[T any](
+	ctx context.Context,
+	db Queryer,
+	ce copyEngine,
+	p *plan,
+	cols []*field,
+	rows []T,
+	bn *binder,
+) (done bool, err error) {
+	g := db.gram()
+	colNames := make([]string, len(cols))
+	for i, f := range cols {
+		colNames[i] = f.column
+	}
+	i := 0
+	next := func() ([]any, error) {
+		if i >= len(rows) {
+			return nil, nil
+		}
+		rv := reflect.ValueOf(&rows[i]).Elem()
+		base := rv.Addr().UnsafePointer()
+		vals := make([]any, len(cols))
+		for c, f := range cols {
+			v, err := fieldValue(f, base, rv, bn)
+			if err != nil {
+				return nil, err
+			}
+			vals[c] = v
+		}
+		i++
+		return vals, nil
+	}
+	cfg := db.conf()
+	table := g.table(p)
+	if len(cfg.hooks) == 0 {
+		n, ok, err := ce.copyIn(ctx, table, colNames, next)
+		if !ok {
+			return false, nil
+		}
+		_ = n
+		return true, translateErr(err, cfg, g.d)
+	}
+	ev := &QueryEvent{Op: "copy", Model: p.structName, Query: "COPY " + table}
+	hctx := cfg.beforeQuery(ctx, ev)
+	start := time.Now()
+	n, ok, err := ce.copyIn(hctx, table, colNames, next)
+	if !ok {
+		return false, nil
+	}
+	err = translateErr(err, cfg, g.d)
+	affected := n
+	if err != nil {
+		affected = -1
+	}
+	cfg.afterQuery(hctx, ev, start, err, affected, -1)
+	return true, err
 }
 
 // batchColumns requires generated keys to be either all zero or all explicit.

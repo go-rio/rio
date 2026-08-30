@@ -512,3 +512,61 @@ func TestSQLiteSoftDeleteStateMachine(t *testing.T) {
 		}
 	}
 }
+
+// The native channel's COPY fast path must store byte-identical results to
+// the chunked VALUES path: same values, same normalized timestamps.
+func TestPostgresNativeCopyMatchesValuesPath(t *testing.T) {
+	dsn := os.Getenv("RIO_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("RIO_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	ndb, err := postgres.OpenNative(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ndb.Close() })
+	sdb, err := postgres.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sdb.Close() })
+
+	type copyItem struct {
+		ID        int64 `rio:",noautoincr"`
+		Name      string
+		CreatedAt time.Time
+		UpdatedAt time.Time
+	}
+	if _, err := rio.Exec(ctx, ndb, `DROP TABLE IF EXISTS copy_items`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rio.Exec(ctx, ndb, `CREATE TABLE copy_items (
+		id BIGINT PRIMARY KEY, name TEXT NOT NULL,
+		created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL
+	)`); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := []copyItem{{ID: 1, Name: "a"}, {ID: 2, Name: "b"}}
+	if err := rio.InsertAll(ctx, ndb, rows); err != nil { // COPY path
+		t.Fatalf("native InsertAll: %v", err)
+	}
+	more := []copyItem{{ID: 3, Name: "c"}}
+	if err := rio.InsertAll(ctx, sdb, more); err != nil { // VALUES path
+		t.Fatalf("sql InsertAll: %v", err)
+	}
+
+	stored, err := rio.From[copyItem]().OrderBy("id").All(ctx, sdb)
+	if err != nil || len(stored) != 3 {
+		t.Fatalf("read back: len=%d err=%v", len(stored), err)
+	}
+	if stored[0].Name != "a" || stored[2].Name != "c" {
+		t.Fatalf("values drifted: %+v", stored)
+	}
+	// The struct holds what the database stores on both paths, so the copy
+	// rows' stamps must round-trip exactly like the VALUES rows'.
+	if !stored[0].CreatedAt.Equal(rows[0].CreatedAt) || !stored[2].CreatedAt.Equal(more[0].CreatedAt) {
+		t.Fatalf("timestamps drifted across paths: %+v vs %+v / %+v", stored, rows, more)
+	}
+}

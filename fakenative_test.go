@@ -28,6 +28,8 @@ type fakeNative struct {
 	failOn  map[string]error
 	closed  bool
 
+	batches     int // QueryBatch flushes, for round-trip assertions
+	copies      int // CopyIn streams, for copy-path assertions
 	beginErr    error
 	rollbackErr error // forced Rollback result (sql.ErrTxDone injection)
 	lastTxOpts  *sql.TxOptions
@@ -969,5 +971,141 @@ func TestNativeUint64SinkRoundTrip(t *testing.T) {
 	}
 	if got[1].Big != 0 {
 		t.Fatalf("Big = %d, want 0", got[1].Big)
+	}
+}
+
+// --- batching fake: fakeNative implements NativeBatcher ---
+
+type fakeNativeBatchResults struct {
+	f     *fakeNative
+	stmts []BatchStatement
+	next  int
+}
+
+// batches counts QueryBatch flushes, so tests can assert round trips.
+func (f *fakeNative) batchCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.batches
+}
+
+func (f *fakeNative) QueryBatch(ctx context.Context, stmts []BatchStatement) (NativeBatchResults, error) {
+	f.mu.Lock()
+	f.batches++
+	f.mu.Unlock()
+	return &fakeNativeBatchResults{f: f, stmts: stmts}, nil
+}
+
+func (r *fakeNativeBatchResults) Rows() (NativeRows, bool, error) {
+	if r.next >= len(r.stmts) {
+		return nil, true, nil
+	}
+	st := r.stmts[r.next]
+	r.next++
+	// Route through the same record/queue machinery as standalone queries,
+	// so logs, failOn injection, and queued results behave identically.
+	if err := r.f.record(context.Background(), st.SQL, st.Args, false); err != nil {
+		return nil, false, err
+	}
+	return &fakeNativeRows{data: r.f.nextRows()}, false, nil
+}
+
+func (r *fakeNativeBatchResults) Close() error { return nil }
+
+var _ NativeBatcher = (*fakeNative)(nil)
+
+// A relation layer's derived statements — every preload and every counting
+// query — share one batch on a batching channel, with the same per-statement
+// events and results as the sequential path.
+func TestNativeBatchesRelationLayer(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeNative()
+	h := &afterHook{}
+	db := f.openWith(Postgres, WithQueryHook(h))
+
+	f.queueRows([]string{"id", "name"}, []any{int64(1), "o"}, []any{int64(2), "o"})
+	// Tags preloads; Posts is only counted — a full Posts preload would be
+	// statically reused instead of queried, which is its own contract.
+	f.queueRows([]string{"id", "name", "bench_owner_id"}, []any{int64(7), "tag", int64(2)})
+	f.queueRows([]string{"bench_owner_id", "count"}, []any{int64(1), int64(3)})
+
+	out, err := From[benchOwner]().With("Tags").WithCount("Posts").All(ctx, db)
+	if err != nil || len(out) != 2 {
+		t.Fatalf("All: len=%d err=%v", len(out), err)
+	}
+	if got := f.batchCount(); got != 1 {
+		t.Fatalf("the whole layer must flush as one batch, got %d", got)
+	}
+	if len(out[1].Tags.Rows()) != 1 || out[0].PostCount != 3 || out[1].PostCount != 0 {
+		t.Fatalf("assembly drifted: %+v", out)
+	}
+	phases := map[string]int{}
+	for _, e := range h.events {
+		phases[e.Phase]++
+	}
+	if phases["preload"] != 1 || phases["count"] != 1 {
+		t.Fatalf("per-statement events must survive batching: %+v", phases)
+	}
+
+	// A failing statement surfaces at its own position and aborts the layer.
+	f2 := newFakeNative()
+	db2 := f2.open(Postgres)
+	f2.queueRows([]string{"id", "name"}, []any{int64(1), "o"})
+	f2.failContaining("bench_posts", errors.New("boom"))
+	_, err = From[benchOwner]().With("Posts").With("Tags").All(ctx, db2)
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("batched statement errors must surface: %v", err)
+	}
+}
+
+// --- copy fake ---
+
+func (f *fakeNative) CopyIn(_ context.Context, table string, columns []string, next func() ([]any, error)) (int64, error) {
+	f.mu.Lock()
+	f.copies++
+	f.mu.Unlock()
+	var n int64
+	for {
+		vals, err := next()
+		if err != nil {
+			return n, err
+		}
+		if vals == nil {
+			return n, nil
+		}
+		if len(vals) != len(columns) {
+			return n, errors.New("fakeNative: column/value arity mismatch")
+		}
+		n++
+	}
+}
+
+var _ NativeCopier = (*fakeNative)(nil)
+
+// An explicit-key InsertAll streams through the copy protocol — one
+// exchange, no VALUES statements — while a backfilling batch keeps the
+// chunked RETURNING path.
+func TestNativeInsertAllUsesCopy(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeNative()
+	h := &afterHook{}
+	db := f.openWith(Postgres, WithQueryHook(h))
+
+	rows := make([]chunkRow, 500)
+	for i := range rows {
+		rows[i] = chunkRow{ID: int64(i + 1), A: 1, B: 2}
+	}
+	if err := InsertAll(ctx, db, rows); err != nil {
+		t.Fatalf("InsertAll: %v", err)
+	}
+	f.mu.Lock()
+	copies, logged := f.copies, len(f.log)
+	f.mu.Unlock()
+	if copies != 1 || logged != 0 {
+		t.Fatalf("explicit keys must stream one copy, got copies=%d statements=%d", copies, logged)
+	}
+	last := h.events[len(h.events)-1]
+	if last.Op != "copy" || last.RowsAffected != 500 {
+		t.Fatalf("the copy event must report the loaded rows: %+v", last)
 	}
 }

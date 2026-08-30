@@ -254,6 +254,13 @@ Performance follows a few enforceable rules:
   maps by name.
 - The pgx-native channel bypasses `driver.Value` conversion while sharing the
   same store helpers and semantic tests as `database/sql`.
+- Native drivers extend past the frozen `NativeDB`/`NativeTx`/`NativeRows` trio
+  through optional interfaces, discovered by type assertion the way
+  `database/sql/driver` grows: a `NativeBatcher` collapses each preload layer's
+  statements into one round trip, and a `NativeCopier` streams explicit-key
+  `InsertAll` batches through the driver's bulk-load protocol. Channels without
+  a capability keep the per-statement path; hook events fire per statement
+  either way.
 - Deterministic fake-driver allocation budgets guard rio's own overhead. Real
   SQLite, MySQL, PostgreSQL, and native pgx benchmarks measure end-to-end cost
   under the documented [benchmark methodology](bench/README.md). Benchmark

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"iter"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -654,14 +655,32 @@ func loadQueryRelations[T any](
 	withs []preloadSpec,
 	counts []string,
 ) error {
-	if err := preloadInto(ctx, db, p, rows, withs); err != nil {
-		return err
+	if len(rows) == 0 || (len(withs) == 0 && len(counts) == 0) {
+		return nil
 	}
-	remaining, err := countsNotPreloaded(p, rows, withs, counts)
+	rv := reflect.ValueOf(rows)
+	queried, reusable := splitCounts(p, withs, counts)
+	stmts, finishes, err := collectRelationLayer(db, p, rv, withs)
 	if err != nil {
 		return err
 	}
-	return countInto(ctx, db, p, rows, remaining)
+	countStmts, countFinishes, err := prepareCountLoads(db, p, rv, queried)
+	if err != nil {
+		return err
+	}
+	stmts = append(stmts, countStmts...)
+	finishes = append(finishes, countFinishes...)
+	// The whole top layer — every preload and every counting query — shares
+	// one round trip on a batching channel.
+	if err := runRelStatements(ctx, db, stmts); err != nil {
+		return err
+	}
+	for _, finish := range finishes {
+		if err := finish(ctx); err != nil {
+			return err
+		}
+	}
+	return reuseCounts(p, rv, reusable)
 }
 
 func queryCapacity(limit int, isSet bool) int {

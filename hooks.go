@@ -11,7 +11,7 @@ import (
 // RowsReturned filled in.
 type QueryEvent struct {
 	// Op is a stable label usable as a metrics dimension without parsing
-	// SQL: "select", "insert", "update", "delete", "upsert", "raw", "exec",
+	// SQL: "select", "insert", "update", "delete", "upsert", "copy", "raw", "exec",
 	// "begin", "commit", "rollback", "savepoint".
 	Op string
 	// Model is the Go struct name behind the statement, "" for Raw/Exec and
@@ -58,6 +58,12 @@ type QueryEvent struct {
 // through row consumption. One exception: a First/Find/Sole miss reports
 // Err = nil — ErrNotFound is a successfully executed query, and telemetry
 // would otherwise count every miss as an error.
+//
+// When a native driver batches a relation layer or streams a bulk insert,
+// events still fire per logical statement, but the statements share one wire
+// exchange: every BeforeQuery fires before the send and the contexts chain
+// into the one execution context, and a failure mid-batch reports the
+// remaining statements' AfterQuery with the same error.
 //
 // The method set is fixed: later hook capabilities arrive as optional
 // interfaces a hook may also satisfy, discovered by type assertion, never as

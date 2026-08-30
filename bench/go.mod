@@ -5,7 +5,7 @@ go 1.27.0
 require (
 	github.com/go-rio/mysql v0.3.1
 	github.com/go-rio/postgres v0.4.1
-	github.com/go-rio/rio v0.10.1
+	github.com/go-rio/rio v0.12.0
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/libtnb/sqlite v1.2.2

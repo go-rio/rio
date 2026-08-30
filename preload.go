@@ -264,8 +264,33 @@ func preloadInto[T any](ctx context.Context, db Queryer, p *plan, rows []T, spec
 // preloadValues is the reflection core shared by the generic entry point and
 // nested recursion. rows is a []T value; slice elements are addressable.
 func preloadValues(ctx context.Context, db Queryer, p *plan, rows reflect.Value, specs []preloadSpec) error {
+	stmts, finishes, err := collectRelationLayer(db, p, rows, specs)
+	if err != nil {
+		return err
+	}
+	// One layer, one round trip where the channel batches; nested layers
+	// batch again inside their finishes.
+	if err := runRelStatements(ctx, db, stmts); err != nil {
+		return err
+	}
+	for _, finish := range finishes {
+		if err := finish(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// collectRelationLayer renders one layer's preload statements and finishes,
+// so the top level can merge them with WithCount's into a single round trip.
+func collectRelationLayer(
+	db Queryer,
+	p *plan,
+	rows reflect.Value,
+	specs []preloadSpec,
+) ([]relStatement, []func(context.Context) error, error) {
 	if rows.Len() == 0 || len(specs) == 0 {
-		return nil
+		return nil, nil, nil
 	}
 	type group struct {
 		opts  []RelOption
@@ -289,17 +314,22 @@ func preloadValues(ctx context.Context, db Queryer, p *plan, rows reflect.Value,
 	}
 	sort.Strings(order) // deterministic query order run to run
 
+	var stmts []relStatement
+	finishes := make([]func(context.Context) error, 0, len(order))
 	for _, head := range order {
 		rel, ok := p.rels[head]
 		if !ok {
-			return fmt.Errorf("rio: %s has no relation %q", p.structName, head)
+			return nil, nil, fmt.Errorf("rio: %s has no relation %q", p.structName, head)
 		}
 		g := groups[head]
-		if err := loadRelation(ctx, db, p, rel, rows, g.opts, g.tails); err != nil {
-			return err
+		relStmts, finish, err := prepareRelationLoad(db, p, rel, rows, g.opts, g.tails)
+		if err != nil {
+			return nil, nil, err
 		}
+		stmts = append(stmts, relStmts...)
+		finishes = append(finishes, finish)
 	}
-	return nil
+	return stmts, finishes, nil
 }
 
 func splitPath(path string) (head, tail string) {
@@ -311,21 +341,26 @@ func splitPath(path string) (head, tail string) {
 	return path, ""
 }
 
-func loadRelation(
-	ctx context.Context,
+// prepareRelationLoad renders one relation's preload queries and returns
+// them with a finish step. The statements scan into a shared buffer; finish
+// recurses into nested paths and assembles the containers, and must run only
+// after every returned statement was consumed. Splitting the two lets a
+// whole layer's statements share one driver round trip on a batching
+// channel.
+func prepareRelationLoad(
 	db Queryer,
 	owner *plan,
 	rel *relField,
-	rows reflect.Value,
+	owners reflect.Value,
 	opts []RelOption,
 	tails []preloadSpec,
-) error {
+) ([]relStatement, func(context.Context) error, error) {
 	res, err := rel.resolve(owner)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	if rel.kind == relManyToMany && len(res.target.pks) != 1 {
-		return fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"rio: relation %s.%s: ManyToMany across composite primary keys is not supported",
 			owner.structName,
 			rel.name,
@@ -341,11 +376,11 @@ func loadRelation(
 	// canonKey groups (it stringifies []byte, which is not a comparable map
 	// key); the child IN (?) binds the *original* value — a stringified
 	// []byte would not match a BLOB/BYTEA column, silently loading nothing.
-	seen := make(map[any]struct{}, rows.Len())
-	keys := make([]any, 0, rows.Len())
-	parentKey := make([]any, rows.Len())
-	for i := 0; i < rows.Len(); i++ {
-		kv := rows.Index(i).FieldByIndex(res.ref.index)
+	seen := make(map[any]struct{}, owners.Len())
+	keys := make([]any, 0, owners.Len())
+	parentKey := make([]any, owners.Len())
+	for i := 0; i < owners.Len(); i++ {
+		kv := owners.Index(i).FieldByIndex(res.ref.index)
 		if kv.Kind() == reflect.Pointer {
 			if kv.IsNil() {
 				parentKey[i] = nil
@@ -368,8 +403,9 @@ func loadRelation(
 	// row (it dominated the preload allocation profile).
 	buf := reflect.New(reflect.SliceOf(elemType)).Elem()
 	buf.Set(reflect.MakeSlice(reflect.SliceOf(elemType), 0, len(keys)))
-	var bufKeys []any
+	bufKeys := &[]any{}
 
+	var stmts []relStatement
 	if len(keys) > 0 {
 		relArgs := 0
 		for _, w := range rq.wheres {
@@ -383,7 +419,7 @@ func loadRelation(
 		}
 		limit := db.gram().d.caps().maxBindParams
 		if relArgs >= limit {
-			return fmt.Errorf(
+			return nil, nil, fmt.Errorf(
 				"rio: preload relation %s.%s uses %d bind parameter(s) in RelWhere, "+
 					"leaving none for parent keys (dialect limit %d)",
 				owner.structName,
@@ -397,127 +433,135 @@ func loadRelation(
 			end := min(start+chunk, len(keys))
 			sqlText, args, keyed, err := renderRelSelect(db.gram(), res, rel.kind, keys[start:end], &rq)
 			if err != nil {
-				return err
+				return nil, nil, err
 			}
-			sqlRows, finish, err := runQueryPhase(ctx, db, "preload", "select", target.structName, sqlText, args)
-			if err != nil {
-				return err
-			}
-			before := buf.Len()
-			part, partKeys, err := scanRel(sqlRows, target, buf, keyed, res)
-			finishQuery(finish, err, int64(part.Len()-before))
-			if err != nil {
-				return err
-			}
-			buf = part
-			bufKeys = append(bufKeys, partKeys...)
+			stmts = append(stmts, relStatement{
+				phase:   "preload",
+				model:   target.structName,
+				sqlText: sqlText,
+				args:    args,
+				consume: func(sqlRows rows) (int64, error) {
+					before := buf.Len()
+					part, partKeys, err := scanRel(sqlRows, target, buf, keyed, res)
+					if err != nil {
+						return int64(part.Len() - before), err
+					}
+					buf = part
+					*bufKeys = append(*bufKeys, partKeys...)
+					return int64(part.Len() - before), nil
+				},
+			})
 		}
 	}
 
-	// Nested paths load into the scan buffer first; the copy into parent
-	// containers below then carries the fully assembled children.
-	if len(tails) > 0 && buf.Len() > 0 {
-		if err := preloadValues(ctx, db, target, buf, tails); err != nil {
-			return err
+	finish := func(ctx context.Context) error {
+		bufKeys := *bufKeys
+		// Nested paths load into the scan buffer first; the copy into parent
+		// containers below then carries the fully assembled children.
+		if len(tails) > 0 && buf.Len() > 0 {
+			if err := preloadValues(ctx, db, target, buf, tails); err != nil {
+				return err
+			}
 		}
-	}
 
-	type indexSpan struct {
-		start int
-		next  int
-		end   int
-	}
-	byKey := make(map[any]indexSpan, len(keys))
-	if rel.kind == relManyToMany {
-		for _, k := range bufKeys {
-			span := byKey[k]
-			span.end++
-			byKey[k] = span
+		type indexSpan struct {
+			start int
+			next  int
+			end   int
 		}
-	} else {
-		// res.fk is the child-side column for HasMany/HasOne and the
-		// target-side referenced column for BelongsTo — either way, the
-		// grouping key on the buffered rows. The canonical keys are kept for
-		// the placement pass below: canonKey boxes into an interface, and
-		// computing each row's key once instead of twice halves what was a
-		// quarter of the preload allocation profile.
-		keyField := res.fk
-		bufKeys = make([]any, buf.Len())
-		for i := 0; i < buf.Len(); i++ {
-			kv := buf.Index(i).FieldByIndex(keyField.index)
-			if kv.Kind() == reflect.Pointer {
-				if kv.IsNil() {
-					continue // bufKeys[i] stays nil, skipped below
+		byKey := make(map[any]indexSpan, len(keys))
+		if rel.kind == relManyToMany {
+			for _, k := range bufKeys {
+				span := byKey[k]
+				span.end++
+				byKey[k] = span
+			}
+		} else {
+			// res.fk is the child-side column for HasMany/HasOne and the
+			// target-side referenced column for BelongsTo — either way, the
+			// grouping key on the buffered rows. The canonical keys are kept for
+			// the placement pass below: canonKey boxes into an interface, and
+			// computing each row's key once instead of twice halves what was a
+			// quarter of the preload allocation profile.
+			keyField := res.fk
+			bufKeys = make([]any, buf.Len())
+			for i := 0; i < buf.Len(); i++ {
+				kv := buf.Index(i).FieldByIndex(keyField.index)
+				if kv.Kind() == reflect.Pointer {
+					if kv.IsNil() {
+						continue // bufKeys[i] stays nil, skipped below
+					}
+					kv = kv.Elem()
 				}
-				kv = kv.Elem()
+				k := canonKey(kv)
+				bufKeys[i] = k
+				span := byKey[k]
+				span.end++
+				byKey[k] = span
 			}
-			k := canonKey(kv)
-			bufKeys[i] = k
-			span := byKey[k]
-			span.end++
-			byKey[k] = span
 		}
-	}
-	grouped := make([]int, buf.Len())
-	offset := 0
-	for k, span := range byKey {
-		count := span.end
-		span.start, span.next, span.end = offset, offset, offset+count
-		byKey[k] = span
-		offset += count
-	}
-	{
-		// Both kinds now carry one canonical key per buffered row.
-		for i, k := range bufKeys {
-			if k == nil {
-				continue // a NULL child-side key groups under no parent
+		grouped := make([]int, buf.Len())
+		offset := 0
+		for k, span := range byKey {
+			count := span.end
+			span.start, span.next, span.end = offset, offset, offset+count
+			byKey[k] = span
+			offset += count
+		}
+		{
+			// Both kinds now carry one canonical key per buffered row.
+			for i, k := range bufKeys {
+				if k == nil {
+					continue // a NULL child-side key groups under no parent
+				}
+				span := byKey[k]
+				grouped[span.next] = i
+				span.next++
+				byKey[k] = span
 			}
-			span := byKey[k]
-			grouped[span.next] = i
-			span.next++
-			byKey[k] = span
 		}
-	}
 
-	ptrType := reflect.PointerTo(elemType)
-	for i := 0; i < rows.Len(); i++ {
-		container := rows.Index(i).FieldByIndex(rel.index).Addr().Interface().(relContainer)
-		var matches []int
-		if parentKey[i] != nil {
-			span := byKey[parentKey[i]]
-			matches = grouped[span.start:span.end]
+		ptrType := reflect.PointerTo(elemType)
+		for i := 0; i < owners.Len(); i++ {
+			container := owners.Index(i).FieldByIndex(rel.index).Addr().Interface().(relContainer)
+			var matches []int
+			if parentKey[i] != nil {
+				span := byKey[parentKey[i]]
+				matches = grouped[span.start:span.end]
+			}
+			switch rel.kind {
+			case relHasMany, relManyToMany:
+				out := reflect.MakeSlice(reflect.SliceOf(elemType), len(matches), len(matches))
+				for k, idx := range matches {
+					out.Index(k).Set(buf.Index(idx)) // value copy per child, no allocation
+				}
+				container.setLoaded(out)
+			case relHasOne, relBelongsTo:
+				if len(matches) == 0 {
+					container.setLoaded(reflect.Zero(ptrType))
+					continue
+				}
+				if rel.kind == relHasOne && len(matches) > 1 {
+					// HasOne declares "one" — silently keeping whichever row the
+					// driver returned first would be a nondeterministic answer.
+					return fmt.Errorf(
+						"rio: relation %s.%s: HasOne loaded %d rows for one parent; "+
+							"the schema evidently allows several — use HasMany, or make %s.%s unique",
+						owner.structName,
+						rel.name,
+						len(matches),
+						target.structName,
+						res.fk.column,
+					)
+				}
+				cp := reflect.New(elemType)
+				cp.Elem().Set(buf.Index(matches[0]))
+				container.setLoaded(cp)
+			}
 		}
-		switch rel.kind {
-		case relHasMany, relManyToMany:
-			out := reflect.MakeSlice(reflect.SliceOf(elemType), len(matches), len(matches))
-			for k, idx := range matches {
-				out.Index(k).Set(buf.Index(idx)) // value copy per child, no allocation
-			}
-			container.setLoaded(out)
-		case relHasOne, relBelongsTo:
-			if len(matches) == 0 {
-				container.setLoaded(reflect.Zero(ptrType))
-				continue
-			}
-			if rel.kind == relHasOne && len(matches) > 1 {
-				// HasOne declares "one" — silently keeping whichever row the
-				// driver returned first would be a nondeterministic answer.
-				return fmt.Errorf(
-					"rio: relation %s.%s: HasOne loaded %d rows for one parent; "+
-						"the schema evidently allows several — use HasMany, or make %s.%s unique",
-					owner.structName,
-					rel.name,
-					len(matches),
-					target.structName,
-					res.fk.column,
-				)
-			}
-			cp := reflect.New(elemType)
-			cp.Elem().Set(buf.Index(matches[0]))
-			container.setLoaded(cp)
-		}
+		return nil
 	}
-	return nil
+	return stmts, finish, nil
 }
 
 // renderRelSelect renders the preload query. keyed reports whether an extra
@@ -700,26 +744,36 @@ func canonKey(v reflect.Value) any {
 	}
 }
 
-// countInto fills WithCount targets: one GROUP BY query per relation, the
-// aggregate sibling of selectin preloading.
-func countInto[T any](ctx context.Context, db Queryer, p *plan, rows []T, counts []string) error {
-	if len(rows) == 0 || len(counts) == 0 {
-		return nil
+// prepareCountLoads renders every WithCount relation's queries — the
+// aggregate sibling of selectin preloading — deduplicated and in sorted
+// order, ready to share the preload layer's round trip.
+func prepareCountLoads(
+	db Queryer,
+	p *plan,
+	rows reflect.Value,
+	counts []string,
+) ([]relStatement, []func(context.Context) error, error) {
+	if rows.Len() == 0 || len(counts) == 0 {
+		return nil, nil, nil
 	}
-	rv := reflect.ValueOf(rows)
 	sorted := append([]string(nil), counts...)
 	sort.Strings(sorted)
+	var stmts []relStatement
+	var finishes []func(context.Context) error
 	prev, first := "", true
 	for _, name := range sorted {
 		if !first && name == prev {
 			continue // deduplicate: WithCount("X").WithCount("X") counts once, like With
 		}
 		first, prev = false, name
-		if err := countRelation(ctx, db, p, name, rv); err != nil {
-			return err
+		cs, finish, err := prepareCountLoad(db, p, name, rows)
+		if err != nil {
+			return nil, nil, err
 		}
+		stmts = append(stmts, cs...)
+		finishes = append(finishes, finish)
 	}
-	return nil
+	return stmts, finishes, nil
 }
 
 func relOptionsChangeCount(opts []RelOption) bool {
@@ -730,8 +784,13 @@ func relOptionsChangeCount(opts []RelOption) bool {
 	return rq.changesCount
 }
 
-func countsNotPreloaded[T any](p *plan, rows []T, specs []preloadSpec, counts []string) ([]string, error) {
-	if len(rows) == 0 || len(specs) == 0 || len(counts) == 0 {
+// splitCounts partitions WithCount targets, statically from the specs: a
+// relation the same query fully preloads (no count-changing options) reads
+// its count off the loaded containers after the preload finishes; everything
+// else issues its own GROUP BY statements — which lets those statements join
+// the preload's round trip instead of waiting for it.
+func splitCounts(p *plan, specs []preloadSpec, counts []string) (queried, reusable []string) {
+	if len(specs) == 0 || len(counts) == 0 {
 		return counts, nil
 	}
 	full := make(map[string]bool, len(specs))
@@ -744,51 +803,57 @@ func countsNotPreloaded[T any](p *plan, rows []T, specs []preloadSpec, counts []
 			full[head] = false
 		}
 	}
-
-	reused := make(map[string]bool, len(full))
-	rv := reflect.ValueOf(rows)
 	for _, name := range counts {
-		if reused[name] || !full[name] {
-			continue
-		}
 		rel, ok := p.rels[name]
-		if !ok || (rel.kind != relHasMany && rel.kind != relManyToMany) {
+		_, hasTarget := p.counts[name]
+		countable := ok && hasTarget && (rel.kind == relHasMany || rel.kind == relManyToMany)
+		if full[name] && countable {
+			reusable = append(reusable, name)
+		} else {
+			queried = append(queried, name)
+		}
+	}
+	return queried, reusable
+}
+
+// reuseCounts fills count targets from containers the preload just loaded.
+func reuseCounts(p *plan, rv reflect.Value, reusable []string) error {
+	reused := make(map[string]bool, len(reusable))
+	for _, name := range reusable {
+		if reused[name] {
 			continue
 		}
-		target, ok := p.counts[name]
-		if !ok {
-			continue
-		}
+		rel := p.rels[name]
+		target := p.counts[name]
 		for i := 0; i < rv.Len(); i++ {
 			container := rv.Index(i).FieldByIndex(rel.index).Addr().Interface().(relContainer)
 			n, loaded := container.loadedLen()
 			if !loaded {
-				return nil, fmt.Errorf("rio: relation %s.%s was not loaded before count reuse", p.structName, name)
+				return fmt.Errorf("rio: relation %s.%s was not loaded before count reuse", p.structName, name)
 			}
 			rv.Index(i).FieldByIndex(target).SetInt(int64(n))
 		}
 		reused[name] = true
 	}
-	if len(reused) == 0 {
-		return counts, nil
-	}
-	remaining := make([]string, 0, len(counts)-len(reused))
-	for _, name := range counts {
-		if !reused[name] {
-			remaining = append(remaining, name)
-		}
-	}
-	return remaining, nil
+	return nil
 }
 
-func countRelation(ctx context.Context, db Queryer, owner *plan, name string, rows reflect.Value) error {
+// prepareCountLoad renders one WithCount relation's GROUP BY queries and
+// returns them with the finish that writes the counts back; finish must run
+// only after every returned statement was consumed.
+func prepareCountLoad(
+	db Queryer,
+	owner *plan,
+	name string,
+	owners reflect.Value,
+) ([]relStatement, func(context.Context) error, error) {
 	rel, ok := owner.rels[name]
 	if !ok {
-		return fmt.Errorf("rio: %s has no relation %q", owner.structName, name)
+		return nil, nil, fmt.Errorf("rio: %s has no relation %q", owner.structName, name)
 	}
 	target, ok := owner.counts[name]
 	if !ok {
-		return fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"rio: %s has no count target for %q; declare a field tagged `rio:\",countof:%s\"`",
 			owner.structName,
 			name,
@@ -796,7 +861,7 @@ func countRelation(ctx context.Context, db Queryer, owner *plan, name string, ro
 		)
 	}
 	if rel.kind != relHasMany && rel.kind != relManyToMany {
-		return fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"rio: WithCount(%q): counting a %s relation is meaningless (0 or 1); load it instead",
 			name,
 			rel.kind,
@@ -804,15 +869,15 @@ func countRelation(ctx context.Context, db Queryer, owner *plan, name string, ro
 	}
 	res, err := rel.resolve(owner)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	// canonKey groups; the IN (?) binds the original value (see loadRelation).
-	seen := make(map[any]struct{}, rows.Len())
-	keys := make([]any, 0, rows.Len())
-	parentKey := make([]any, rows.Len())
-	for i := 0; i < rows.Len(); i++ {
-		kv := rows.Index(i).FieldByIndex(res.ref.index)
+	seen := make(map[any]struct{}, owners.Len())
+	keys := make([]any, 0, owners.Len())
+	parentKey := make([]any, owners.Len())
+	for i := 0; i < owners.Len(); i++ {
+		kv := owners.Index(i).FieldByIndex(res.ref.index)
 		if kv.Kind() == reflect.Pointer {
 			if kv.IsNil() {
 				parentKey[i] = nil // nil pointer key: nothing to count against
@@ -831,6 +896,7 @@ func countRelation(ctx context.Context, db Queryer, owner *plan, name string, ro
 	g := db.gram()
 	d := g.d
 	byKey := make(map[any]int64, len(keys))
+	var stmts []relStatement
 	chunk := d.caps().maxBindParams
 	for start := 0; start < len(keys); start += chunk {
 		end := min(start+chunk, len(keys))
@@ -902,24 +968,27 @@ func countRelation(ctx context.Context, db Queryer, owner *plan, name string, ro
 
 		sqlText, outArgs, err := finishSQL(d, b, args)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
-		sqlRows, finish, err := runQueryPhase(ctx, db, "count", "select", res.target.structName, sqlText, outArgs)
-		if err != nil {
-			return err
-		}
-		scanned, err := scanCounts(sqlRows, res.ref.typ, byKey)
-		finishQuery(finish, err, scanned)
-		if err != nil {
-			return err
-		}
+		stmts = append(stmts, relStatement{
+			phase:   "count",
+			model:   res.target.structName,
+			sqlText: sqlText,
+			args:    outArgs,
+			consume: func(sqlRows rows) (int64, error) {
+				return scanCounts(sqlRows, res.ref.typ, byKey)
+			},
+		})
 	}
 
-	for i := 0; i < rows.Len(); i++ {
-		n := byKey[parentKey[i]]
-		rows.Index(i).FieldByIndex(target).SetInt(n)
+	finish := func(context.Context) error {
+		for i := 0; i < owners.Len(); i++ {
+			n := byKey[parentKey[i]]
+			owners.Index(i).FieldByIndex(target).SetInt(n)
+		}
+		return nil
 	}
-	return nil
+	return stmts, finish, nil
 }
 
 // scanCounts drains (key, count) pairs into the grouping map and reports how
