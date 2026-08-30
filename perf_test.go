@@ -10,19 +10,15 @@ import (
 	"unsafe"
 )
 
-// loopDB is fakeDB's measurement counterpart: it serves the same scripted
-// rows for every query and a fixed (1, 1) result for every exec, with no
-// statement log and no locking — fakeDB's per-statement log append would
-// pollute AllocsPerRun and benchmark numbers.
+// loopDB serves the same scripted rows for every query and a fixed (1, 1) result
+// for every exec, with no statement log or locking to pollute AllocsPerRun.
 type loopDB struct {
 	cols       []string
 	rows       [][]driver.Value
 	columnScan bool
 
-	// sets, when non-empty, serves queries round-robin by call order — one
-	// logical operation issues the same statements in the same order every
-	// iteration (main query, then each preload), so position identifies the
-	// shape. The single benchmark goroutine owns pos.
+	// sets, when non-empty, serves queries round-robin by call order, so
+	// position identifies the statement shape; the benchmark goroutine owns pos.
 	sets []fakeRows
 	pos  int
 }
@@ -67,10 +63,7 @@ func (c loopConn) ExecContext(context.Context, string, []driver.NamedValue) (dri
 	return fakeExecResult{fakeResult{lastID: 1, affected: 1}}, nil
 }
 
-// loopNative is loopDB's counterpart on the native channel: a NativeDB that
-// serves the same scripted typed rows for every query and a fixed count for
-// every exec, with no log and no locking, so AllocsPerRun measures the
-// channel itself.
+// loopNative is loopDB's counterpart on the native channel: scripted typed rows, no log, no locking.
 type loopNative struct {
 	cols []string
 	rows [][]any
@@ -139,8 +132,7 @@ func perfUserNativeRow() []any {
 	return []any{int64(1), "u@example.com", int64(30), testNow, testNow}
 }
 
-// perfPlain and perfPtr share one column shape; only nullability differs, so
-// the benchmark pair isolates the scanPtr path's per-cell cost.
+// perfPlain and perfPtr differ only in nullability, isolating the scanPtr per-cell cost.
 type perfPlain struct {
 	ID int64
 	A  int64
@@ -462,8 +454,7 @@ func BenchmarkUpsertMySQL(b *testing.B) {
 	}
 }
 
-// BenchmarkUpsertAllSQLiteChunk upserts exactly one full SQLite chunk
-// (999/5 = 199 rows with explicit IDs), the shape the batch SQL cache keys.
+// One full SQLite chunk (999/5 = 199 rows with explicit IDs), the shape the batch SQL cache keys.
 func BenchmarkUpsertAllSQLiteChunk(b *testing.B) {
 	l := &loopDB{}
 	db := l.open(SQLite)
@@ -498,10 +489,8 @@ func BenchmarkUpsertAllSQLiteThreeChunks(b *testing.B) {
 	}
 }
 
-// TestAllocDiagnostics prints AllocsPerRun for each CRUD op next to a
-// hand-written database/sql equivalent on the same loop driver. Run with
-// -run TestAllocDiagnostics -v; the pinned budget assertions live in
-// TestCRUDAllocBudget.
+// Prints AllocsPerRun per CRUD op next to a hand-written database/sql
+// equivalent; the pinned budget assertions live in TestCRUDAllocBudget.
 func TestAllocDiagnostics(t *testing.T) {
 	if testing.Short() {
 		t.Skip("diagnostic only")
@@ -515,11 +504,8 @@ func TestAllocDiagnostics(t *testing.T) {
 	}
 }
 
-// TestCRUDAllocBudget pins DESIGN.md's allocation contract: entity CRUD pays
-// at most 2 extra allocations per call over a hand-written database/sql
-// equivalent on the same driver, and Upsert at most its conflict-shape
-// machinery on top. Deltas, not absolute counts: database/sql's own
-// allocations shift across Go releases and cancel out of the difference.
+// TestCRUDAllocBudget pins DESIGN.md's allocation contract as deltas over a
+// hand-written database/sql equivalent — absolute counts shift across Go releases.
 func TestCRUDAllocBudget(t *testing.T) {
 	budgets := map[string]float64{
 		"find/pg":           1,
@@ -549,12 +535,8 @@ func TestCRUDAllocBudget(t *testing.T) {
 	}
 }
 
-// TestNativeAllocBudget pins the native channel's allocation counts on the
-// deterministic fake-native stack — the whole stack is rio's own code, so
-// absolute counts are stable, unlike the stdlib pairs whose driver half
-// shifts with Go releases — plus the channel-vs-channel invariant the design
-// promises: for the same call on the same data, the native channel never
-// allocates more than the database/sql channel.
+// TestNativeAllocBudget pins absolute native-channel counts (the whole stack is
+// rio's code, so they are stable) plus the invariant that native never allocates more than stdlib.
 func TestNativeAllocBudget(t *testing.T) {
 	ctx := context.Background()
 	fatal := func(err error) {
@@ -569,7 +551,7 @@ func TestNativeAllocBudget(t *testing.T) {
 	}
 	legs := map[string]leg{}
 
-	{ // Find: the 30→18 story of the real-network bench, isolated.
+	{ // Find
 		ln := &loopNative{cols: perfUserCols, rows: [][]any{perfUserNativeRow()}}
 		ls := &loopDB{cols: perfUserCols, rows: [][]driver.Value{perfUserRow()}}
 		ndb, sdb := ln.open(Postgres), ls.open(Postgres)
@@ -580,7 +562,7 @@ func TestNativeAllocBudget(t *testing.T) {
 		}
 	}
 
-	{ // All over 100 rows: the flagship read shape (433→124 on the wire).
+	{ // All over 100 rows
 		rows := make([][]any, 100)
 		drows := make([][]driver.Value, 100)
 		for i := range rows {
@@ -686,10 +668,8 @@ type allocPair struct {
 	std func()
 }
 
-// allocMeasurements builds the rio-vs-stdlib pairs on identical loop
-// drivers. Every std closure executes the byte-identical SQL rio renders,
-// with equivalent argument preparation (time formatting included), so the
-// difference is rio's own overhead.
+// allocMeasurements builds rio-vs-stdlib pairs on identical loop drivers; every std
+// closure executes the byte-identical SQL rio renders, so the difference is rio's own overhead.
 func allocMeasurements(ctx context.Context) map[string]allocPair {
 	fatal := func(err error) {
 		if err != nil {
@@ -763,8 +743,7 @@ func allocMeasurements(ctx context.Context) map[string]allocPair {
 		}
 	}
 
-	{ // Insert, ClickHouse exec path: explicit ID (nothing generates or
-		// backfills there), stamps bound as chTimeFormat text.
+	{ // Insert, ClickHouse exec path: explicit ID, stamps bound as chTimeFormat text.
 		l := &loopDB{}
 		db, raw := l.open(ClickHouse), l.raw()
 		u := &perfUser{ID: 1, Email: "u@example.com", Age: 30}
@@ -862,8 +841,7 @@ func allocMeasurements(ctx context.Context) map[string]allocPair {
 		}
 	}
 
-	{ // Upsert, Postgres, options hoisted by the caller (isolates rio's own
-		// per-call overhead from the functional-option construction cost).
+	{ // Upsert, Postgres, options hoisted by the caller (isolates the functional-option cost).
 		l := &loopDB{cols: perfUserCols, rows: [][]driver.Value{perfUserRow()}}
 		db := l.open(Postgres)
 		u := &perfUser{ID: 1, Email: "u@example.com", Age: 30, CreatedAt: testNow, UpdatedAt: testNow}
@@ -895,8 +873,7 @@ func allocMeasurements(ctx context.Context) map[string]allocPair {
 	return pairs
 }
 
-// The relation-path benchmark models: an owner with children, grandchildren,
-// a count target, and a many-to-many side.
+// Relation-path benchmark models: owner, children, grandchildren, a count target, and an m2m side.
 type benchOwner struct {
 	ID        int64
 	Name      string
@@ -931,8 +908,7 @@ func benchOwnerRows(n int) fakeRows {
 	return fakeRows{cols: []string{"id", "name"}, rows: rows}
 }
 
-// benchChildRows builds (id, fk, text) rows: per children under each of
-// parents parents, ids sequential. Posts and comments share the shape.
+// benchChildRows builds (id, fk, text) rows: per children under each parent, sequential ids.
 func benchChildRows(fkCol, text string, parents, per int) fakeRows {
 	rows := make([][]driver.Value, 0, parents*per)
 	id := int64(0)

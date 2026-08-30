@@ -11,9 +11,8 @@ import (
 	"github.com/go-rio/rio"
 )
 
-// The end-to-end suite runs against every real database the environment
-// provides: SQLite always (modernc, in-memory), PostgreSQL and MySQL when
-// RIO_POSTGRES_DSN / RIO_MYSQL_DSN are set (CI services, local docker).
+// End-to-end suite: SQLite always (modernc, in-memory); PostgreSQL and MySQL
+// when RIO_POSTGRES_DSN / RIO_MYSQL_DSN are set.
 
 type User struct {
 	ID        int64
@@ -279,8 +278,8 @@ func runSuite(t *testing.T, db *rio.DB, dialect string) {
 	}
 }
 
-// runV02Suite exercises the 0.2 surface end-to-end: WhereHas, WithCount,
-// RelLimit, Attach/Detach, Rows streaming, Pluck.
+// runV02Suite: WhereHas, WithCount, RelLimit, Attach/Detach, Rows streaming,
+// Pluck.
 func runV02Suite(t *testing.T, db *rio.DB, dialect string) {
 	ctx := context.Background()
 	freshSchema(t, db, dialect)
@@ -500,9 +499,8 @@ var hardeningDDL = map[string][]string{
 
 func (AllDefault) TableName() string { return "all_defaults" }
 
-// runHardening covers the post-v0.3.0 audit fixes end-to-end on a real
-// database: all-defaults INSERT, idempotent Update (MySQL's changed-rows
-// counting), whitelist column order, NullTime write parity, and UpsertAll.
+// runHardening: all-defaults INSERT, idempotent Update, whitelist order,
+// NullTime parity, UpsertAll, *time.Time stamps, []byte keys, savepoints.
 func runHardening(t *testing.T, db *rio.DB, dialect string) {
 	ctx := context.Background()
 	for _, ddl := range hardeningDDL[dialect] {
@@ -521,8 +519,8 @@ func runHardening(t *testing.T, db *rio.DB, dialect string) {
 		t.Fatalf("all-defaults reload: %+v %v", got, err)
 	}
 
-	// Idempotent Update on a model without UpdatedAt/version must succeed on
-	// every dialect (MySQL counts changed rows, not matched rows).
+	// Idempotent Update must succeed everywhere (MySQL counts changed rows,
+	// not matched).
 	if err := rio.Update(ctx, db, got); err != nil {
 		t.Fatalf("idempotent update: %v", err)
 	}
@@ -536,8 +534,7 @@ func runHardening(t *testing.T, db *rio.DB, dialect string) {
 		t.Fatalf("whitelist update: %v", err)
 	}
 
-	// sql.NullTime stores rio's canonical encoding: reload compares Equal
-	// against the microsecond-truncated instant, same as time.Time.
+	// sql.NullTime stores rio's canonical encoding, same as time.Time.
 	at := time.Date(2026, 7, 9, 3, 4, 5, 123456789, time.UTC)
 	rem := Reminder{ID: 1, At: at, Maybe: sql.NullTime{Time: at, Valid: true}}
 	if err := rio.Insert(ctx, db, &rem); err != nil {
@@ -561,8 +558,7 @@ func runHardening(t *testing.T, db *rio.DB, dialect string) {
 		t.Fatalf("NullTime arg must match stored encoding: n=%d %v", n, err)
 	}
 
-	// UpsertAll smoke: insert two, re-upsert with a change. Batch inserts
-	// backfill no ids on MySQL (documented contract) — reload for them.
+	// UpsertAll smoke; MySQL batch inserts backfill no ids — reload instead.
 	if err := rio.InsertAll(ctx, db, []AllDefault{{Note: "a"}, {Note: "b"}}); err != nil {
 		t.Fatalf("InsertAll: %v", err)
 	}
@@ -579,8 +575,8 @@ func runHardening(t *testing.T, db *rio.DB, dialect string) {
 		t.Fatalf("UpsertAll effect: %+v %v", re, err)
 	}
 
-	// *time.Time CreatedAt/UpdatedAt are auto-stamped and round-trip, like the
-	// value form (round-2 audit fix).
+	// *time.Time CreatedAt/UpdatedAt auto-stamp and round-trip like the
+	// value form.
 	if _, err := rio.Exec(ctx, db, "DROP TABLE IF EXISTS ptr_stampeds"); err != nil {
 		t.Fatalf("ptr-stamp drop: %v", err)
 	}
@@ -602,9 +598,8 @@ func runHardening(t *testing.T, db *rio.DB, dialect string) {
 		t.Fatalf("*time.Time CreatedAt round-trip: %v != %v", psBack.CreatedAt, ps.CreatedAt)
 	}
 
-	// A relation keyed by a binary column ([]byte PK/FK) must preload: the
-	// key binds as the original bytes, not a stringified map key that would
-	// miss a BLOB/BYTEA column.
+	// A []byte-keyed relation must preload: keys bind as bytes, not
+	// stringified map keys.
 	for _, ddl := range binKeyDDL[dialect] {
 		if _, err := rio.Exec(ctx, db, ddl); err != nil {
 			t.Fatalf("bin-key ddl %q: %v", ddl, err)
@@ -625,10 +620,8 @@ func runHardening(t *testing.T, db *rio.DB, dialect string) {
 		t.Fatalf("[]byte-keyed preload lost children: %+v", bps)
 	}
 
-	// A savepoint whose inner context died must still roll back — its ROLLBACK
-	// TO runs on a cancellation-decoupled context, so the inner insert cannot
-	// silently survive into the outer commit when the caller swallows the inner
-	// error.
+	// A savepoint whose inner context died must still roll back — ROLLBACK TO
+	// runs on a cancellation-decoupled context.
 	spRow := AllDefault{Note: "sp-leak"}
 	err = db.Tx(ctx, func(tx *rio.Tx) error {
 		inner, cancel := context.WithCancel(ctx)
@@ -706,8 +699,8 @@ type Widget struct {
 	Kind string
 }
 
-// Gadget has a soft-delete column: DeleteAll trashes matching rows, while
-// ForceDeleteAll hard-deletes them — trashed rows included.
+// Gadget has a soft-delete column: DeleteAll trashes, ForceDeleteAll
+// hard-deletes.
 type Gadget struct {
 	ID        int64
 	Name      string
@@ -732,12 +725,7 @@ var hardDeleteDDL = map[string][]string{
 	},
 }
 
-// runHardDelete covers the hard-delete verbs end-to-end on a real database.
-// DeleteAll on a model without a soft-delete column is a genuine DELETE that
-// removes only the rows the conditions match — the rest stay. On a soft-delete
-// model DeleteAll instead trashes the matching rows (they survive WithTrashed),
-// while ForceDeleteAll removes rows for good, reaching trashed rows too once
-// WithTrashed lifts the default filter.
+// runHardDelete covers DeleteAll/ForceDeleteAll semantics end-to-end.
 func runHardDelete(t *testing.T, db *rio.DB, dialect string) {
 	ctx := context.Background()
 	for _, ddl := range hardDeleteDDL[dialect] {
@@ -746,8 +734,7 @@ func runHardDelete(t *testing.T, db *rio.DB, dialect string) {
 		}
 	}
 
-	// No soft-delete column: DeleteAll is a real DELETE that removes only the
-	// matching rows.
+	// No soft-delete column: DeleteAll really deletes only the matching rows.
 	if err := rio.InsertAll(ctx, db, []Widget{
 		{Name: "a1", Kind: "a"}, {Name: "a2", Kind: "a"},
 		{Name: "b1", Kind: "b"}, {Name: "b2", Kind: "b"},
@@ -768,8 +755,8 @@ func runHardDelete(t *testing.T, db *rio.DB, dialect string) {
 		t.Fatalf("unmatched rows must survive: kept=%d err=%v", kept, err)
 	}
 
-	// Soft-delete column: DeleteAll trashes the matching rows. They hide from
-	// the default scope but remain visible WithTrashed.
+	// Soft-delete column: DeleteAll trashes — hidden by default, visible
+	// WithTrashed.
 	if err := rio.InsertAll(ctx, db, []Gadget{
 		{Name: "g1"}, {Name: "g2"}, {Name: "g3"}, {Name: "g4"},
 	}); err != nil {
@@ -786,8 +773,8 @@ func runHardDelete(t *testing.T, db *rio.DB, dialect string) {
 		t.Fatalf("soft DeleteAll keeps rows WithTrashed: all=%d err=%v", all, err)
 	}
 
-	// ForceDeleteAll hard-deletes, trashed rows included: WithTrashed lifts the
-	// default filter, AllRows opts into the unconditional bulk write.
+	// ForceDeleteAll hard-deletes trashed rows too; AllRows opts into the
+	// unconditional bulk write.
 	n, err = rio.From[Gadget]().WithTrashed().AllRows().ForceDeleteAll(ctx, db)
 	if err != nil || n != 4 {
 		t.Fatalf("ForceDeleteAll: n=%d err=%v", n, err)
@@ -796,8 +783,8 @@ func runHardDelete(t *testing.T, db *rio.DB, dialect string) {
 		t.Fatalf("ForceDeleteAll must remove trashed rows too: remaining=%d err=%v", remaining, err)
 	}
 
-	// Delete and Restore are idempotent end-to-end: a second Delete keeps
-	// the original stamp, restoring a live row bumps nothing.
+	// Delete and Restore are idempotent: a repeat Delete keeps the original
+	// stamp, a repeat Restore bumps nothing.
 	g := &Gadget{Name: "twice"}
 	if err := rio.Insert(ctx, db, g); err != nil {
 		t.Fatalf("insert gadget: %v", err)

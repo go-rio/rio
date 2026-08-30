@@ -3,20 +3,14 @@ package rio
 import "strings"
 
 // snakeCase converts an exported Go identifier to its snake_case column
-// form, splitting initialisms the way Go names read: within a run of
-// uppercase letters, the final letter belongs to the next word when a
-// lowercase letter follows (HTTPServer → http_server, ABTest → ab_test,
-// UserID → user_id, ID → id). An uppercase letter that follows a lowercase
-// letter or a digit also starts a new word, which keeps trailing digits
-// attached to their word (HTTPServer2 → http_server2) at the cost of a few
-// ugly-but-consistent corners (OAuth2Token → o_auth2_token, IPv4Address →
-// i_pv4_address) — rule consistency beats per-case perfection, and tags are
-// the escape hatch. Bytes outside [A-Za-z0-9_] are dropped, so for any input
-// the result matches [a-z0-9_]* and the function is idempotent. The goldens
-// in inflect_test.go freeze this mapping as a compatibility promise.
+// form. The last letter of an uppercase run starts the next word when a
+// lowercase letter follows (HTTPServer → http_server, UserID → user_id);
+// an uppercase letter after a lowercase letter or digit starts a new word
+// (HTTPServer2 → http_server2, OAuth2Token → o_auth2_token). Bytes outside
+// [A-Za-z0-9_] are dropped, so the result matches [a-z0-9_]* and the
+// function is idempotent. The goldens in inflect_test.go freeze this mapping.
 func snakeCase(name string) string {
-	// Boundary detection looks at surviving neighbors, so filter before
-	// splitting rather than while splitting.
+	// Boundary detection looks at surviving neighbors: filter first.
 	kept := make([]byte, 0, len(name))
 	for i := 0; i < len(name); i++ {
 		switch c := name[i]; {
@@ -39,10 +33,7 @@ func snakeCase(name string) string {
 	return string(out)
 }
 
-// startsWord reports whether the uppercase letter at kept[i] begins a new
-// word: it follows a lowercase letter or a digit, or it is the last letter
-// of an uppercase run and a lowercase letter comes next (the initialism
-// boundary rule).
+// startsWord reports whether the uppercase letter at kept[i] begins a new word.
 func startsWord(kept []byte, i int) bool {
 	if i == 0 {
 		return false
@@ -59,14 +50,8 @@ func isASCIILower(c byte) bool { return 'a' <= c && c <= 'z' }
 func isASCIIDigit(c byte) bool { return '0' <= c && c <= '9' }
 
 // pluralize returns the plural table form of a snake_case name. Only the
-// final underscore-separated segment is the noun; everything before it is a
-// modifier and passes through untouched (user_profile → user_profiles,
-// data_point → data_points — "data" being uninflected does not matter
-// there). Lookup order on that segment: irregular nouns, uninflected nouns,
-// then the spelling rules — consonant+y → ies, the s/sh/ch/x/z endings → es,
-// the short consonant+o list → es, and a bare s for everything else. The
-// input is already lowercase, as snakeCase produces it, and the output stays
-// lowercase.
+// final underscore-separated segment is inflected (user_profile →
+// user_profiles); input and output are lowercase.
 func pluralize(snake string) string {
 	head, noun := "", snake
 	if i := strings.LastIndexByte(snake, '_'); i >= 0 {
@@ -100,8 +85,8 @@ func pluralNoun(noun string) string {
 	return noun + "s"
 }
 
-// isConsonant reports whether c is a lowercase consonant letter. Digits and
-// underscores never count, so names like key2y stay with the default rule.
+// isConsonant reports whether c is a lowercase consonant letter; digits and
+// underscores never count.
 func isConsonant(c byte) bool {
 	switch c {
 	case 'a', 'e', 'i', 'o', 'u':
@@ -110,9 +95,8 @@ func isConsonant(c byte) bool {
 	return isASCIILower(c)
 }
 
-// irregularPlural maps nouns whose plural no spelling rule can derive. The
-// table is consulted before every rule, which is what lets quiz → quizzes
-// win over the plain z → es rule.
+// irregularPlural maps nouns whose plural no spelling rule can derive; it is
+// consulted before every rule (quiz → quizzes, not quizes).
 var irregularPlural = map[string]string{
 	"person":      "people",
 	"child":       "children",
@@ -149,8 +133,7 @@ var irregularPlural = map[string]string{
 	"quiz":        "quizzes",
 }
 
-// uninflected lists nouns whose plural equals the singular. Membership is
-// checked on the final segment only, never on modifiers.
+// uninflected lists nouns whose plural equals the singular.
 var uninflected = map[string]bool{
 	"sheep":       true,
 	"fish":        true,
@@ -169,8 +152,8 @@ var uninflected = map[string]bool{
 	"aircraft":    true,
 }
 
-// esOPlural lists the common consonant+o nouns that take es; every other o
-// ending appends a bare s (photo → photos, piano → pianos).
+// esOPlural lists the consonant+o nouns that take es; every other o ending
+// appends a bare s (photo → photos).
 var esOPlural = map[string]bool{
 	"hero":   true,
 	"potato": true,
@@ -179,11 +162,8 @@ var esOPlural = map[string]bool{
 	"veto":   true,
 }
 
-// tableName derives the conventional table name for a struct type as
-// pluralize(snakeCase(structName)): User → users, APIKey → api_keys,
-// Person → people, UserProfile → user_profiles. Models that want a
-// different name declare TableName or use WithTableNamer; the convention
-// itself never bends per model.
+// tableName derives the conventional table name for a struct type:
+// User → users, APIKey → api_keys, Person → people.
 func tableName(structName string) string {
 	return pluralize(snakeCase(structName))
 }

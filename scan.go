@@ -13,8 +13,7 @@ import (
 	"unsafe"
 )
 
-// fieldCodec is the per-field scan/bind strategy, decided once at plan time
-// so row scanning does zero classification work.
+// fieldCodec is the per-field scan/bind strategy, decided at plan time.
 type fieldCodec struct {
 	kind          scanKind
 	bits          int  // integer/float width for overflow checks
@@ -22,14 +21,11 @@ type fieldCodec struct {
 	bindPtrValuer bool // bind the field address so pointer-receiver Value() runs
 	nullTimeText  bool // sql.NullTime/sql.Null[time.Time]: parse rio's text form before Scan
 
-	// elemKind/elemBits are scanPtr's element strategy, classified at plan
-	// time like everything else: the per-cell path then allocates only the
-	// *T cell itself instead of rebuilding scaffolding per row.
+	// scanPtr's element strategy, classified at plan time.
 	elemKind scanKind
 	elemBits int
 
-	// elemSlice/elemSize serve scanPtr's chunked cell allocator: []T for
-	// reflect.MakeSlice and T's byte size for slot arithmetic.
+	// scanPtr's cell allocator: []T for reflect.MakeSlice, T's byte size.
 	elemSlice reflect.Type
 	elemSize  int
 }
@@ -37,16 +33,16 @@ type fieldCodec struct {
 type scanKind uint8
 
 const (
-	scanInt scanKind = iota // fast path: unsafe.Add + direct store
+	scanInt scanKind = iota
 	scanUint
 	scanFloat
 	scanBool
 	scanString
 	scanBytes
 	scanTime
-	scanJSON    // slow path: reflect + encoding/json
-	scanScanner // slow path: delegate to sql.Scanner, including NULL
-	scanPtr     // *T: one reflect.New per non-NULL cell, element written via the plan-time elem codec
+	scanJSON    // reflect + encoding/json
+	scanScanner // delegates to sql.Scanner, including NULL
+	scanPtr     // *T: cell from the column chunk, written via the elem codec
 )
 
 var (
@@ -55,26 +51,20 @@ var (
 	nullTimeGenericType = reflect.TypeFor[sql.Null[time.Time]]()
 )
 
-// colScanner adapts one field to sql.Rows.Scan. One instance per column per
-// query, rebased per row — O(cols) allocations per query, not per row.
+// colScanner adapts one field to sql.Rows.Scan, rebased per row.
 type colScanner struct {
 	f    *field
 	base unsafe.Pointer // start of the row's struct, set per row
 
-	// scanPtr cell chunk: non-NULL *T cells come out of a shared per-column
-	// backing array (1, 4, 16, 64, then 128-cell chunks) instead of one
-	// reflect.New per cell. Each cell stays an independent slot (rescans hand
-	// out a fresh one, writes never alias); a surviving *T keeps its chunk —
-	// at most 128 cells, never the whole column — alive. chunk is an
-	// unsafe.Pointer so the GC sees the backing array while cells are handed
-	// out; afterwards the published pointers keep it alive.
+	// chunk backs non-NULL *T cells; a surviving *T pins at most its chunk
+	// (≤128 cells), never the whole column. Held as unsafe.Pointer so the GC
+	// sees the backing array while cells are handed out.
 	chunk unsafe.Pointer
 	used  int // cells handed out of the current chunk
 	csize int // current chunk capacity, in cells
 }
 
-// rowScanner scans consecutive rows into values of one plan. cells and dests
-// are pooled across queries — zero steady-state allocations per query.
+// rowScanner scans consecutive rows of one plan; pooled via rsPool.
 type rowScanner struct {
 	cells []colScanner
 	dests []any
@@ -90,13 +80,7 @@ type scalarFieldResult struct {
 var scalarFields sync.Map
 
 // binder is one write call's binding context: the dialect plus the call's
-// clock instant with its rendered bind value memoized. Stamped columns all
-// carry the same now, so SQLite's text encoding and the interface boxing
-// happen once per call instead of once per stamped column — batch paths
-// would otherwise re-render the identical instant on every row. Callers
-// build it on the stack; zero now (no stamps in play) still memoizes
-// correctly because the memo is keyed by instant equality — every time rio
-// binds is already normalized, so Equal here is exact.
+// clock instant with its rendered bind value memoized.
 type binder struct {
 	d       Dialect
 	now     time.Time // normalized clock instant, zero when the call stamps nothing
@@ -110,11 +94,8 @@ func (s *colScanner) Scan(src any) error {
 	f := s.f
 	p := unsafe.Add(s.base, f.offset)
 
-	// publish is the scanPtr hand-off: the scanPtr case allocates the element
-	// cell and re-dispatches on the plan-time elem codec through this one
-	// switch body, avoiding a per-cell function call on the plain path. The
-	// field slot is written only after the element scanned cleanly, so a
-	// conversion error leaves the struct untouched.
+	// publish is the scanPtr hand-off: the field slot is written only after
+	// the element scanned cleanly, so an error leaves the struct untouched.
 	kind, bits := f.code.kind, f.code.bits
 	var publish unsafe.Pointer
 
@@ -190,8 +171,6 @@ scan:
 	case scanScanner:
 		return s.slowScanner(src)
 	case scanPtr:
-		// The element was classified at plan time (codecFor): take a fresh
-		// cell from the column's chunk and re-dispatch on the elem codec.
 		// basicCodec never yields scanPtr, so this jump cannot recurse.
 		publish, p = p, s.nextCell()
 		kind, bits = f.code.elemKind, f.code.elemBits
@@ -205,20 +184,13 @@ scan:
 	return nil
 }
 
-// --- NativeCell: the typed sinks of the native channel ---
-//
-// The typed Set methods mirror Scan without the interface boxing (see the
-// NativeCell godoc in native.go). Only the arms a native driver actually
-// routes — matching kind, or the text forms of the numeric kinds — are
-// boxing-free; mismatched kinds and Scanner fields fall back through the
-// boxed slow paths.
+// The typed Set methods below mirror Scan's semantics without the interface
+// boxing (see the NativeCell godoc in native.go).
 
 var _ NativeCell = (*colScanner)(nil)
 
-// ScanKind reports the cell's plan-time scan strategy (see NativeCell).
-// Pointer fields report the element's kind: the sinks allocate and publish
-// the *T cell internally and SetNull stores nil, so pointer-ness never
-// crosses the SPI.
+// ScanKind reports the cell's plan-time scan strategy. Pointer fields report
+// the element's kind; pointer-ness never crosses the SPI.
 func (s *colScanner) ScanKind() NativeScanKind {
 	k := s.f.code.kind
 	if k == scanPtr {
@@ -278,15 +250,11 @@ func (s *colScanner) SetUint64(v uint64) error {
 	case scanUint:
 		err = storeUint(s.f, p, bits, v)
 	case scanInt:
-		// A uint64 into a signed field: srcInt gates the high-bit overflow
-		// exactly as Scan(uint64(v)) would (a mismatched kind — a native driver
-		// routes here only off ScanKind's uint verdict).
 		var n int64
 		if n, err = srcInt(v, s.f); err == nil {
 			err = storeInt(s.f, p, bits, n)
 		}
 	case scanFloat:
-		// Mirrors Scan(uint64(v)): srcFloat widens every integer to float64.
 		err = storeFloat(s.f, p, bits, float64(v))
 	default:
 		return s.sinkSlow(v)
@@ -428,8 +396,7 @@ func (s *colScanner) SetTime(v time.Time) error {
 
 func (s *colScanner) SetNull() error { return s.scanNull() }
 
-// nextCell returns a zeroed slot for one non-NULL scanPtr cell, growing the
-// chunk when exhausted.
+// nextCell returns a zeroed slot for one non-NULL scanPtr cell.
 func (s *colScanner) nextCell() unsafe.Pointer {
 	if s.used == s.csize {
 		n := s.csize * 4
@@ -446,10 +413,8 @@ func (s *colScanner) nextCell() unsafe.Pointer {
 	return p
 }
 
-// scanNull applies the NULL rules for one cell. Scan(nil) and SetNull are
-// both this function, so the two channels' NULL semantics — pointer nil-out,
-// bytes nil, nil *T for json, the softdelete zero-time exception, and the
-// error text everything else gets — cannot drift.
+// scanNull applies the NULL rules for one cell; Scan(nil) and SetNull share
+// it so the two channels cannot drift.
 func (s *colScanner) scanNull() error {
 	f := s.f
 	p := unsafe.Add(s.base, f.offset)
@@ -463,16 +428,14 @@ func (s *colScanner) scanNull() error {
 		*(*[]byte)(p) = nil
 		return nil
 	case scanJSON:
-		// The write side stores SQL NULL for a nil *T json field; the
-		// round trip must come back as nil, not as an error.
+		// A nil *T json field round-trips through SQL NULL.
 		if f.typ.Kind() == reflect.Pointer {
 			reflect.NewAt(f.typ, p).Elem().SetZero()
 			return nil
 		}
 	case scanTime:
 		if f.isSoftDelete {
-			// NULL means "not deleted": the softdelete tag opts this
-			// column into the zero-time exception.
+			// NULL means "not deleted": the zero-time exception.
 			*(*time.Time)(p) = time.Time{}
 			return nil
 		}
@@ -483,11 +446,8 @@ func (s *colScanner) scanNull() error {
 
 func (s *colScanner) slowScanner(src any) error {
 	f := s.f
-	// rio owns the null-time types' encoding on both sides: the write path
-	// binds the dialect's text form, so a text column (SQLite TEXT, or an
-	// expression column with no decltype for the driver to convert) must
-	// parse back here — sql.NullTime's own Scan rejects strings. The type
-	// test happened at plan time, like every other classification.
+	// rio writes null-time columns in the dialect's text form, which
+	// sql.NullTime's own Scan rejects — parse text back before delegating.
 	if f.code.nullTimeText {
 		switch src.(type) {
 		case string, []byte:
@@ -504,9 +464,8 @@ func (s *colScanner) slowScanner(src any) error {
 		return sc.Scan(src)
 	}
 	if f.typ.Kind() == reflect.Pointer {
-		// The field itself is a pointer to a Scanner (*sql.NullString):
-		// scanning through a zero struct means the pointer is nil, so
-		// allocate before delegating — and map NULL back to nil.
+		// Pointer-to-Scanner field: allocate before delegating; NULL maps
+		// back to nil.
 		elem := v.Elem()
 		if src == nil {
 			elem.SetZero()
@@ -517,9 +476,8 @@ func (s *colScanner) slowScanner(src any) error {
 		}
 		return elem.Interface().(sql.Scanner).Scan(src)
 	}
-	// The value type implements Scanner directly (rare, value receiver).
-	// comma-ok, not a bare assertion: a panic here happens while database/sql
-	// holds closemu.RLock, turning it into a permanently blocked rows.Close.
+	// comma-ok: a panic here runs under database/sql's closemu.RLock and
+	// would block rows.Close forever.
 	sc, ok := v.Elem().Interface().(sql.Scanner)
 	if !ok {
 		return fmt.Errorf("rio: column %q: field %s (%s) does not implement sql.Scanner as a value", f.column, f.name, f.typ)
@@ -527,11 +485,8 @@ func (s *colScanner) slowScanner(src any) error {
 	return sc.Scan(src)
 }
 
-// sinkTarget resolves one typed store's destination: the field slot, or —
-// for pointer fields — a fresh cell from the column's chunk, with the field
-// slot returned as the publish target. Callers publish only after a clean
-// store; a conversion error leaves the struct untouched (Scan's discipline,
-// including the consumed cell).
+// sinkTarget resolves one typed store's destination. Callers publish only
+// after a clean store, so an error leaves the struct untouched.
 func (s *colScanner) sinkTarget() (p, publish unsafe.Pointer, kind scanKind, bits int) {
 	f := s.f
 	p = unsafe.Add(s.base, f.offset)
@@ -543,9 +498,7 @@ func (s *colScanner) sinkTarget() (p, publish unsafe.Pointer, kind scanKind, bit
 	return p, publish, kind, bits
 }
 
-// sinkSlow is the boxed tail of the typed sinks: Scanner fields delegate the
-// value exactly as Scan would, and every impossible conversion reports the
-// same error the stdlib channel does.
+// sinkSlow is the boxed fallback of the typed sinks.
 func (s *colScanner) sinkSlow(src any) error {
 	if s.f.code.kind == scanScanner {
 		return s.slowScanner(src)
@@ -553,8 +506,7 @@ func (s *colScanner) sinkSlow(src any) error {
 	return convErr(s.f, src)
 }
 
-// sealedNativeCell seals NativeCell to this package: drivers consume cells,
-// never implement them, so rio can add Set methods without breaking a driver.
+// sealedNativeCell seals NativeCell: drivers consume cells, never implement them.
 func (s *colScanner) sealedNativeCell() {}
 
 func (rs *rowScanner) release() {
@@ -582,18 +534,16 @@ func (b *binder) time(nt time.Time) any {
 	return b.d.bindTime(nt)
 }
 
-// codecFor classifies a field. Order is the documented priority chain:
-// json tag > sql.Scanner > pointer > []byte > basics. Anything else is a
-// plan-time error, not a runtime surprise.
+// codecFor classifies a field. Priority: json tag > sql.Scanner > pointer >
+// []byte > basics; anything else is a plan-time error.
 func codecFor(f *field) (fieldCodec, error) {
 	t := f.typ
 	if f.jsonCol {
 		return fieldCodec{kind: scanJSON}, nil
 	}
 	if t.Kind() == reflect.Interface {
-		// An interface satisfying sql.Scanner would pass the Implements check
-		// below, but a zero struct holds a nil interface: scanning has nothing
-		// to Scan into, and a panic inside Rows.Scan wedges rows.Close forever.
+		// A zero struct holds a nil interface: nothing to Scan into, and a
+		// panic inside Rows.Scan wedges rows.Close forever.
 		return fieldCodec{}, fmt.Errorf(
 			"field %s: interface-typed fields cannot be mapped to a column; "+
 				"use a concrete type implementing sql.Scanner, or exclude it with `rio:\"-\"`",
@@ -602,14 +552,9 @@ func codecFor(f *field) (fieldCodec, error) {
 	}
 	if t.Implements(scannerType) || reflect.PointerTo(t).Implements(scannerType) {
 		c := fieldCodec{kind: scanScanner}
-		// A Scanner type that also customizes its stored form through
-		// driver.Valuer needs the same treatment as the basic kinds below:
-		// binding the bare value would only run a value-receiver Value() —
-		// database/sql never takes an address — so a pointer-receiver Valuer
-		// would silently store the raw underlying value. The two null-time
-		// types are excluded: rio owns their encoding (bindArg normalizes and
-		// dialect-encodes the inner time), and their value-receiver Value()
-		// must not preempt that.
+		// Scanner+Valuer types bind through Value() (see the basic-kind case
+		// below). The null-time types are excluded: rio owns their encoding,
+		// and their value-receiver Value() must not preempt it.
 		c.nullTimeText = t == nullTimeType || t == nullTimeGenericType
 		if !c.nullTimeText {
 			if t.Implements(valuerType) {
@@ -636,11 +581,8 @@ func codecFor(f *field) (fieldCodec, error) {
 	if err != nil {
 		return c, err
 	}
-	// A basic-kind type that customizes its stored form through driver.Valuer
-	// (value receiver, so a bound value triggers it) must bind through Value(),
-	// not the unsafe fast read that would hand the driver the raw underlying
-	// value. Scan stays on the fast path: the column already holds the encoded
-	// form. (Scanner types get the same flags in their branch above.)
+	// Valuer types must bind through Value(), not the unsafe fast read that
+	// would hand the driver the raw underlying value.
 	if t.Implements(valuerType) {
 		c.bindValuer = true
 	} else if reflect.PointerTo(t).Implements(valuerType) {
@@ -674,15 +616,11 @@ func basicCodec(t reflect.Type, f *field) (fieldCodec, error) {
 		f.name, t)
 }
 
-// The store helpers below write one decoded value into a field slot with the
-// width and overflow rules attached. Scan (via the src converters) and the
-// NativeCell typed sinks run these same functions, so the two channels'
-// storage semantics cannot drift. Error construction lives in out-of-line
-// funcs to keep the helpers within the inlining budget — the hot path stays
-// call-free.
+// The store helpers below are shared by Scan and the typed sinks. Error
+// construction stays out-of-line to keep them within the inlining budget.
 
 func storeInt(f *field, p unsafe.Pointer, bits int, n int64) error {
-	if bits == 64 { // int64 and int, the dominant widths: stays inlined
+	if bits == 64 {
 		*(*int64)(p) = n
 		return nil
 	}
@@ -751,10 +689,8 @@ func storeBytes(p unsafe.Pointer, v []byte) {
 
 func storeJSON(f *field, p unsafe.Pointer, data []byte) error {
 	dst := reflect.NewAt(f.typ, p)
-	// Unmarshal merges into a non-nil map and overwrites only the keys
-	// present in the JSON of a struct. Scan-back targets (Upsert reloading
-	// the winning row into the caller's struct) still hold the caller's
-	// previous value, which would blend with what the database stored.
+	// Zero first: Unmarshal merges into existing maps and struct fields, and
+	// scan-back targets still hold the caller's previous value.
 	dst.Elem().SetZero()
 	if err := json.Unmarshal(data, dst.Interface()); err != nil {
 		return fmt.Errorf("rio: column %q: decoding JSON into %s: %w", f.column, f.typ, err)
@@ -770,8 +706,6 @@ func uintOverflowErr(f *field, n uint64) error {
 	return fmt.Errorf("rio: column %q value %d overflows %s", f.column, n, f.typ)
 }
 
-// uintFromInt64 is the negative-value gate shared by srcUint's int64 arm and
-// SetInt64's unsigned arm.
 func uintFromInt64(f *field, v int64) (uint64, error) {
 	if v < 0 {
 		return 0, negativeUintErr(f, v)
@@ -783,9 +717,8 @@ func negativeUintErr(f *field, v int64) error {
 	return fmt.Errorf("rio: column %q value %d is negative but field %s is unsigned", f.column, v, f.name)
 }
 
-// nullable reports whether the field can hold a database NULL: a pointer
-// target, or the softdelete column's NULL↔zero-time exception. Scanner
-// fields decide for themselves and are judged separately where it matters.
+// nullable reports whether the field can hold NULL: a pointer, or the
+// softdelete NULL↔zero-time exception. Scanner fields decide for themselves.
 func (f *field) nullable() bool {
 	return f.typ.Kind() == reflect.Pointer || f.isSoftDelete
 }
@@ -794,10 +727,8 @@ func convErr(f *field, src any) error {
 	return fmt.Errorf("rio: column %q: cannot convert %T into field %s (%s)", f.column, src, f.name, f.typ)
 }
 
-// The src* converters accept, beyond database/sql's canonical driver values,
-// the natively typed values clickhouse-go delivers: it bypasses the canonical
-// set via its NamedValueChecker, so UInt64 columns arrive as uint64, Int32 as
-// int32, Float32 as float32, and so on.
+// The src* converters also accept the natively typed values clickhouse-go
+// delivers (uint64, int32, float32, …) beyond database/sql's canonical set.
 
 func srcInt(src any, f *field) (int64, error) {
 	switch v := src.(type) {
@@ -977,11 +908,9 @@ func parseTime(s string, f *field) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("rio: column %q: cannot parse %q as time.Time", f.column, s)
 }
 
-// newRowScanner acquires a scanner from the pool, sized and fully reset for
-// this query's field list — a pooled cell must never leak chunk state, or a
-// query could hand out cells another query's structs already point at.
-// Callers release() once the last Scan returned; the driver never touches
-// dests after rows.Scan returns, so releasing before rows.Close is fine.
+// newRowScanner acquires a fully reset pooled scanner: a leaked chunk could
+// hand out cells another query's structs already point at. Callers release()
+// after the last Scan; the driver never touches dests past rows.Scan.
 func newRowScanner(fields []*field, extras []any) *rowScanner {
 	rs := rsPool.Get().(*rowScanner)
 	n := len(fields)
@@ -999,8 +928,7 @@ func newRowScanner(fields []*field, extras []any) *rowScanner {
 	return rs
 }
 
-// entityFields verifies the result set matches the plan's column order — the
-// last line of defense against schema drift between render and execution.
+// entityFields verifies the result set matches the plan's column order.
 func entityFields(rows rows, p *plan, extras int) ([]*field, error) {
 	cols, err := rows.Columns()
 	if err != nil {
@@ -1018,10 +946,8 @@ func entityFields(rows rows, p *plan, extras int) ([]*field, error) {
 }
 
 // namedFields maps result columns to plan fields by name (Raw queries).
-// Unknown columns are an error — silently dropping data is how schema drift
-// hides — and so are missing ones: a partially scanned entity handed to
-// Update would overwrite the unselected columns with zero values. Partial
-// projections belong in DTO types, whose plan the result then covers fully.
+// Unknown and missing columns are errors: a partially scanned entity handed
+// to Update would zero the unselected columns.
 func namedFields(rows rows, p *plan) ([]*field, error) {
 	cols, err := rows.Columns()
 	if err != nil {
@@ -1057,25 +983,17 @@ func namedFields(rows rows, p *plan) ([]*field, error) {
 	return fields, nil
 }
 
-// mergeClose closes rows and, when consumption itself succeeded, promotes the
-// Close error to the result. For a result set left undrained (single-row
-// reads, probes), Close is where drivers surface deferred protocol and
-// connection errors — pgx reads the trailing command status there — so a
-// deferred rows.Close() that drops its return would report a failed statement
-// as success. err points at the caller's named return; on a fully drained
-// result Close is a no-op (database/sql already auto-closed at EOF) and
-// nothing changes.
+// mergeClose closes rows and, when consumption succeeded, promotes the Close
+// error: on an undrained result Close is where drivers surface deferred
+// protocol errors. err points at the caller's named return.
 func mergeClose(rows rows, err *error) {
 	if cerr := rows.Close(); cerr != nil && *err == nil {
 		*err = cerr
 	}
 }
 
-// drainRows is the shared tail of the entity and Raw Rows iterators: it owns
-// the finished/finish bookkeeping, per-row scanning, early-break close, and
-// the yielded-row count hooks receive — the part that must never drift
-// between the two channels. resolve builds the scan plan under the same
-// close guarantee (its panic still closes the rows).
+// drainRows is the shared tail of the entity and Raw Rows iterators. resolve
+// runs under the same close guarantee: its panic still closes the rows.
 func drainRows[T any](rows rows, finish func(error, int64), resolve func() ([]*field, error), yield func(T, error) bool) {
 	var zero T
 	finished := false
@@ -1165,10 +1083,7 @@ func scanScalarsCap[T any](rows rows, maxRows, capacity int) (out []T, err error
 	if err != nil {
 		return nil, err
 	}
-	// The cell and its dest slot share one escaping box: the cell's address
-	// reaches the heap through the dest interface anyway, and a variadic
-	// slice built fresh at the interface call would heap-allocate per row
-	// (rows is an interface, so the callee is opaque to escape analysis).
+	// One escaping box for cell and dest avoids a per-row variadic allocation.
 	var box struct {
 		cell colScanner
 		dest [1]any
@@ -1210,9 +1125,8 @@ func scanScalarOne[T any](rows rows) (out T, found bool, err error) {
 	return out, true, rows.Err()
 }
 
-// synthField builds an ad-hoc scan field outside any plan — name and column
-// only label errors; the codec comes from the type alone, and the zero
-// offset makes the cell scan into a standalone buffer.
+// synthField builds an ad-hoc scan field outside any plan; the zero offset
+// makes the cell scan into a standalone buffer.
 func synthField(name, column string, t reflect.Type) (*field, error) {
 	f := &field{name: name, column: column, typ: t}
 	codec, err := codecFor(f)
@@ -1235,7 +1149,7 @@ func scalarField(t reflect.Type) (*field, error) {
 }
 
 // isScalarType reports whether T scans as a single column rather than a
-// struct row. time.Time is a struct but scans as one column.
+// struct row.
 func isScalarType(t reflect.Type) bool {
 	if t == timeType || t == timePtrType {
 		return true
@@ -1250,10 +1164,8 @@ func isScalarType(t reflect.Type) bool {
 	return k != reflect.Struct
 }
 
-// bindArgFast extracts a bind value through the field's offset, skipping the
-// reflect.Value round-trip for fixed-layout kinds. ok=false falls back to
-// bindArg. The same discipline as the scan fast path applies: offsets only
-// cross value-embedded structs, never pointers.
+// bindArgFast reads a bind value through the field's offset; ok=false falls
+// back to bindArg. Offsets only cross value-embedded structs, never pointers.
 func bindArgFast(f *field, base unsafe.Pointer, b *binder) (any, bool, error) {
 	p := unsafe.Add(base, f.offset)
 	switch f.code.kind {
@@ -1310,10 +1222,7 @@ func bindArgFast(f *field, base unsafe.Pointer, b *binder) (any, bool, error) {
 		}
 		nt := normalizeTime(t)
 		if nt != t {
-			// Write the normalized form back (representation compare — the
-			// instant is unchanged): the struct then holds exactly what the
-			// database stores, so insert-then-reload compares Equal even for
-			// caller-provided nanosecond or zoned times.
+			// Write back so the struct holds exactly what the database stores.
 			*(*time.Time)(p) = nt
 		}
 		if err := checkBindTime(b.d, nt); err != nil {
@@ -1368,9 +1277,8 @@ func zeroFast(f *field, base unsafe.Pointer) (isZero, ok bool) {
 	return false, false
 }
 
-// fieldValue binds one field, fast path first. A driver.Valuer basic type
-// skips the fast path so bindArg hands the driver the value itself, letting
-// Value() run.
+// fieldValue binds one field, fast path first; Valuer types skip it so
+// Value() runs.
 func fieldValue(f *field, base unsafe.Pointer, rv reflect.Value, b *binder) (any, error) {
 	if !f.code.bindValuer && !f.code.bindPtrValuer {
 		if a, ok, err := bindArgFast(f, base, b); ok {
@@ -1380,7 +1288,6 @@ func fieldValue(f *field, base unsafe.Pointer, rv reflect.Value, b *binder) (any
 	return bindArg(f, rv.FieldByIndex(f.index), b)
 }
 
-// fieldIsZero checks one field, fast path first.
 func fieldIsZero(f *field, base unsafe.Pointer, rv reflect.Value) bool {
 	if z, ok := zeroFast(f, base); ok {
 		return z
@@ -1388,7 +1295,6 @@ func fieldIsZero(f *field, base unsafe.Pointer, rv reflect.Value) bool {
 	return rv.FieldByIndex(f.index).IsZero()
 }
 
-// scanOne scans exactly one row into a fresh T, the Find fast path.
 func scanOne[T any](rows rows, p *plan) (out *T, err error) {
 	defer mergeClose(rows, &err)
 	fields, err := entityFields(rows, p, 0)
@@ -1443,10 +1349,8 @@ func bindArg(f *field, v reflect.Value, b *binder) (any, error) {
 		}
 		v = v.Elem()
 	}
-	// Mirror normalizeArgs: left to the driver's Valuer path, the inner time
-	// would skip microsecond truncation and rio's SQLite text encoding, so the
-	// same field would store differently under Insert and Upsert. The
-	// normalized form is written back, as on the fast path.
+	// Bind the inner time here (as normalizeArgs does): the driver's Valuer
+	// path would skip truncation and rio's SQLite text encoding.
 	if v.Type() == nullTimeType {
 		if nv := v.Interface().(sql.NullTime); nv.Valid {
 			nt := normalizeTime(nv.Time)
@@ -1498,11 +1402,8 @@ func bindArg(f *field, v reflect.Value, b *binder) (any, error) {
 	return v.Interface(), nil
 }
 
-// chByteArg converts a byte-slice argument — named types like
-// json.RawMessage included — into the string form ClickHouse needs
-// (normalizeArgs' slow case; the exact []byte case is handled inline).
-// driver.Valuer implementers are left alone so their Value() runs, and a
-// typed nil slice stays SQL NULL.
+// chByteArg converts byte-slice arguments to ClickHouse's string form.
+// Valuer implementers are left alone; a typed nil slice stays SQL NULL.
 func chByteArg(a any) (any, bool) {
 	t := reflect.TypeOf(a)
 	if t == nil || t.Kind() != reflect.Slice || t.Elem().Kind() != reflect.Uint8 || t.Implements(valuerType) {
@@ -1515,11 +1416,9 @@ func chByteArg(a any) (any, bool) {
 	return string(v.Bytes()), true
 }
 
-// bindOverflowUint binds a uint64 whose high bit is set. database/sql refuses
-// it, so MySQL (BIGINT UNSIGNED) and PostgreSQL (numeric) take the decimal
-// literal as a string. SQLite has no unsigned 64-bit integer: an INTEGER
-// column silently coerces the oversized literal to REAL and loses precision,
-// so rio fails loudly there instead of corrupting the row.
+// bindOverflowUint binds a uint64 with the high bit set as a decimal string
+// (database/sql refuses it). SQLite would silently coerce that to REAL and
+// lose precision, so it errors there instead.
 func bindOverflowUint(d Dialect, n uint64) (any, error) {
 	if d.name() == "sqlite" {
 		return nil, fmt.Errorf(
@@ -1531,9 +1430,8 @@ func bindOverflowUint(d Dialect, n uint64) (any, error) {
 	return strconv.FormatUint(n, 10), nil
 }
 
-// normalizeTime is the single write-side time rule: UTC, no monotonic
-// reading, microsecond precision (the ceiling shared by PG and MySQL —
-// nanoseconds would make insert-then-reload comparisons fail forever).
+// normalizeTime is the write-side time rule: UTC, no monotonic reading,
+// microsecond precision (PG and MySQL's shared ceiling).
 func normalizeTime(t time.Time) time.Time {
 	return t.UTC().Round(0).Truncate(time.Microsecond)
 }

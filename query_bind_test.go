@@ -215,8 +215,7 @@ func TestQueryDeferredSliceArgs(t *testing.T) {
 
 	f := newFakeDB()
 	db := f.open()
-	// Warm the scalar SQL shape first. A later slice must bypass that cache and
-	// render its own expanded shape.
+	// Warm the scalar SQL shape; a later slice must bypass that cache and expand.
 	f.queueRows(userCols)
 	if _, err := q.All(ctx, db, int64(1)); err != nil {
 		t.Fatalf("scalar All: %v", err)

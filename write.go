@@ -180,8 +180,8 @@ func ForceDelete[T any](ctx context.Context, db Queryer, row *T) error {
 }
 
 // Restore clears the deletion timestamp of one soft-deleted row by primary
-// key — the entity-form inverse of Delete. The version column, when present,
-// is checked and bumped like any other write.
+// key. The version column, when present, is checked and bumped like any
+// other write.
 func Restore[T any](ctx context.Context, db Queryer, row *T) error {
 	p, err := planOf[T]()
 	if err != nil {
@@ -240,9 +240,7 @@ func Restore[T any](ctx context.Context, db Queryer, row *T) error {
 		return err
 	}
 	if n == 0 {
-		// The IS NOT NULL predicate makes "already live" a zero-affected
-		// outcome on every dialect: idempotent success adopts the stored
-		// state instead of bumping the version or refreshing UpdatedAt.
+		// Already-live rows match zero; adopt the stored state (idempotent).
 		return resolveSoftNoop(ctx, db, p, rv, false)
 	}
 	clearTime(p.softDel, rv)
@@ -306,9 +304,7 @@ func softDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 		return err
 	}
 	if n == 0 {
-		// The IS NULL predicate makes "already trashed" a zero-affected
-		// outcome on every dialect: idempotent success adopts the stored
-		// stamp — re-stamping would erase the original deletion time.
+		// Already-trashed rows match zero; adopt the stored stamp (idempotent).
 		return resolveSoftNoop(ctx, db, p, rv, true)
 	}
 	setTime(p.softDel, rv, now)
@@ -502,7 +498,6 @@ func setTime(f *field, rv reflect.Value, now time.Time) {
 	setTimePtr(f, rv, now)
 }
 
-// setTimePtr keeps pointer-field allocation off the value-field fast path.
 func setTimePtr(f *field, rv reflect.Value, now time.Time) {
 	rv.FieldByIndex(f.index).Set(reflect.ValueOf(&now))
 }
@@ -540,7 +535,6 @@ func insertColumns(
 	cacheable = len(p.fields) <= 64
 	base := rv.Addr().UnsafePointer()
 	if !p.hasOmitZero {
-		// plan.insCols precomputes this partition.
 		cols, bits = p.fields, p.allBits
 		if p.autoIncr != nil && fieldIsZero(p.autoIncr, base, rv) {
 			cols, back, bits = p.insCols, p.insBack, p.insBits
@@ -764,8 +758,7 @@ func setBits(p *plan, fields []*field) (uint64, bool) {
 	return bits, true
 }
 
-// appendPKWhereSQL renders the WHERE pk [AND version] tail, placeholders in
-// unified ? form — the render half of appendPKWhere, cacheable per grammar.
+// appendPKWhereSQL renders the WHERE pk [AND version] tail in unified ? form.
 func appendPKWhereSQL(b []byte, d Dialect, p *plan) []byte {
 	b = appendPKOnlyWhere(b, d, p)
 	if p.version != nil {
@@ -773,12 +766,11 @@ func appendPKWhereSQL(b []byte, d Dialect, p *plan) []byte {
 		b = d.quote(b, p.version.column)
 		b = append(b, " = ?"...)
 	}
-	return b // still in unified ? form; crudSQL rebinds the whole statement
+	return b
 }
 
 // appendPKOnlyWhere renders the primary-key predicate without the version
-// clause appendPKWhereSQL adds: probes ask about the row itself, not the
-// caller's snapshot of it.
+// clause: probes ask about the row, not the caller's snapshot of it.
 func appendPKOnlyWhere(b []byte, d Dialect, p *plan) []byte {
 	for i, pk := range p.pks {
 		if i == 0 {
@@ -827,7 +819,7 @@ func zeroAffectedMeansMissing(ctx context.Context, db Queryer, p *plan, rv refle
 }
 
 // appendVersionBump renders ", version = version + 1" when the plan has an
-// optimistic-lock column; Update, Restore, and softDelete all bump it.
+// optimistic-lock column.
 func appendVersionBump(b []byte, d Dialect, p *plan) []byte {
 	if p.version == nil {
 		return b
@@ -839,10 +831,8 @@ func appendVersionBump(b []byte, d Dialect, p *plan) []byte {
 	return append(b, " + 1"...)
 }
 
-// appendCurrentReadProbeTail locks a zero-affected probe on MySQL: under
-// InnoDB REPEATABLE READ a plain SELECT reads the snapshot, and the answer
-// must match the UPDATE's current-read view; autocommit releases the lock
-// immediately. Other dialects read committed state without it.
+// appendCurrentReadProbeTail locks the probe on MySQL: a plain SELECT reads
+// the REPEATABLE READ snapshot, not the UPDATE's current-read view.
 func appendCurrentReadProbeTail(b []byte, d Dialect) []byte {
 	if d.name() != "mysql" {
 		return b
@@ -876,11 +866,8 @@ func probeCell(f *field, dst reflect.Value) *colScanner {
 	return &colScanner{f: &cf, base: dst.UnsafePointer()}
 }
 
-// probeSoftState reads the softdelete stamp (and version) by primary key —
-// primary key only, never the caller's version: the probe asks about the row,
-// not the caller's snapshot of it. It serves the cold zero-affected paths of
-// Delete and Restore, whose trash predicates make "already in the target
-// state" a zero-matched outcome on every dialect.
+// probeSoftState reads the softdelete stamp (and version) by primary key
+// only — the probe asks about the row, not the caller's snapshot of it.
 func probeSoftState(ctx context.Context, db Queryer, p *plan, rv reflect.Value) (softProbeState, error) {
 	g := db.gram()
 	d := g.d
@@ -930,9 +917,8 @@ func probeSoftState(ctx context.Context, db Queryer, p *plan, rv reflect.Value) 
 	return st, nil
 }
 
-// resolveSoftNoop resolves a zero-affected soft write: it adopts the stored
-// state when the row is already in the wanted trash state (idempotent
-// success), and otherwise reports the version conflict or the missing row.
+// resolveSoftNoop resolves a zero-affected soft write: adopt the stored state
+// when the row is already in the wanted trash state, else stale or missing.
 func resolveSoftNoop(ctx context.Context, db Queryer, p *plan, rv reflect.Value, wantTrashed bool) error {
 	st, err := probeSoftState(ctx, db, p, rv)
 	if err != nil {
@@ -949,8 +935,7 @@ func resolveSoftNoop(ctx context.Context, db Queryer, p *plan, rv reflect.Value,
 }
 
 // adoptSoftState writes the probed stamp and version into the caller's
-// struct, so the idempotent paths keep the invariant that the struct holds
-// exactly what the database stores.
+// struct: it must hold exactly what the database stores.
 func adoptSoftState(p *plan, rv reflect.Value, st softProbeState) {
 	rv.FieldByIndex(p.softDel.index).Set(st.deleted.Elem())
 	if p.version != nil {

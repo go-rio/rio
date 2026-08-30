@@ -2,23 +2,18 @@ package bench
 
 import (
 	"context"
-	"os"
 	"testing"
 
 	"github.com/go-rio/postgres"
 	"github.com/go-rio/rio"
 )
 
-// PostgreSQL relation-path benchmarks: the same 100×5 shape as the SQLite
-// pair, but over a real network round trip per statement — the dimension
-// batching addresses. Both channels run so the native seam stays honest.
+// PostgreSQL relation benchmarks: the same 100×5 shape as the SQLite pair,
+// over real network round trips; both channels run.
 
 func benchPGRelationDB(b *testing.B, native bool) *rio.DB {
 	b.Helper()
-	dsn := os.Getenv("RIO_BENCH_PG_DSN")
-	if dsn == "" {
-		b.Skip("RIO_BENCH_PG_DSN not set")
-	}
+	dsn := pgDSN(b)
 	ctx := context.Background()
 	var db *rio.DB
 	var err error
@@ -75,8 +70,8 @@ func benchPGRelationDB(b *testing.B, native bool) *rio.DB {
 }
 
 func benchPGWithPosts(b *testing.B, db *rio.DB) {
-	// Two preloads and a reused count: three statements, and on a batching
-	// channel the relation layer's two collapse into one round trip.
+	// Three statements; on a batching channel the two preloads collapse into
+	// one round trip.
 	q := rio.From[BenchAuthor]().With("Posts").With("Reviews").WithCount("Posts").Must()
 	ctx := context.Background()
 	b.ReportAllocs()

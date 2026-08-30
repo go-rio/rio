@@ -9,10 +9,8 @@ import (
 	"testing"
 )
 
-// This file pins rebind by differential fuzzing against naiveRebind, an
-// independent reference implementation. naiveRebind trades everything for
-// obviousness: one explicit state per lexical region, one byte per step, no
-// shared code with rebind.go beyond the lexProfile flags it interprets.
+// Pins rebind by differential fuzzing against naiveRebind, an independent
+// reference that trades everything for obviousness: one state per region, one byte per step.
 
 const (
 	nvSQL      = iota // plain statement text
@@ -85,10 +83,7 @@ func naiveRebind(p lexProfile, style bindStyle, query string, args []any) (strin
 					i++
 				}
 			case c == '$' && p.heredoc && !naiveIdentByte(query, i) && naiveHeredocEnd(query, i) > 0:
-				// ClickHouse heredoc, consumed whole: unlike PG's dollar quote
-				// the tag may be empty or start with a digit, and without a
-				// closing delimiter no heredoc exists at all (the guard above
-				// then falls through to the plain-byte default).
+				// ClickHouse heredoc, consumed whole; unterminated ones are not heredocs.
 				end := naiveHeredocEnd(query, i)
 				if style == bindQuestionEsc && len(args) > 0 && strings.ContainsRune(query[i:end], '?') {
 					return "", nil, fmt.Errorf("naive: ? inside heredoc at byte %d with arguments", i)
@@ -108,8 +103,7 @@ func naiveRebind(p lexProfile, style bindStyle, query string, args []any) (strin
 				i++
 				state = nvLine
 			case c == '/' && p.slashSlashComment && i+1 < len(query) && query[i+1] == '/':
-				// ClickHouse // line comment, consumed whole so the driver
-				// blind spot check can see its region.
+				// ClickHouse // comment, consumed whole so the blind-spot check sees its region.
 				end := i
 				for end < len(query) && query[end] != '\n' {
 					end++
@@ -125,8 +119,7 @@ func naiveRebind(p lexProfile, style bindStyle, query string, args []any) (strin
 				depth = 1
 				state = nvBlock
 			case c == '\\' && p.backslashQuestion && i+1 < len(query) && query[i+1] == '?':
-				// The client-side binder's own literal-? escape: pass it
-				// through, bind nothing.
+				// The driver's own literal-? escape: pass through, bind nothing.
 				out = append(out, '\\', '?')
 				i += 2
 			case c == '?':
@@ -151,8 +144,7 @@ func naiveRebind(p lexProfile, style bindStyle, query string, args []any) (strin
 					if len(elems) == 0 {
 						return "", nil, fmt.Errorf("naive: empty slice at byte %d", i)
 					}
-					// Flat expansion: the caller's "IN (?)" keeps its own
-					// parentheses, the sqlx convention.
+					// Flat expansion, the sqlx convention.
 					expand = true
 					for k, e := range elems {
 						if k > 0 {
@@ -303,10 +295,8 @@ func naiveRebind(p lexProfile, style bindStyle, query string, args []any) (strin
 	return string(out), args, nil
 }
 
-// naiveHeredocEnd finds the index after a ClickHouse heredoc's closing
-// delimiter, or 0 when the $ opens no heredoc (no opening tag shape, or no
-// closing delimiter anywhere — ClickHouse then lexes the $ as an ordinary
-// byte, unlike PG's swallow-to-end dollar quote).
+// naiveHeredocEnd finds the index after a heredoc's closing delimiter, or 0
+// when the $ opens no heredoc (ClickHouse then lexes it as an ordinary byte).
 func naiveHeredocEnd(s string, start int) int {
 	j := start + 1
 	for j < len(s) {
@@ -381,9 +371,7 @@ func naiveSliceElems(arg any) ([]any, bool) {
 	return elems, true
 }
 
-// naiveLiveCount counts live placeholders in sql by brute force: the unique
-// argument count naiveRebind accepts. Placeholders cannot outnumber bytes,
-// so the trial loop is bounded.
+// naiveLiveCount brute-forces the unique argument count naiveRebind accepts; bounded by len(sql).
 func naiveLiveCount(t *testing.T, p lexProfile, sql string) int {
 	t.Helper()
 	for k := 0; k <= len(sql)+1; k++ {
@@ -395,9 +383,8 @@ func naiveLiveCount(t *testing.T, p lexProfile, sql string) int {
 	return -1
 }
 
-// maxDollarPlaceholder returns the largest $N in s. Callers only use it on
-// output whose input contained no $, so every $N found was emitted by rebind
-// and cannot hide inside a string or comment.
+// maxDollarPlaceholder returns the largest $N in s; callers only use it on
+// output whose input contained no $, so every $N found was emitted by rebind.
 func maxDollarPlaceholder(s string) int {
 	maxN := 0
 	for i := 0; i < len(s); i++ {
@@ -476,13 +463,9 @@ func FuzzRebind(f *testing.F) {
 		"/*",
 		"/**/?",
 		"/*/*?*/?*/",
-		// CI fuzz regression: a UTF-8 continuation byte before e' is
-		// identifier material, so no E-string opens and the ? stays live.
+		// A UTF-8 continuation byte before e' is identifier material, so no E-string opens and the ? stays live.
 		"\xa0e'\\'?",
-		// ClickHouse: heredocs (empty and digit-leading tags, unterminated
-		// ones are not heredocs), // comments, the # space rule, the driver's
-		// \? literal escape, and backslash-escaped quotes in all three quote
-		// flavors.
+		// ClickHouse seeds: heredocs, // comments, the # space rule, \?, and escaped quotes.
 		"SELECT $$he?llo$$",
 		"SELECT $$a?b$$, ?",
 		"SELECT $1a$ ? $1a$ , ?",
@@ -517,9 +500,7 @@ func FuzzRebind(f *testing.F) {
 			}
 		}
 	}
-	// Slice-argument seeds drive IN (?) through the expand-first /
-	// renumber-second path, including multi-slice, trailing-scalar, empty,
-	// and never-expanding []byte shapes.
+	// Slice seeds drive IN (?) through the expand-then-renumber path.
 	sliceSeeds := []string{
 		"SELECT * FROM t WHERE id IN (?)",
 		"SELECT * FROM t WHERE id IN (?) AND b = ?",
@@ -559,10 +540,7 @@ func FuzzRebind(f *testing.F) {
 				args[i] = 1.5
 			}
 		}
-		// Bit i of sliceBits swaps args[i] for a slice-family shape, so the
-		// fuzzer explores every mix of scalars and IN (?) expansions. The
-		// shapes cover multi-element, single, mixed-type, empty (an error on
-		// both sides), array, and the []byte scalar that must never expand.
+		// Bit i of sliceBits swaps args[i] for a slice-family shape (including empty and the never-expanding []byte).
 		for i := range args {
 			if i >= 8 || sliceBits&(1<<i) == 0 {
 				continue
@@ -599,10 +577,8 @@ func FuzzRebind(f *testing.F) {
 			t.Fatalf("rebind(%q) args = %#v, naive args = %#v", query, gotArgs, wantArgs)
 		}
 
-		// Output invariants. Each is gated on inputs that cannot smuggle
-		// placeholder lookalikes into the output: pre-existing $N text
-		// defeats the max-$N check, and a ?? collapsed to a literal ? is
-		// indistinguishable from a live ? in question-style output.
+		// Output invariants, gated on inputs that cannot smuggle placeholder
+		// lookalikes into the output (pre-existing $N, ?? collapsed to a bare ?).
 		switch style {
 		case bindDollar:
 			if !strings.Contains(query, "$") {
@@ -617,9 +593,7 @@ func FuzzRebind(f *testing.F) {
 				}
 			}
 		case bindQuestionEsc:
-			// Backslashes are excluded too: an emitted \? escape (from ??) or
-			// a pre-existing one reads as a live ? under profiles without the
-			// backslashQuestion rule, which this invariant is not about.
+			// Backslashes excluded too: an emitted \? reads as a live ? under profiles without backslashQuestion.
 			if !strings.Contains(query, "??") && !strings.Contains(query, `\`) {
 				if live := naiveLiveCount(t, p, gotSQL); live != len(gotArgs) {
 					t.Fatalf("rebind(%q) = %q: %d live placeholder(s) in output, want %d", query, gotSQL, live, len(gotArgs))

@@ -24,9 +24,8 @@ const (
 	queryCachePluck
 )
 
-// queryCacheKey identifies one rendered shape: the executing handle's
-// grammar (weakly, so a package-level Must query never pins a closed
-// handle's grammar and crud cache), the terminal, and Pluck's column.
+// queryCacheKey identifies one rendered shape. The grammar is held weakly so
+// a package-level Must query never pins a closed handle's grammar.
 type queryCacheKey struct {
 	grammar weak.Pointer[grammar]
 	op      queryCacheOp
@@ -82,10 +81,9 @@ func (c *queryCache) store(
 	}
 	actual, loaded := c.entries.LoadOrStore(key, entry)
 	if !loaded {
-		// The weak key alone leaves a dead grammar's entry in the map, so the
-		// first store arms a cleanup: when the grammar is collected, drop its
-		// entry. The cleanup holds the cache weakly too — a discarded Query
-		// must not live until every handle it ever ran on dies.
+		// The first store arms a cleanup dropping the entry when the grammar
+		// is collected. The cleanup holds the cache weakly too: a discarded
+		// Query must not live until every handle it ever ran on dies.
 		cache := weak.Make(c)
 		runtime.AddCleanup(g, func(k queryCacheKey) {
 			if qc := cache.Value(); qc != nil {

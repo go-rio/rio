@@ -22,16 +22,14 @@ type ColumnSchema struct {
 	PrimaryKey bool
 	// JSON marks columns stored as serialized JSON text.
 	JSON bool
-	// Scanner marks columns rio delegates to the type's own sql.Scanner —
-	// their database representation is the type's business, so schema
-	// tooling treats them as undecidable rather than guessing.
+	// Scanner marks columns delegated to the type's own sql.Scanner; their
+	// database representation is undecidable to schema tooling.
 	Scanner bool
 }
 
-// TableSchema is a model's mapping under one handle: the table name this
-// handle resolves (TableName override, then WithTableNamer, then convention)
-// and every mapped column in plan order. It feeds schema tooling — the lint
-// package compares it against the live database — and is read-only.
+// TableSchema is a model's mapping under one handle: the resolved table name
+// (TableName override, then WithTableNamer, then convention) and every
+// mapped column in plan order. Read-only.
 type TableSchema struct {
 	// Struct is the model's Go type name.
 	Struct string
@@ -77,7 +75,5 @@ func (d *DB) DescribeModel(model any) (*TableSchema, error) {
 }
 
 // Dialect returns this handle's dialect identity — one of rio.Postgres,
-// rio.MySQL, rio.SQLite, or rio.ClickHouse. The interface stays opaque;
-// the value is a comparable identity for dispatch, exactly as New consumed
-// it.
+// rio.MySQL, rio.SQLite, or rio.ClickHouse — a comparable value for dispatch.
 func (d *DB) Dialect() Dialect { return d.g.d }

@@ -9,10 +9,7 @@ import (
 	"unsafe"
 )
 
-// sinkWide covers every scan kind the sinks and Scan share: all integer
-// widths, both float widths, bool, string, bytes, time, a value-typed
-// softdelete column, json (value and pointer), a Scanner field, and the
-// pointer form of each basic kind.
+// sinkWide covers every scan kind the sinks and Scan share.
 type sinkWide struct {
 	ID  int64
 	I8  int8
@@ -42,8 +39,7 @@ type sinkWide struct {
 	PT  *time.Time
 }
 
-// sinkDispatch routes one value to its typed sink, the way a native driver's
-// codecs would.
+// sinkDispatch routes one value to its typed sink, like a native driver's codecs.
 func sinkDispatch(c *colScanner, v any) error {
 	switch tv := v.(type) {
 	case nil:
@@ -66,10 +62,7 @@ func sinkDispatch(c *colScanner, v any) error {
 	panic("no sink for value")
 }
 
-// TestNativeCellSinkEquivalence pins the SPI's core promise over the full
-// kind × value matrix: SetX(v) behaves exactly like Scan(v) — same stored
-// value (including pointer cells and NULL rules), same success/failure, same
-// error text — because both paths share their store helpers.
+// SetX(v) must behave exactly like Scan(v): same stored value, same failure, same error text.
 func TestNativeCellSinkEquivalence(t *testing.T) {
 	p, err := planOf[sinkWide]()
 	if err != nil {
@@ -111,8 +104,7 @@ func TestNativeCellSinkEquivalence(t *testing.T) {
 	}
 }
 
-// structFieldsEqual compares one field of two sinkWide values, following
-// pointers (distinct cells holding equal values must compare equal).
+// structFieldsEqual compares one field of two sinkWide values, following pointers.
 func structFieldsEqual(f *field, a, b *sinkWide) bool {
 	av := fieldOf(f, a)
 	bv := fieldOf(f, b)
@@ -134,9 +126,7 @@ func fieldOf(f *field, s *sinkWide) any {
 	return rv.Interface()
 }
 
-// TestNativeCellSinkBytesCopyDiscipline pins SetBytes' contract: the driver
-// buffer may be reused the instant the call returns, and nothing rio stored
-// may alias it.
+// SetBytes must copy: the driver buffer may be reused the instant the call returns.
 func TestNativeCellSinkBytesCopyDiscipline(t *testing.T) {
 	p, err := planOf[sinkWide]()
 	if err != nil {
@@ -246,9 +236,7 @@ func TestNativeCellSetNullRules(t *testing.T) {
 	}
 }
 
-// End-to-end pointer-cell independence on the native channel: the chunked
-// allocator behind the sinks hands out distinct slots across rows (the
-// stdlib channel's TestScanPtrCellsIndependent, replayed over the SPI).
+// TestScanPtrCellsIndependent replayed over the SPI: distinct pointer cells across rows.
 func TestNativeScanPtrCellsIndependent(t *testing.T) {
 	nf := newFakeNative()
 	db := nf.open(SQLite)

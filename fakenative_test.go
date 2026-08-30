@@ -13,13 +13,9 @@ import (
 	"time"
 )
 
-// fakeNative is fakeDB's counterpart for the native channel: a
-// zero-dependency NativeDB that records every statement and serves scripted
-// typed results. Its rows dispatch values through the NativeCell typed sinks
-// the way a native driver's codecs would — the SPI surface itself is what
-// these tests exercise. Like a real driver (and like database/sql's own
-// ctx check), it refuses statements on a dead context without sending them,
-// which is what makes the WithoutCancel regression tests meaningful here.
+// fakeNative is a zero-dependency NativeDB that records every statement and
+// serves scripted results through the NativeCell typed sinks; like a real
+// driver it refuses statements on a dead context without sending them.
 type fakeNative struct {
 	mu      sync.Mutex
 	log     []fakeNativeStmt
@@ -33,10 +29,7 @@ type fakeNative struct {
 	beginErr    error
 	rollbackErr error // forced Rollback result (sql.ErrTxDone injection)
 	lastTxOpts  *sql.TxOptions
-	// probe, when non-nil, receives every statement's SQL and the context it
-	// executes under — begin/commit/rollback included, since all of them flow
-	// through record — so context-propagation tests read the executing context
-	// at the driver.
+	// probe, when non-nil, sees every statement's SQL and executing context, begin/commit/rollback included.
 	probe func(sqlText string, ctx context.Context)
 }
 
@@ -49,9 +42,7 @@ type fakeNativeStmt struct {
 type fakeNativeRowsData struct {
 	cols []string
 	rows [][]any
-	// errAfter is the deferred error a driver discovers while reading the
-	// trailing protocol data: it surfaces from Err after the rows are
-	// exhausted or closed, never before — pgx's shape.
+	// errAfter surfaces from Err only after the rows are exhausted or closed — pgx's deferred-error shape.
 	errAfter error
 }
 
@@ -87,8 +78,7 @@ func (f *fakeNative) queueRowsCloseErr(errAfter error, cols []string, rows ...[]
 	f.results = append(f.results, fakeNativeRowsData{cols: cols, rows: rows, errAfter: errAfter})
 }
 
-// queueExec scripts the next Exec's affected-row count. Unscripted execs
-// report 1.
+// queueExec scripts the next Exec's affected count; unscripted execs report 1.
 func (f *fakeNative) queueExec(affected int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -123,9 +113,7 @@ func (f *fakeNative) loggedContaining(sub string) []fakeNativeStmt {
 	return out
 }
 
-// record logs one statement, refusing dead contexts before "sending" — the
-// behavior of every real driver stack rio's cleanup discipline is built
-// against.
+// record logs one statement, refusing dead contexts before "sending", like a real driver stack.
 func (f *fakeNative) record(ctx context.Context, sqlText string, args []any, inTx bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -240,9 +228,7 @@ func (t *fakeNativeTx) Commit(ctx context.Context) error {
 	return nil
 }
 
-// Rollback honors the SPI contract: a finished transaction reports
-// sql.ErrTxDone, and a dead context refuses the statement (pgx would also
-// destroy the connection; the semantic rio must survive is the refusal).
+// Rollback reports sql.ErrTxDone when finished and refuses dead contexts, per the SPI contract.
 func (t *fakeNativeTx) Rollback(ctx context.Context) error {
 	if t.done {
 		return sql.ErrTxDone
@@ -274,8 +260,7 @@ func (r *fakeNativeRows) Next() bool {
 		return false
 	}
 	if r.pos >= len(r.data.rows) {
-		// Exhaustion is where a native driver reads the trailing command
-		// status; deferred errors become visible to Err from here on.
+		// Exhaustion makes deferred errors visible to Err, as with a real driver.
 		r.done = true
 		return false
 	}
@@ -308,11 +293,8 @@ func (r *fakeNativeRows) Err() error {
 
 func (r *fakeNativeRows) Close() { r.closed = true }
 
-// assignNativeDest dispatches one scripted value the way a native driver's
-// codecs route decoded values: typed sinks for NativeCell dests, native
-// scanning for the plain pointers rio passes (the count column of
-// WithCount), and the cell's own Scan for anything a codec would only have
-// in driver-canonical form.
+// assignNativeDest routes one scripted value like a native codec: typed sinks
+// for NativeCell dests, *int64 for WithCount's count column, cell.Scan otherwise.
 func assignNativeDest(dest, v any) error {
 	cell, ok := dest.(NativeCell)
 	if !ok {
@@ -355,8 +337,7 @@ func nativeUserRow(id int64, email string) []any {
 
 // --- behavior: the native channel replays the stdlib channel's contracts ---
 
-// The rendered SQL is channel-independent; asserting the exact statement the
-// stdlib-channel tests pin proves the engine seam feeds it through untouched.
+// The rendered SQL is channel-independent — the engine seam feeds it through untouched.
 func TestNativeAllRendersAndScansTypedRows(t *testing.T) {
 	nf := newFakeNative()
 	db := nf.open()
@@ -379,8 +360,7 @@ func TestNativeAllRendersAndScansTypedRows(t *testing.T) {
 	if got := nf.logged()[0]; got != want {
 		t.Fatalf("sql:\n got: %s\nwant: %s", got, want)
 	}
-	// Native args are rio's bind values verbatim — no database/sql
-	// driver-value normalization layer sits in between (18 stays an int).
+	// Native args are rio's bind values verbatim — 18 stays an int.
 	if args := nf.loggedContaining("SELECT")[0].args; len(args) != 1 || args[0] != 18 {
 		t.Fatalf("args = %v", args)
 	}
@@ -436,8 +416,7 @@ func TestNativeUpdateAffectedCountSemantics(t *testing.T) {
 		if err := Update(ctx, db, p); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("want ErrNotFound, got %v", err)
 		}
-		// PostgreSQL counts matched rows: zero already means missing, and the
-		// MySQL-only pk probe must not run.
+		// PostgreSQL counts matched rows; the MySQL-only pk probe must not run.
 		if logs := nf.logged(); len(logs) != 1 {
 			t.Fatalf("expected the UPDATE alone, got %v", logs)
 		}
@@ -456,9 +435,7 @@ func TestNativeUpdateAffectedCountSemantics(t *testing.T) {
 	})
 }
 
-// Exec's sql.Result is driver.RowsAffected — the pgx database/sql adapter's
-// own result type — so both channels answer RowsAffected and refuse
-// LastInsertId with the same words.
+// Exec's sql.Result is driver.RowsAffected, so both channels refuse LastInsertId with the same words.
 func TestNativeExecResultShape(t *testing.T) {
 	nf := newFakeNative()
 	db := nf.open()
@@ -555,9 +532,7 @@ func TestNativeSavepointChoreography(t *testing.T) {
 	}
 }
 
-// The native ports of the 71b3772 regressions: the fake refuses statements
-// on a dead context exactly like database/sql does, so these pass only
-// because rio's cleanup runs on the cancellation-decoupled context.
+// The fake refuses statements on a dead context, so savepoint cleanup must run on the decoupled context.
 func TestNativeSavepointCleanupSurvivesCanceledContext(t *testing.T) {
 	nf := newFakeNative()
 	db := nf.open()
@@ -621,9 +596,7 @@ func TestNativeSavepointPanicRollbackSurvivesCanceledContext(t *testing.T) {
 	}
 }
 
-// finishTx must reach the channel when the whole transaction's context died
-// mid-fn — the native engine honors contexts on Rollback, so rio hands it a
-// decoupled one.
+// finishTx must reach the channel even when the transaction's context died mid-fn.
 func TestNativeRollbackRunsOnDecoupledContext(t *testing.T) {
 	nf := newFakeNative()
 	db := nf.open()
@@ -643,8 +616,7 @@ func TestNativeRollbackRunsOnDecoupledContext(t *testing.T) {
 	}
 }
 
-// A transaction the driver already finished (begin context died, connection
-// broke) reports sql.ErrTxDone per the SPI contract; finishTx tolerates it.
+// A transaction the driver already finished reports sql.ErrTxDone; finishTx tolerates it.
 func TestNativeRollbackToleratesTxDone(t *testing.T) {
 	nf := newFakeNative()
 	nf.rollbackErr = fmt.Errorf("adapter translation: %w", sql.ErrTxDone)
@@ -772,8 +744,7 @@ func TestNativeUnwrapAndAccessors(t *testing.T) {
 	})
 }
 
-// closeOrderConnector observes the *sql.DB view's close through the
-// database/sql connector-Closer hook.
+// closeOrderConnector observes the *sql.DB view's close via the connector-Closer hook.
 type closeOrderConnector struct {
 	driver.Connector
 	onClose func()
@@ -836,9 +807,7 @@ func TestNewNativeConstructionPanics(t *testing.T) {
 	})
 }
 
-// The single-row reads leave the result undrained; the deferred error a
-// native driver discovers at close time must surface (mergeClose through the
-// SPI's Close-then-Err shape).
+// Single-row reads leave the result undrained; the deferred close-time error must still surface.
 func TestNativeDeferredCloseErrorSurfaces(t *testing.T) {
 	ctx := context.Background()
 
@@ -874,8 +843,7 @@ func TestNativeDeferredCloseErrorSurfaces(t *testing.T) {
 	})
 }
 
-// sqlStateErr mimics a driver error carrying an SQLSTATE — the dialect
-// fallback translator's input shape.
+// sqlStateErr mimics a driver error carrying an SQLSTATE — the fallback translator's input.
 type sqlStateErr struct{ code string }
 
 func (e sqlStateErr) Error() string    { return "driver: constraint violation " + e.code }
@@ -895,8 +863,7 @@ func TestNativeErrorTranslationApplies(t *testing.T) {
 	}
 }
 
-// nativeCountUser exercises WithCount's plain *int64 dest — the one non-cell
-// dest rio ever passes a NativeRows.
+// nativeCountUser exercises WithCount's plain *int64 dest, the one non-cell dest rio passes.
 type nativeCountUser struct {
 	ID         int64
 	Email      string
@@ -924,9 +891,7 @@ func TestNativeWithCountScansPlainDest(t *testing.T) {
 	}
 }
 
-// nativeUintRow exercises the uint64 sink over the SPI: a plain uint64 column,
-// a *uint64 for the NULL rule, and a uint32 the fake keeps no typed sink for,
-// so its value reaches the cell only through the boxed Scan path.
+// nativeUintRow: a plain uint64, a *uint64 for the NULL rule, and a uint32 that reaches the cell only via boxed Scan.
 type nativeUintRow struct {
 	ID    int64
 	Big   uint64
@@ -936,11 +901,7 @@ type nativeUintRow struct {
 
 var nativeUintCols = []string{"id", "big", "opt", "boxed"}
 
-// The native channel delivers unsigned values verbatim — no database/sql bind
-// coercion sits in between — so a UInt64 above math.MaxInt64 routes through
-// SetUint64 intact, a NULL reaches the *uint64 through SetNull, and a value the
-// fake carries only in driver-canonical form (uint32) still lands via the
-// cell's own Scan.
+// The native channel delivers unsigned values verbatim — no database/sql bind coercion in between.
 func TestNativeUint64SinkRoundTrip(t *testing.T) {
 	nf := newFakeNative()
 	db := nf.open()
@@ -978,11 +939,11 @@ func TestNativeUint64SinkRoundTrip(t *testing.T) {
 
 type fakeNativeBatchResults struct {
 	f     *fakeNative
+	ctx   context.Context
 	stmts []BatchStatement
 	next  int
 }
 
-// batches counts QueryBatch flushes, so tests can assert round trips.
 func (f *fakeNative) batchCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -993,7 +954,7 @@ func (f *fakeNative) QueryBatch(ctx context.Context, stmts []BatchStatement) (Na
 	f.mu.Lock()
 	f.batches++
 	f.mu.Unlock()
-	return &fakeNativeBatchResults{f: f, stmts: stmts}, nil
+	return &fakeNativeBatchResults{f: f, ctx: ctx, stmts: stmts}, nil
 }
 
 func (r *fakeNativeBatchResults) Rows() (NativeRows, bool, error) {
@@ -1002,21 +963,19 @@ func (r *fakeNativeBatchResults) Rows() (NativeRows, bool, error) {
 	}
 	st := r.stmts[r.next]
 	r.next++
-	// Route through the same record/queue machinery as standalone queries,
-	// so logs, failOn injection, and queued results behave identically.
-	if err := r.f.record(context.Background(), st.SQL, st.Args, false); err != nil {
+	// Route through Query itself so logs, failOn, queued results, and dead-context refusal apply.
+	rows, err := r.f.Query(r.ctx, st.SQL, st.Args)
+	if err != nil {
 		return nil, false, err
 	}
-	return &fakeNativeRows{data: r.f.nextRows()}, false, nil
+	return rows, false, nil
 }
 
 func (r *fakeNativeBatchResults) Close() error { return nil }
 
 var _ NativeBatcher = (*fakeNative)(nil)
 
-// A relation layer's derived statements — every preload and every counting
-// query — share one batch on a batching channel, with the same per-statement
-// events and results as the sequential path.
+// A relation layer's derived statements share one batch, with per-statement events intact.
 func TestNativeBatchesRelationLayer(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeNative()
@@ -1024,8 +983,7 @@ func TestNativeBatchesRelationLayer(t *testing.T) {
 	db := f.openWith(Postgres, WithQueryHook(h))
 
 	f.queueRows([]string{"id", "name"}, []any{int64(1), "o"}, []any{int64(2), "o"})
-	// Tags preloads; Posts is only counted — a full Posts preload would be
-	// statically reused instead of queried, which is its own contract.
+	// Tags preloads; Posts is only counted (a full preload would be statically reused).
 	f.queueRows([]string{"id", "name", "bench_owner_id"}, []any{int64(7), "tag", int64(2)})
 	f.queueRows([]string{"bench_owner_id", "count"}, []any{int64(1), int64(3)})
 
@@ -1060,7 +1018,7 @@ func TestNativeBatchesRelationLayer(t *testing.T) {
 
 // --- copy fake ---
 
-func (f *fakeNative) CopyIn(_ context.Context, table string, columns []string, next func() ([]any, error)) (int64, error) {
+func (f *fakeNative) CopyIn(_ context.Context, table []string, columns []string, next func() ([]any, error)) (int64, error) {
 	f.mu.Lock()
 	f.copies++
 	f.mu.Unlock()
@@ -1082,9 +1040,7 @@ func (f *fakeNative) CopyIn(_ context.Context, table string, columns []string, n
 
 var _ NativeCopier = (*fakeNative)(nil)
 
-// An explicit-key InsertAll streams through the copy protocol — one
-// exchange, no VALUES statements — while a backfilling batch keeps the
-// chunked RETURNING path.
+// Explicit-key InsertAll streams through the copy protocol; a backfilling batch keeps chunked RETURNING.
 func TestNativeInsertAllUsesCopy(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeNative()
@@ -1107,5 +1063,43 @@ func TestNativeInsertAllUsesCopy(t *testing.T) {
 	last := h.events[len(h.events)-1]
 	if last.Op != "copy" || last.RowsAffected != 500 {
 		t.Fatalf("the copy event must report the loaded rows: %+v", last)
+	}
+}
+
+// plainNative strips the fake's optional capabilities so rio must take the per-statement and chunked fallbacks.
+type plainNative struct{ nd NativeDB }
+
+func (p plainNative) Query(ctx context.Context, sql string, args []any) (NativeRows, error) {
+	return p.nd.Query(ctx, sql, args)
+}
+func (p plainNative) Exec(ctx context.Context, sql string, args []any) (int64, error) {
+	return p.nd.Exec(ctx, sql, args)
+}
+func (p plainNative) Begin(ctx context.Context, opts *sql.TxOptions) (NativeTx, error) {
+	return p.nd.Begin(ctx, opts)
+}
+func (p plainNative) Close() error { return p.nd.Close() }
+
+// A channel without the optional capabilities declines before any side effect.
+func TestNativeWithoutCapabilitiesFallsBack(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeNative()
+	h := &afterHook{}
+	db := NewNative(NativeConfig{DB: plainNative{nd: f}}, Postgres, WithClock(fixedClock), WithQueryHook(h))
+
+	rows := []chunkRow{{ID: 1, A: 1, B: 2}, {ID: 2, A: 3, B: 4}}
+	if err := InsertAll(ctx, db, rows); err != nil {
+		t.Fatalf("InsertAll: %v", err)
+	}
+	f.mu.Lock()
+	copies, batches, logged := f.copies, f.batches, len(f.log)
+	f.mu.Unlock()
+	if copies != 0 || batches != 0 || logged == 0 {
+		t.Fatalf("stripped channel must chunk VALUES, got copies=%d batches=%d statements=%d", copies, batches, logged)
+	}
+	for _, e := range h.events {
+		if e.Op == "copy" {
+			t.Fatalf("no copy event may fire on a declining channel: %+v", e)
+		}
 	}
 }

@@ -8,11 +8,9 @@ import (
 	"sync"
 )
 
-// stmtCache is an LRU of prepared statements keyed by SQL text. It exists
-// because IN (?) expansion makes every slice length a distinct statement —
-// unbounded growth would leak server-side prepared statements. *sql.Stmt is
-// reference-counted by database/sql, so closing an evicted statement while a
-// query still runs on it is safe.
+// stmtCache is an LRU of prepared statements keyed by SQL text: IN (?)
+// expansion makes every slice length a distinct statement. *sql.Stmt is
+// reference-counted, so closing an evicted statement mid-query is safe.
 type stmtCache struct {
 	prepare stmtPreparer
 	cap     int

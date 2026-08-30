@@ -8,31 +8,22 @@ import (
 	"time"
 )
 
-// This file is rio's native driver SPI — the equivalent of database/sql/driver
-// for driver-native execution channels. A driver module (go-rio/postgres)
-// implements these small, std-types-only interfaces around its native client
-// (pgxpool) and hands them to NewNative; every rio semantic above the engine
-// seam — rendering, hooks, error translation, scanning rules, savepoints —
-// stays the channel-independent core. Application code constructs through the
-// driver module (postgres.OpenNative), never this surface.
+// rio's native driver SPI: a driver module implements these interfaces around
+// its native client and hands them to NewNative. Everything here is
+// driver-module SPI, not application API — applications construct through the
+// driver module (postgres.OpenNative).
 //
-// Extension policy: NativeDB, NativeTx, and NativeRows are frozen — a driver
-// that satisfies them compiles against every v1 rio, because rio adds no
-// method to these three within v1. New capabilities arrive as optional
-// interfaces a driver may additionally implement, discovered by type assertion
-// at the seam (database/sql/driver's own pattern — Queryer, SessionResetter,
-// and the rest opt in this way), never as a new method on these three.
-// NativeCell is the sealed, rio-implemented counterpart and grows the other
-// way; see its godoc.
+// Extension policy, as in database/sql/driver: NativeDB, NativeTx, and
+// NativeRows are frozen within v1 — new capabilities arrive as optional
+// interfaces discovered by type assertion, never as new methods on these
+// three. NativeCell is the sealed, rio-implemented counterpart and grows the
+// other way.
 
 // NativeDB is a driver-native execution channel: what rio needs from a driver
-// pool. Driver-module SPI, not application API.
-//
-// SQL arrives fully rendered in the dialect's placeholder form; args are the
-// bind values rio would hand database/sql. Exec returns the statement's
-// affected-row count (the driver's command tag). Begin maps *sql.TxOptions
-// (possibly nil) onto the driver's transaction options. Close releases the
-// channel's resources — for a pooled driver, the pool itself.
+// pool. SQL arrives fully rendered in the dialect's placeholder form; args
+// are the bind values rio would hand database/sql. Exec returns the driver's
+// affected-row count. Begin maps *sql.TxOptions (possibly nil) onto the
+// driver's transaction options. Close releases the channel's resources.
 type NativeDB interface {
 	Query(ctx context.Context, sql string, args []any) (NativeRows, error)
 	Exec(ctx context.Context, sql string, args []any) (rowsAffected int64, err error)
@@ -40,16 +31,10 @@ type NativeDB interface {
 	Close() error
 }
 
-// NativeTx is one driver-native transaction. Driver-module SPI, not
-// application API.
-//
-// Finished-transaction contract: once the transaction has ended — committed,
-// rolled back, or destroyed by the driver on its own (a begin context that
-// died, a broken connection) — Commit and Rollback must return an error
-// satisfying errors.Is(err, sql.ErrTxDone), translating the driver's own
-// sentinel (pgx.ErrTxClosed) where needed. rio's cleanup paths tolerate
-// exactly sql.ErrTxDone, which keeps rollback semantics identical across
-// channels without the core importing any driver.
+// NativeTx is one driver-native transaction. Once the transaction has ended —
+// committed, rolled back, or destroyed by the driver on its own — Commit and
+// Rollback must return an error satisfying errors.Is(err, sql.ErrTxDone),
+// translating the driver's own sentinel where needed.
 type NativeTx interface {
 	Query(ctx context.Context, sql string, args []any) (NativeRows, error)
 	Exec(ctx context.Context, sql string, args []any) (int64, error)
@@ -57,17 +42,12 @@ type NativeTx interface {
 	Rollback(ctx context.Context) error
 }
 
-// NativeRows is a driver-native result set, shaped like pgx.Rows: Close
-// returns nothing, and errors — including those Close itself discovers, such
-// as the failed statement behind an undrained single-row read — converge in
-// Err. rio reads Err after Close, so deferred protocol errors still surface
-// (see mergeClose). Driver-module SPI, not application API.
-//
-// rio passes the same dest slots, in the same order, for every row of one
-// result. Each slot is either a NativeCell (rio's per-column typed sink) or a
-// plain pointer (rare; scan it the way the driver natively would).
-// Implementations may therefore classify the dest list on the first Scan and
-// reuse that classification for the remaining rows.
+// NativeRows is a driver-native result set. Close returns nothing; errors —
+// including those Close itself discovers — converge in Err, which rio reads
+// after Close. rio passes the same dest slots, in the same order, for every
+// row of one result; each slot is either a NativeCell or a plain pointer
+// (scan it as the driver natively would), so implementations may classify
+// the dest list on the first Scan and reuse it.
 type NativeRows interface {
 	Columns() []string
 	Next() bool
@@ -77,19 +57,14 @@ type NativeRows interface {
 }
 
 // NativeScanKind names the plan-time scan strategy of one NativeCell, so a
-// NativeRows implementation can pick a typed decode path per column.
-// Driver-module SPI, not application API.
-//
-// The enum can grow. Treat any kind you do not recognize as
-// NativeKindScanner: the sql.Scanner fallback is correct for every kind —
-// only slower — because the cell's Scan accepts the same driver-canonical
-// values database/sql delivers.
+// NativeRows implementation can pick a typed decode path per column. The
+// enum can grow: treat any unrecognized kind as NativeKindScanner — the
+// fallback is correct for every kind, only slower.
 type NativeScanKind uint8
 
 const (
-	// NativeKindScanner is the fallback: pass the cell itself to the
-	// driver's sql.Scanner path. Also the zero value, so an adapter that
-	// never learned a newer kind degrades to correct-but-slower.
+	// NativeKindScanner is the fallback and zero value: pass the cell
+	// itself to the driver's sql.Scanner path.
 	NativeKindScanner NativeScanKind = iota
 	NativeKindInt
 	NativeKindUint
@@ -99,37 +74,24 @@ const (
 	NativeKindBytes
 	NativeKindTime
 	// NativeKindJSON takes the column's raw JSON payload through SetBytes or
-	// SetString — the bytes rio unmarshals into the field — not a value
-	// decoded driver-side.
+	// SetString, not a value decoded driver-side.
 	NativeKindJSON
 )
 
 // NativeCell is the typed sink a NativeRows implementation feeds decoded
-// column values into — rio's side of the native scan path, one cell per
-// column. Driver-module SPI, not application API.
+// column values into, one cell per column. Sealed: drivers consume it, never
+// implement it, so rio may add Set methods in a minor version without
+// breaking a driver.
 //
-// Drivers consume NativeCell; they never implement it. The interface is sealed
-// (sealedNativeCell), so rio may add Set methods in a minor version without
-// breaking a driver — a new sink is one more optional route a codec can take,
-// never a compile break. This is the mirror of the NativeDB, NativeTx, and
-// NativeRows freeze: those three, driver-implemented, cannot gain methods
-// within v1; NativeCell, rio-implemented, can.
-//
-// Every Set method is exactly Scan with the interface boxing removed:
-// SetInt64(v) behaves like Scan(int64(v)), SetUint64(v) like Scan(uint64(v)),
-// SetNull like Scan(nil), and so on — same conversion rules, same overflow and
-// NULL handling, same error shapes, mismatched-kind fallback included, because
-// both paths run the same store helpers (scan.go). SetBytes never retains v —
-// driver memory is copied where it is stored. SetString stores its argument
-// as-is, so hand over an owned string, never an unsafe view of driver memory.
-//
-// ScanKind reports the cell's strategy. Pointer fields report their element's
-// kind: the sinks allocate and publish the *T cell internally and SetNull
-// stores nil, so pointer-ness never crosses the SPI. A NativeKindJSON cell
-// takes the raw JSON payload through SetBytes or SetString — the bytes rio
-// unmarshals — not a value decoded driver-side.
+// Every Set method is exactly Scan with the interface boxing removed —
+// SetInt64(v) behaves like Scan(int64(v)), SetNull like Scan(nil) — same
+// conversion, overflow, and NULL rules, same error shapes, mismatched-kind
+// fallback included. SetBytes never retains its argument. SetString stores
+// its argument as-is, so hand over an owned string, never an unsafe view of
+// driver memory. ScanKind reports the cell's strategy; pointer fields report
+// their element's kind, and SetNull stores nil.
 type NativeCell interface {
-	sql.Scanner // the fallback path: the cell scans driver-canonical values itself
+	sql.Scanner // fallback: accepts driver-canonical values
 	ScanKind() NativeScanKind
 	SetInt64(int64) error
 	SetUint64(uint64) error
@@ -140,7 +102,7 @@ type NativeCell interface {
 	SetTime(time.Time) error
 	SetNull() error
 
-	sealedNativeCell() // rio implements NativeCell; drivers only consume it
+	sealedNativeCell()
 }
 
 // NativeConfig carries what a driver module hands NewNative, all wired to
@@ -149,30 +111,20 @@ type NativeConfig struct {
 	// DB is the native execution channel. Required.
 	DB NativeDB
 
-	// Handle is the driver-native pool handle (a *pgxpool.Pool under
-	// go-rio/postgres). (*DB).DriverHandle carries it — that is what the
-	// driver module's typed accessors (postgres.PoolOf) read — and
-	// (*DB).Native returns it as the native-channel marker.
+	// Handle is the driver-native pool handle, returned by
+	// (*DB).DriverHandle and (*DB).Native.
 	Handle any
 
 	// SQLView is an optional database/sql view over the same pool, returned
-	// by (*DB).Unwrap so pool-agnostic helpers (pings, migrations) keep
-	// working on the native channel. (*DB).Close closes it before DB.
-	// Without one, Unwrap returns nil.
+	// by (*DB).Unwrap (nil without one). (*DB).Close closes it before DB.
 	SQLView *sql.DB
 }
 
 // NewNative constructs a *DB on a driver-native execution channel.
-// Driver-module SPI, not application API — applications construct through
-// the driver module (postgres.OpenNative), which wires the adapter, the pool
-// handle, and the database/sql view together.
-//
-// Like New taking over the *sql.DB's Close, Close on the returned DB closes
-// what the config carries: first the SQLView, then the channel (whose
-// adapter closes the pool). Panics if NativeConfig.DB or dialect is nil.
-// WithStmtCache panics here too — a native channel has no database/sql
-// prepared statements; statement caching belongs to the driver (with pgx, the
-// DSN parameter default_query_exec_mode, which defaults to caching already).
+// Driver-module SPI: applications construct through the driver module
+// (postgres.OpenNative). Close on the returned DB closes the SQLView first,
+// then the channel. Panics if NativeConfig.DB or dialect is nil, or if opts
+// include WithStmtCache — statement caching belongs to the native driver.
 func NewNative(nc NativeConfig, dialect Dialect, opts ...Option) *DB {
 	if nc.DB == nil {
 		panic("rio: NewNative: NativeConfig.DB must not be nil")
@@ -185,7 +137,6 @@ func NewNative(nc NativeConfig, dialect Dialect, opts ...Option) *DB {
 		opt(cfg)
 	}
 	if cfg.stmtCache {
-		// Construction-time misuse, as in New.
 		panic(
 			"rio: WithStmtCache is not supported on the native channel " +
 				"(no database/sql prepared statements exist here); statement caching belongs to the driver — " +
@@ -195,8 +146,6 @@ func NewNative(nc NativeConfig, dialect Dialect, opts ...Option) *DB {
 	}
 	handle := nc.Handle
 	if cfg.driverHandle != nil {
-		// WithDriverHandle wins like any later option; NativeConfig.Handle
-		// is the default the driver module supplies.
 		handle = cfg.driverHandle
 	}
 	return &DB{
@@ -209,10 +158,8 @@ func NewNative(nc NativeConfig, dialect Dialect, opts ...Option) *DB {
 	}
 }
 
-// nativeRows adapts the SPI's pgx-shaped result — Close without a return
-// value, errors converging in Err — to the internal rows seam. Close-then-Err
-// keeps mergeClose's promise: a deferred protocol error behind an undrained
-// result surfaces at close time.
+// nativeRows adapts the pgx-shaped NativeRows to the internal rows seam;
+// Close returns Err so deferred protocol errors surface at close time.
 type nativeRows struct {
 	nr NativeRows
 }
@@ -227,11 +174,10 @@ func (r *nativeRows) Close() error {
 	return r.nr.Err()
 }
 
-// nativeEngine executes through a NativeDB. It carries no statement cache:
-// prepared statements belong to the native driver's own machinery.
+// nativeEngine executes through a NativeDB.
 type nativeEngine struct {
 	nd   NativeDB
-	view *sql.DB // Unwrap's view; closed by close() ahead of the channel
+	view *sql.DB // Unwrap's view; closed before the channel
 }
 
 func (e *nativeEngine) exec(ctx context.Context, sqlText string, args []any) (sql.Result, error) {
@@ -239,10 +185,6 @@ func (e *nativeEngine) exec(ctx context.Context, sqlText string, args []any) (sq
 	if err != nil {
 		return nil, err
 	}
-	// driver.RowsAffected is the exact result pgx's database/sql adapter
-	// returns for an Exec: RowsAffected reports the command tag's count and
-	// never fails, LastInsertId returns the stdlib's own "not supported"
-	// error.
 	return driver.RowsAffected(n), nil
 }
 
@@ -262,11 +204,8 @@ func (e *nativeEngine) begin(ctx context.Context, opts *sql.TxOptions) (txEngine
 	return nativeTxEngine{nt: nt}, nil
 }
 
-// close closes the database/sql view first, then the channel (the driver
-// module's adapter closes the pool there) — construction in reverse, and the
-// only order that is clean on both sides: closing a pgx view never touches
-// the pool, while a pool closed first would fail the view's own close-time
-// connection teardown.
+// close closes the view before the channel: a pool closed first would break
+// the view's own close-time connection teardown.
 func (e *nativeEngine) close() error {
 	var verr error
 	if e.view != nil {
@@ -275,9 +214,8 @@ func (e *nativeEngine) close() error {
 	return errors.Join(verr, e.nd.Close())
 }
 
-// nativeTxEngine executes on one NativeTx. Rollback passes the context it is
-// given straight through: rio's cleanup callers (finishTx, spExec) already
-// decouple cancellation with WithoutCancel.
+// nativeTxEngine executes on one NativeTx. Rollback passes ctx through;
+// rio's cleanup callers already decouple cancellation.
 type nativeTxEngine struct {
 	nt NativeTx
 }
@@ -301,11 +239,10 @@ func (e nativeTxEngine) query(ctx context.Context, sqlText string, args []any) (
 func (e nativeTxEngine) commit(ctx context.Context) error   { return e.nt.Commit(ctx) }
 func (e nativeTxEngine) rollback(ctx context.Context) error { return e.nt.Rollback(ctx) }
 
-// --- optional capabilities, discovered by type assertion at the seam ---
+// --- optional capabilities ---
 
 // BatchStatement is one rendered statement of a batch: SQL in the dialect's
-// placeholder form and its bind values, exactly as NativeDB.Query receives
-// them.
+// placeholder form and its bind values, as NativeDB.Query receives them.
 type BatchStatement struct {
 	SQL  string
 	Args []any
@@ -313,11 +250,8 @@ type BatchStatement struct {
 
 // NativeBatcher is an optional capability of a NativeDB or NativeTx:
 // executing a group of independent row-returning statements in one driver
-// round trip. rio uses it for the statements one logical operation derives —
-// the preload and count queries a With/WithCount set issues — so a page that
-// loads two relations and a count pays one network round trip instead of
-// three. Implementations queue every statement and flush once; results are
-// consumed strictly in submission order.
+// round trip. Implementations queue every statement and flush once; results
+// are consumed strictly in submission order.
 type NativeBatcher interface {
 	QueryBatch(ctx context.Context, stmts []BatchStatement) (NativeBatchResults, error)
 }
@@ -333,62 +267,29 @@ type NativeBatchResults interface {
 	Close() error
 }
 
-// queryBatch exposes the channel's NativeBatcher when the driver implements
-// it; ok is false otherwise and callers fall back to per-statement queries.
-func (e *nativeEngine) queryBatch(ctx context.Context, stmts []BatchStatement) (NativeBatchResults, bool, error) {
-	b, ok := e.nd.(NativeBatcher)
-	if !ok {
-		return nil, false, nil
-	}
-	res, err := b.QueryBatch(ctx, stmts)
-	return res, true, err
-}
-
-func (e nativeTxEngine) queryBatch(ctx context.Context, stmts []BatchStatement) (NativeBatchResults, bool, error) {
-	b, ok := e.nt.(NativeBatcher)
-	if !ok {
-		return nil, false, nil
-	}
-	res, err := b.QueryBatch(ctx, stmts)
-	return res, true, err
-}
+func (e *nativeEngine) batcher() (NativeBatcher, bool)  { b, ok := e.nd.(NativeBatcher); return b, ok }
+func (e nativeTxEngine) batcher() (NativeBatcher, bool) { b, ok := e.nt.(NativeBatcher); return b, ok }
 
 // batchEngine is the internal seam preload probes for round-trip batching.
 type batchEngine interface {
-	queryBatch(ctx context.Context, stmts []BatchStatement) (NativeBatchResults, bool, error)
+	batcher() (NativeBatcher, bool)
 }
 
 // NativeCopier is an optional capability of a NativeDB or NativeTx:
-// bulk-loading rows through the driver's streaming copy protocol
-// (PostgreSQL COPY FROM). rio routes InsertAll's no-backfill path through it
-// — explicit-key batches stream in one protocol exchange and land
-// atomically, instead of chunked multi-VALUES statements. next returns the
-// bind values of one row in columns order, or (nil, nil) when the batch is
-// exhausted; a non-nil error aborts the copy.
+// bulk-loading rows through the driver's streaming copy protocol (PostgreSQL
+// COPY FROM). table is the resolved, unquoted table name split into schema
+// segments ([]string{"app", "users"}); the driver quotes each segment. next
+// returns one row's bind values in columns order, (nil, nil) when the batch
+// is exhausted, or a non-nil error to abort the copy; the returned slice is
+// valid only until the next call, so encode it before pulling the next row.
 type NativeCopier interface {
-	CopyIn(ctx context.Context, table string, columns []string, next func() ([]any, error)) (int64, error)
+	CopyIn(ctx context.Context, table []string, columns []string, next func() ([]any, error)) (int64, error)
 }
 
-// copyIn exposes the channel's NativeCopier when the driver implements it.
-func (e *nativeEngine) copyIn(ctx context.Context, table string, cols []string, next func() ([]any, error)) (int64, bool, error) {
-	c, ok := e.nd.(NativeCopier)
-	if !ok {
-		return 0, false, nil
-	}
-	n, err := c.CopyIn(ctx, table, cols, next)
-	return n, true, err
-}
-
-func (e nativeTxEngine) copyIn(ctx context.Context, table string, cols []string, next func() ([]any, error)) (int64, bool, error) {
-	c, ok := e.nt.(NativeCopier)
-	if !ok {
-		return 0, false, nil
-	}
-	n, err := c.CopyIn(ctx, table, cols, next)
-	return n, true, err
-}
+func (e *nativeEngine) copier() (NativeCopier, bool)  { c, ok := e.nd.(NativeCopier); return c, ok }
+func (e nativeTxEngine) copier() (NativeCopier, bool) { c, ok := e.nt.(NativeCopier); return c, ok }
 
 // copyEngine is the internal seam InsertAll probes for streaming bulk loads.
 type copyEngine interface {
-	copyIn(ctx context.Context, table string, cols []string, next func() ([]any, error)) (int64, bool, error)
+	copier() (NativeCopier, bool)
 }

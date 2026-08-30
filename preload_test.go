@@ -215,9 +215,7 @@ func TestPreloadManyToMany(t *testing.T) {
 	}
 }
 
-// The panic must name the Go field ("Posts"), not the target type ("Post"):
-// With resolves relations by field name, so the old type-name hint sent
-// users straight into a second error (AUDIT M12).
+// The panic must name the Go field ("Posts"), not the target type — With resolves by field name.
 func TestUnloadedRelationPanics(t *testing.T) {
 	if _, err := planOf[User](); err != nil { // the built plan teaches the field name
 		t.Fatal(err)
@@ -238,9 +236,7 @@ func TestUnloadedRelationPanics(t *testing.T) {
 
 type orphanTarget struct{ ID int64 }
 
-// Without a built plan the field name is unknowable — the panic falls back
-// to generic wording instead of guessing (the type name would be wrong for
-// every pluralized field).
+// Without a built plan the field name is unknowable; the panic falls back to generic wording.
 func TestUnloadedPanicWithoutPlanStaysGeneric(t *testing.T) {
 	defer func() {
 		msg, _ := recover().(string)
@@ -264,8 +260,7 @@ type ambigOwnerB struct {
 	Stuff HasMany[ambigTarget]
 }
 
-// Two models declaring the same container type under different field names:
-// naming either would be wrong for the other, so the hint goes generic.
+// Two models declare the same container type under different field names, so the hint goes generic.
 func TestUnloadedPanicAmbiguousFieldNameStaysGeneric(t *testing.T) {
 	if _, err := planOf[ambigOwnerA](); err != nil {
 		t.Fatal(err)
@@ -309,8 +304,7 @@ func TestPreloadUnknownRelation(t *testing.T) {
 	}
 }
 
-// Pointer keys group by value, never by address — a *int64 owner PK must
-// match the int64 keys scanned back from join rows and count queries.
+// Pointer keys group by value, never by address.
 func TestCanonKeyDereferencesPointers(t *testing.T) {
 	n := int64(7)
 	if canonKey(reflect.ValueOf(&n)) != canonKey(reflect.ValueOf(int64(7))) {
@@ -322,9 +316,7 @@ func TestCanonKeyDereferencesPointers(t *testing.T) {
 	}
 }
 
-// With/WithCount typos must fail on every execution, not only when the
-// result set happens to be non-empty (AUDIT M13: the old data-dependent
-// check let empty-fixture tests ship misspelled relation names).
+// With/WithCount typos must fail on every execution, not only when the result set is non-empty.
 func TestWithValidationDoesNotDependOnData(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -363,9 +355,7 @@ type XFChild struct {
 	ParentID string `rio:"parent_id"`
 }
 
-// A string FK against an int64 PK groups by keys that can never be equal:
-// the rows come back from the database and are then silently dropped during
-// assembly (AUDIT M11). resolveRel must refuse the pair instead.
+// A string FK against an int64 PK can never match; resolveRel must refuse the pair, not silently drop rows.
 func TestPreloadRefusesCrossFamilyKeys(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -382,8 +372,7 @@ func TestPreloadRefusesCrossFamilyKeys(t *testing.T) {
 		}
 	}
 
-	// WithCount walks the same resolution and must fail identically — the
-	// audit's smoking gun was PostsCount=1 next to a loaded-empty Posts.
+	// WithCount walks the same resolution and must fail identically.
 	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
 	_, err = From[XFParent]().WithCount("Kids").All(ctx, db)
 	if err == nil || !strings.Contains(err.Error(), "never compare equal") {
@@ -401,9 +390,7 @@ type XOKChild struct {
 	ParentID int32 `rio:"parent_id"`
 }
 
-// Same-family pairs stay legal: canonKey folds all integer kinds together,
-// so an int32 FK loads against an int64 PK (pointer FKs are covered by
-// TestPreloadBelongsToAndNullFK's *int64).
+// Same-family pairs stay legal: canonKey folds all integer kinds together.
 func TestPreloadAllowsSameFamilyKeys(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -430,9 +417,7 @@ type CompositeOwner struct {
 	Side ManyToMany[CompositeSide]
 }
 
-// The old advice "set ref: explicitly" cannot work on ManyToMany — there
-// ref: names a join-table column, not a key (AUDIT LB6). The error must
-// state the v1 limitation and a path that actually exists.
+// On ManyToMany ref: names a join-table column, not a key; the error must state the limitation and a workable path.
 func TestManyToManyCompositePKError(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()

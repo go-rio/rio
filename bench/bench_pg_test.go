@@ -19,18 +19,15 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-// Real-network PostgreSQL benchmarks, same three legs and five shapes as the
-// SQLite file. Gated on RIO_BENCH_PG_DSN so `go test ./...` stays hermetic:
+// Real-network PostgreSQL benchmarks, gated on RIO_BENCH_PG_DSN:
 //
 //	docker run -d --name rio-bench-pg -e POSTGRES_PASSWORD=bench -p 15432:5432 \
 //	  postgres:17 -c fsync=off -c synchronous_commit=off -c full_page_writes=off
 //	RIO_BENCH_PG_DSN='postgres://postgres:bench@127.0.0.1:15432/postgres?sslmode=disable' \
 //	  go test -bench 'PG' -benchmem -run NONE ./...
 //
-// All three legs share pgx's database/sql adapter (and its default per-conn
-// statement cache), so the delta is ORM overhead, not driver choice. The GORM
-// leg runs GORM's default configuration — PrepareStmt off — plus QueryFields
-// to select explicit columns like rio does.
+// All legs share pgx's database/sql adapter, so the delta is ORM overhead;
+// the GORM leg runs defaults plus QueryFields.
 const pgDDL = `CREATE TABLE bench_users (
 	id BIGSERIAL PRIMARY KEY,
 	email VARCHAR(191) NOT NULL,
@@ -90,11 +87,10 @@ func benchPGGorm(b *testing.B) *gorm.DB {
 	return gdb
 }
 
-// benchPGNative opens the third tier — the pgx-native channel — over the
-// same schema the stdlib legs use (benchPGRaw owns DDL and seeding).
+// benchPGNative opens the pgx-native channel; benchPGRaw owns DDL and seeding.
 func benchPGNative(b *testing.B, raw *sql.DB) *rio.DB {
 	b.Helper()
-	_ = raw // schema owner; queries below run natively over their own pool
+	_ = raw // schema owner
 	db, err := riopostgres.OpenNative(context.Background(), pgDSN(b))
 	if err != nil {
 		b.Fatal(err)
@@ -133,9 +129,8 @@ func BenchmarkPGReadOne_RioNative(b *testing.B) {
 	}
 }
 
-// BenchmarkPGReadOne_RioStmtCache measures rio.WithStmtCache against the
-// default pgx-stdlib path (which already caches statements per connection),
-// isolating what an explicit database/sql prepared statement saves on top.
+// BenchmarkPGReadOne_RioStmtCache isolates what rio.WithStmtCache saves on
+// top of pgx-stdlib's own per-conn statement cache.
 func BenchmarkPGReadOne_RioStmtCache(b *testing.B) {
 	raw := benchPGRaw(b)
 	seedPG(b, raw, 100)

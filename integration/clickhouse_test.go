@@ -16,15 +16,9 @@ import (
 	_ "github.com/ClickHouse/clickhouse-go/v2"
 )
 
-// The ClickHouse leg runs when RIO_CLICKHOUSE_DSN is set, e.g.
-// RIO_CLICKHOUSE_DSN="clickhouse://rio:rio@localhost:19000/rio_test".
-//
-// It has three layers:
-//   - driver probes pinning the clickhouse-go behaviors rio's dialect design
-//     depends on (if upstream changes one, the matching probe fails first);
-//   - server-semantics regressions replaying the design's experiment matrix;
-//   - the rio end-to-end pass over the supported surface, plus real-database
-//     proof that the rejected surface sends nothing.
+// Runs when RIO_CLICKHOUSE_DSN is set, e.g.
+// "clickhouse://rio:rio@localhost:19000/rio_test". Three layers: driver
+// probes, server semantics (T1–T8), rio end to end.
 
 func clickhouseDB(t *testing.T, opts ...rio.Option) *rio.DB {
 	t.Helper()
@@ -36,17 +30,14 @@ func clickhouseDB(t *testing.T, opts ...rio.Option) *rio.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// No error translator: ClickHouse has no unique or FK constraints, so no
-	// server error maps to a rio sentinel (the go-rio/clickhouse module
-	// installs none either).
+	// No error translator: no unique/FK constraints, so no sentinel mapping.
 	db := rio.New(raw, rio.ClickHouse, opts...)
 	if err := db.Unwrap().Ping(); err != nil {
 		t.Fatalf("ping clickhouse: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	// rio's version floor: 26.x is where INSERT and comparisons natively
-	// parse rio's offset-carrying time text — before that, comparisons
-	// TYPE_MISMATCH regardless of session settings.
+	// Version floor: 26+ is where rio's offset-carrying time text parses in
+	// both INSERT and comparisons.
 	if major, minor := chServerVersion(t, context.Background(), db); major < 26 {
 		t.Skipf("rio requires ClickHouse 26+, server is %d.%d", major, minor)
 	}
@@ -62,7 +53,6 @@ func chExec(t *testing.T, ctx context.Context, db *rio.DB, stmts ...string) {
 	}
 }
 
-// chServerVersion returns the server's major/minor version.
 func chServerVersion(t *testing.T, ctx context.Context, db *rio.DB) (major, minor int) {
 	t.Helper()
 	v, err := rio.Raw[string]("SELECT version()").First(ctx, db)
@@ -78,11 +68,10 @@ func chServerVersion(t *testing.T, ctx context.Context, db *rio.DB) (major, mino
 	return major, minor
 }
 
-// --- layer 1: driver probes (upstream contracts, §-pinned) ---
+// --- layer 1: driver probes (upstream contracts) ---
 
-// TestClickHouseDriverProbes locks the clickhouse-go behaviors the dialect is
-// built around. Each subtest failing means upstream changed the contract —
-// revisit the matching design decision before "fixing" the test.
+// TestClickHouseDriverProbes pins the clickhouse-go behaviors the dialect
+// depends on; a failing probe means upstream changed a contract.
 func TestClickHouseDriverProbes(t *testing.T) {
 	db := clickhouseDB(t)
 	raw := db.Unwrap()
@@ -94,8 +83,7 @@ func TestClickHouseDriverProbes(t *testing.T) {
 		"CREATE TABLE probe_bytes (id Int64, s String) ENGINE = MergeTree ORDER BY id",
 	)
 
-	// Contract (a), the go.mod floor: the binder is quote-aware — a ? inside
-	// a string literal or comment survives; only the bare ? binds.
+	// Quote-aware binder (the go.mod driver floor): only the bare ? binds.
 	t.Run("quote-aware binding", func(t *testing.T) {
 		var lit, val string
 		row := raw.QueryRowContext(ctx, "SELECT '?' AS lit, ? AS val -- trailing ? stays\n", "bound")
@@ -107,8 +95,7 @@ func TestClickHouseDriverProbes(t *testing.T) {
 		}
 	})
 
-	// Contract (b): \? is un-escaped to a literal ? — the target of rio's ??
-	// rendering (ClickHouse's ternary operator reaches the server this way).
+	// \? unescapes to a literal ? — the target of rio's ?? rendering.
 	t.Run("backslash-question restores literal", func(t *testing.T) {
 		var y string
 		row := raw.QueryRowContext(ctx, `SELECT 2 > ? \? 'y' : 'n'`, 1)
@@ -120,10 +107,8 @@ func TestClickHouseDriverProbes(t *testing.T) {
 		}
 	})
 
-	// Contract (c): a time.Time positional argument is silently truncated to
-	// whole seconds by the driver — the reason rio binds chTimeFormat text
-	// instead. If this starts preserving sub-seconds, upstream fixed
-	// formatTime and rio could simplify.
+	// time.Time args truncate to whole seconds — why rio binds chTimeFormat
+	// text instead; if sub-seconds survive, rio could simplify.
 	t.Run("time.Time direct pass truncates to seconds", func(t *testing.T) {
 		at := time.Date(2024, 1, 2, 3, 4, 5, 123456000, time.UTC)
 		if _, err := raw.ExecContext(ctx, "INSERT INTO probe_times (id, at) VALUES (?, ?)", 1, at); err != nil {
@@ -138,12 +123,8 @@ func TestClickHouseDriverProbes(t *testing.T) {
 		}
 	})
 
-	// []byte has no dedicated formatValue branch: it renders as an
-	// Array(UInt8) literal. Against a String column the server does not even
-	// error — it stores the literal's text form ("hi" lands as "[104,105]"),
-	// silent corruption — the reason rio's ClickHouse funnels bind byte
-	// payloads as strings. If this round-trips the original bytes one day,
-	// upstream added a []byte branch and the funnel can go.
+	// []byte renders as an Array(UInt8) literal and silently corrupts String
+	// columns — why rio funnels byte payloads as strings.
 	t.Run("bytes direct pass corrupts", func(t *testing.T) {
 		if _, err := raw.ExecContext(ctx, "INSERT INTO probe_bytes (id, s) VALUES (?, ?)", 1, []byte("hi")); err != nil {
 			return // rejected loudly: also proof the funnel is required
@@ -157,8 +138,8 @@ func TestClickHouseDriverProbes(t *testing.T) {
 		}
 	})
 
-	// RowsAffected is unconditionally 0 and LastInsertId always errors —
-	// why entity Update/Delete (built on honest counts) are rejected.
+	// RowsAffected is always 0 and LastInsertId errors — why entity
+	// Update/Delete are rejected.
 	t.Run("RowsAffected is always zero", func(t *testing.T) {
 		res, err := raw.ExecContext(ctx, "INSERT INTO probe_bytes (id, s) VALUES (?, ?)", 2, "real row")
 		if err != nil {
@@ -177,8 +158,8 @@ func TestClickHouseDriverProbes(t *testing.T) {
 		}
 	})
 
-	// Begin is a no-op shim: a "rolled back transaction"'s insert stays
-	// visible — why db.Tx is rejected outright.
+	// Begin is a no-op shim: a rolled-back insert stays visible — why db.Tx
+	// is rejected.
 	t.Run("Begin is a fake transaction", func(t *testing.T) {
 		tx, err := raw.Begin()
 		if err != nil {
@@ -197,8 +178,8 @@ func TestClickHouseDriverProbes(t *testing.T) {
 		}
 	})
 
-	// Prepare implements INSERT batching only; a prepared SELECT is unusable
-	// — why WithStmtCache panics at construction.
+	// Prepare is INSERT-only; a prepared SELECT is unusable — why
+	// WithStmtCache panics at construction.
 	t.Run("Prepare(SELECT) is broken", func(t *testing.T) {
 		stmt, err := raw.PrepareContext(ctx, "SELECT 1")
 		if err != nil {
@@ -219,7 +200,7 @@ func TestClickHouseDriverProbes(t *testing.T) {
 	})
 }
 
-// --- layer 2: server semantics (the design's experiment matrix, T1–T8) ---
+// --- layer 2: server semantics (experiment matrix T1–T8) ---
 
 func TestClickHouseServerSemantics(t *testing.T) {
 	db := clickhouseDB(t)
@@ -243,8 +224,8 @@ func TestClickHouseServerSemantics(t *testing.T) {
 	// Base instant: 2024-01-02 03:04:05.123456 UTC = epoch 1704164645.123456.
 	const epoch = "1704164645.123456"
 
-	// T1: offset-free wall-clock text parses in the *column's* timezone — the
-	// Asia/Shanghai column lands 8h off. (Why rio's format carries an offset.)
+	// T1: offset-free text parses in the column's timezone — why rio's
+	// format carries an offset.
 	t.Run("T1 bare text obeys column timezone", func(t *testing.T) {
 		chExec(t, ctx, db, "INSERT INTO sem_tt VALUES (1, '2024-01-02 03:04:05.123456', '2024-01-02 03:04:05.123456', '2024-01-02 03:04:05')")
 		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 1 AND toUnixTimestamp64Micro(d) = 1704164645123456"); n != 1 {
@@ -255,9 +236,8 @@ func TestClickHouseServerSemantics(t *testing.T) {
 		}
 	})
 
-	// T3: text with an explicit offset overrides the column timezone — both
-	// columns store the same instant, comparisons included; the negative
-	// epoch range (pre-1970) parses too. This is rio's chosen encoding.
+	// T3: offset text overrides the column timezone (pre-1970 included) —
+	// rio's chosen encoding.
 	t.Run("T3 offset text is timezone-proof", func(t *testing.T) {
 		chExec(t, ctx, db, "INSERT INTO sem_tt VALUES (3, '2024-01-02 03:04:05.123456+00:00', '2024-01-02 03:04:05.123456+00:00', '2024-01-02 03:04:05.000000+00:00')")
 		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 3 AND toUnixTimestamp64Micro(d) = 1704164645123456 AND toUnixTimestamp64Micro(dz) = 1704164645123456"); n != 1 {
@@ -273,18 +253,15 @@ func TestClickHouseServerSemantics(t *testing.T) {
 		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 31 AND d = '1950-01-02 03:04:05.123456+00:00'"); n != 1 {
 			t.Fatal("negative-epoch offset text must round-trip")
 		}
-		// Sub-second text against a seconds column truncates silently — the
-		// same schema-responsibility class as DateTime64(3) dropping
-		// microseconds (the design memo expected a loud TYPE_MISMATCH here;
-		// 26.6 truncates instead — pin what the server actually does).
+		// Sub-second text on a seconds column truncates silently — pinned as
+		// schema responsibility.
 		chExec(t, ctx, db, "INSERT INTO sem_tt VALUES (32, '2024-01-02 03:04:05.123456+00:00', '2024-01-02 03:04:05.123456+00:00', '2024-01-02 03:04:05.123456+00:00')")
 		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 32 AND toUnixTimestamp(ds) = 1704164645"); n != 1 {
 			t.Fatal("DateTime(seconds) must truncate sub-second text, not reject or shift it")
 		}
 	})
 
-	// T2: fractional epoch strings work on DateTime64 but cannot express
-	// pre-1970 and break on DateTime — why they lost to offset text.
+	// T2: epoch strings cannot express pre-1970 — why they lost to offset text.
 	t.Run("T2 epoch strings are partial", func(t *testing.T) {
 		if n := scalarU64("SELECT count(*) FROM sem_tt WHERE id = 3 AND d = '" + epoch + "'"); n != 1 {
 			t.Fatal("epoch decimal string must compare on DateTime64")
@@ -317,7 +294,7 @@ func TestClickHouseServerSemantics(t *testing.T) {
 	})
 
 	// T5: a max-uint64 decimal string compares correctly — rio's overflow
-	// binding strategy holds on ClickHouse.
+	// binding holds.
 	t.Run("T5 uint64 max as string", func(t *testing.T) {
 		chExec(t, ctx, db, "INSERT INTO sem_plain VALUES (18446744073709551615, 'max')")
 		if n := scalarU64("SELECT count(*) FROM sem_plain WHERE id = '18446744073709551615'"); n != 1 {
@@ -404,8 +381,8 @@ type Reading struct {
 	UpdatedAt time.Time
 }
 
-// ProfileRow is the ReplacingMergeTree recipe: app-owned version column,
-// Insert new versions, read through Final().
+// ProfileRow is the ReplacingMergeTree recipe: app-owned version, Insert new
+// versions, read through Final().
 type ProfileRow struct {
 	ID      int64
 	Name    string
@@ -488,8 +465,8 @@ func TestClickHouseSuite(t *testing.T) {
 		t.Fatalf("batch time round-trip: %+v vs %+v", back, batch)
 	}
 
-	// Relations: all four kinds preload, WithCount aggregates, RelLimit
-	// windows, WhereHas filters (version-gated).
+	// Relations: all four kinds preload; WithCount, RelLimit, WhereHas
+	// (version-gated).
 	alice := Writer{ID: 1, Email: "alice@example.com"}
 	bob := Writer{ID: 2, Email: "bob@example.com"}
 	if err := rio.InsertAll(ctx, db, []Writer{alice, bob}); err != nil {
@@ -636,9 +613,8 @@ func TestClickHouseSuite(t *testing.T) {
 	}
 }
 
-// TestClickHouseRejectionsSendNothing proves on a real server that the
-// rejected surface fails before any statement leaves rio: a counting hook
-// observes zero queries during the rejected calls.
+// TestClickHouseRejectionsSendNothing: rejected calls fail before any
+// statement reaches the server (a counting hook sees zero queries).
 func TestClickHouseRejectionsSendNothing(t *testing.T) {
 	var statements atomic.Int64
 	db := clickhouseDB(t, rio.WithQueryHook(countingHook{&statements}))
@@ -710,8 +686,8 @@ type countingHook struct{ n *atomic.Int64 }
 func (countingHook) BeforeQuery(ctx context.Context, _ *rio.QueryEvent) context.Context { return ctx }
 func (h countingHook) AfterQuery(_ context.Context, _ *rio.QueryEvent)                  { h.n.Add(1) }
 
-// A rio sentinel that can never fire on ClickHouse must really never fire:
-// double-inserting the same sorting key succeeds (no unique constraints).
+// Same-key double insert succeeds (no unique constraints): ErrDuplicateKey
+// never fires.
 func TestClickHouseNoConstraintSentinels(t *testing.T) {
 	db := clickhouseDB(t)
 	ctx := context.Background()

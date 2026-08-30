@@ -55,9 +55,7 @@ func TestPreloadHasOne(t *testing.T) {
 	}
 }
 
-// Two child rows for one parent contradict HasOne — silently keeping
-// whichever row the driver returned first is a nondeterministic answer
-// (AUDIT LB5).
+// Two child rows for one parent contradict HasOne — refuse rather than pick one.
 func TestPreloadHasOneRefusesMultipleRows(t *testing.T) {
 	f := newFakeDB()
 	db := f.open()
@@ -128,8 +126,7 @@ func TestCreateOrFirstRaceAndTombstone(t *testing.T) {
 		t.Fatalf("must adopt existing row: %+v", u)
 	}
 
-	// Insert conflicts and find misses: a soft-deleted tombstone holds the
-	// key — the error says so.
+	// Insert conflicts and find misses: a soft-deleted tombstone holds the key.
 	f.queueRows(userCols)
 	err := From[User]().Where("email = ?").CreateOrFirst(ctx, dbT, &User{Email: "ghost@x"}, "ghost@x")
 	if !errors.Is(err, ErrDuplicateKey) || !strings.Contains(err.Error(), "soft-deleted") {
@@ -172,9 +169,7 @@ func TestStmtCache(t *testing.T) {
 	}
 }
 
-// Zero-arg statements bypass the cache on both engines: preparing buys
-// nothing without binds, a one-off DDL text would pin an LRU slot, and a
-// multi-command script cannot be prepared at all.
+// Zero-arg statements bypass the cache: no binds to gain, and multi-command scripts cannot prepare.
 func TestStmtCacheSkipsZeroArgStatements(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -309,8 +304,7 @@ func TestStmtCacheEvictionClosesStatement(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// cap 2: the third shape evicts the least recently used first one, and
-	// the evicted server-side statement must be closed, not leaked.
+	// cap 2: the third shape evicts the LRU statement, which must be closed, not leaked.
 	closed := f.closedStmts()
 	if len(closed) != 1 || !strings.Contains(closed[0], "a = ?") {
 		t.Fatalf("evicting must close exactly the LRU statement, closed: %v", closed)
@@ -360,9 +354,7 @@ func TestDBCloseClosesCachedStatements(t *testing.T) {
 	}
 }
 
-// schemaChangeErr mimics pgx/lib/pq errors carrying SQLSTATE 0A000 ("cached
-// plan must not change result type"), raised when DDL invalidates a prepared
-// statement.
+// schemaChangeErr mimics driver errors carrying SQLSTATE 0A000, raised when DDL invalidates a prepared statement.
 type schemaChangeErr struct{}
 
 func (schemaChangeErr) Error() string    { return "pq: cached plan must not change result type" }
@@ -387,8 +379,6 @@ func TestStmtCacheSchemaChangeEvictsAndPropagates(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "cached plan must not change result type") {
 		t.Fatalf("the schema-change error must propagate unchanged: %v", err)
 	}
-	// The invalidated statement is evicted (closed), and rio never retried:
-	// the statement hit the driver exactly twice — first success, one failure.
 	if closed := f.closedStmts(); len(closed) != 1 || !strings.Contains(closed[0], "SELECT") {
 		t.Fatalf("0A000 must evict and close the cached statement, closed: %v", closed)
 	}
@@ -396,7 +386,6 @@ func TestStmtCacheSchemaChangeEvictsAndPropagates(t *testing.T) {
 		t.Fatalf("0A000 must never auto-retry, got %d executions", n)
 	}
 
-	// The next execution prepares fresh instead of reusing the stale plan.
 	f.unfail("SELECT")
 	f.queueRows(userCols)
 	if _, err := q.All(ctx, db); err != nil {
@@ -418,7 +407,6 @@ func TestStmtCachePrepareFailurePropagates(t *testing.T) {
 	if !errors.Is(err, prepErr) {
 		t.Fatalf("a prepare failure must surface loudly, got %v", err)
 	}
-	// No silent fallback: the statement never executed and nothing was cached.
 	if logged := f.loggedContaining("SELECT"); len(logged) != 0 {
 		t.Fatalf("failed prepare must not execute the statement: %v", logged)
 	}
@@ -427,10 +415,8 @@ func TestStmtCachePrepareFailurePropagates(t *testing.T) {
 	}
 }
 
-// closeCachedStmts closes every *sql.Stmt the cache holds without evicting its
-// entries, reproducing the documented race where a concurrent eviction closes
-// a handle between the cache get and its use. Close runs off the lock — it can
-// do a network round-trip and the mutex guards only the maps.
+// closeCachedStmts closes every cached *sql.Stmt without evicting entries,
+// reproducing a concurrent eviction; Close runs off the lock, which guards only the maps.
 func closeCachedStmts(db *DB) {
 	stmts := db.e.(*sqlEngine).stmts
 	stmts.mu.Lock()
@@ -454,10 +440,7 @@ func TestStmtCacheClosedStatementFallsBackToDirectExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Simulate the documented race: a concurrent eviction closes the handle
-	// between the cache get and the query. database/sql then fails with
-	// "sql: statement is closed" before reaching the driver, and rio must
-	// fall back to direct execution — the statement never ran, so it is safe.
+	// Eviction race: the statement never ran, so direct-execution fallback is safe.
 	closeCachedStmts(db)
 
 	f.queueRows(userCols, userRow(1, "a@x"))
@@ -483,10 +466,7 @@ func TestStmtCacheExecClosedStatementFallsBackToDirectExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The exec path carries the same race as the query path: a concurrent
-	// eviction closes the handle between the cache get and the exec, so
-	// database/sql reports "sql: statement is closed" before the driver runs
-	// it. rio re-executes directly — the write never happened, so it is safe.
+	// Same race on the exec path: the write never happened, so re-executing is safe.
 	closeCachedStmts(db)
 
 	f.queueExec(0, 7)
@@ -520,9 +500,7 @@ func TestStmtCacheExecSchemaChangeEvictsAndPropagates(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "cached plan must not change result type") {
 		t.Fatalf("the schema-change error must propagate unchanged: %v", err)
 	}
-	// The invalidated statement is evicted (closed) and never auto-retried: a
-	// write retried on its own could double-execute. It hit the driver exactly
-	// twice — one success, one failure.
+	// Never auto-retried: a write retried on its own could double-execute.
 	if closed := f.closedStmts(); len(closed) != 1 || !strings.Contains(closed[0], "UPDATE") {
 		t.Fatalf("0A000 must evict and close the cached statement, closed: %v", closed)
 	}
@@ -530,7 +508,6 @@ func TestStmtCacheExecSchemaChangeEvictsAndPropagates(t *testing.T) {
 		t.Fatalf("0A000 must never auto-retry, got %d executions", n)
 	}
 
-	// The next write prepares fresh instead of reusing the stale plan.
 	f.unfail("UPDATE")
 	if _, err := Exec(ctx, db, stmt, 32, 1); err != nil {
 		t.Fatal(err)
@@ -540,10 +517,7 @@ func TestStmtCacheExecSchemaChangeEvictsAndPropagates(t *testing.T) {
 	}
 }
 
-// TestStmtCacheConcurrentEvictionRaceClean hammers a cap-bound cache with more
-// shapes than it holds, so gets, evictions, and same-shape prepare races
-// overlap continuously. Its point is the -race gate: the cache's locking must
-// hold with no data race, no lost error, and no double-close.
+// Hammers a cap-bound cache so gets, evictions, and prepare races overlap; the point is the -race gate.
 func TestStmtCacheConcurrentEvictionRaceClean(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -994,10 +968,7 @@ func TestPreloadRelWhereBindLimit(t *testing.T) {
 	}
 }
 
-// Exists probes for one row, so a Limit >= 1 collapses to LIMIT 1 — but
-// Limit(0) means "no rows" (as on All) and Offset shifts which row must
-// exist: Offset(10).Exists asks "is there an 11th row", the paging probe,
-// and dropping it would answer a different question.
+// Exists collapses Limit >= 1 to LIMIT 1; Limit(0) still means "no rows" and Offset shifts the probe row.
 func TestExistsHonorsOffsetAndZeroLimit(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1077,10 +1048,7 @@ func TestUpsertScanBackReplacesJSONWholesale(t *testing.T) {
 	f := newFakeDB()
 	db := f.open()
 
-	// Conflict branch with settings outside the DoUpdate whitelist: the row
-	// keeps its stored JSON and RETURNING hands it back. json.Unmarshal into
-	// the caller's non-nil map would merge the two states; the struct must
-	// hold exactly what the database stores.
+	// Scan-back must replace the caller's JSON map wholesale, not unmarshal-merge into it.
 	f.queueRows(
 		[]string{"id", "email", "settings"},
 		[]driver.Value{int64(7), "a@x", []byte(`{"theme":"dark"}`)},
@@ -1115,8 +1083,7 @@ func TestRestoreEntity(t *testing.T) {
 	}
 }
 
-// Codex review: Upsert(DoNothing) without OnConflict rendered the invalid
-// "ON CONFLICT ()" on PG/SQLite; the idempotent-insert shape must work bare.
+// Bare Upsert(DoNothing) once rendered the invalid "ON CONFLICT ()".
 func TestUpsertDoNothingWithoutTarget(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1133,8 +1100,7 @@ func TestUpsertDoNothingWithoutTarget(t *testing.T) {
 	}
 }
 
-// Codex review: partial entity scans through Raw risked zeroed-out writes;
-// missing mapped columns now fail with DTO guidance.
+// Partial entity scans through Raw risk zeroed-out writes; missing mapped columns fail with DTO guidance.
 func TestRawPartialEntityRefused(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1163,8 +1129,7 @@ func TestRawDuplicateColumnsRefused(t *testing.T) {
 	}
 }
 
-// Codex review: uint64 keys above MaxInt64 must bind on query paths too,
-// not just through entity writes.
+// uint64 args above MaxInt64 must bind on query paths too, not just entity writes.
 func TestHugeUint64QueryArgs(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1181,7 +1146,7 @@ func TestHugeUint64QueryArgs(t *testing.T) {
 	}
 }
 
-// --- v0.2: WhereHas / WhereHasNot ---
+// --- WhereHas / WhereHasNot ---
 
 func TestWhereHas(t *testing.T) {
 	ctx := context.Background()
@@ -1269,7 +1234,7 @@ func TestQueryAllowsDeferredWhereWithInlineWhereHas(t *testing.T) {
 	}
 }
 
-// --- v0.2: WithCount + RelLimit ---
+// --- WithCount + RelLimit ---
 
 type Board struct {
 	ID         int64
@@ -1301,7 +1266,6 @@ func TestWithCount(t *testing.T) {
 	if boards[0].PostsCount != 3 || boards[1].PostsCount != 0 {
 		t.Fatalf("counts: %+v", boards)
 	}
-	// The count target itself is not a column.
 	if !strings.Contains(f.logged()[0], `SELECT "boards"."id" FROM "boards"`) {
 		t.Fatalf("countof field must not map to a column: %s", f.logged()[0])
 	}
@@ -1492,7 +1456,7 @@ func TestRelLimitManyToMany(t *testing.T) {
 	}
 }
 
-// --- v0.2: Attach/Detach, Rows, Pluck ---
+// --- Attach/Detach, Rows, Pluck ---
 
 func TestAttachDetach(t *testing.T) {
 	ctx := context.Background()
@@ -1621,7 +1585,7 @@ func TestPluck(t *testing.T) {
 	}
 }
 
-// --- v0.3: WriteColumns, SyncRelation, Scope, Query.Rows ---
+// --- WriteColumns, SyncRelation, Scope, Query.Rows ---
 
 func TestWriteColumns(t *testing.T) {
 	var buf strings.Builder
@@ -1643,11 +1607,9 @@ func TestWriteColumns(t *testing.T) {
 			t.Fatalf("missing %q in generated:\n%s", frag, got)
 		}
 	}
-	// Models sort deterministically (Post before User).
 	if strings.Index(got, "PostTable") > strings.Index(got, "UserTable") {
 		t.Fatal("output must sort by model name")
 	}
-	// Relation containers and countof targets are not columns.
 	if strings.Contains(got, "Posts ") || strings.Contains(got, "Author ") {
 		t.Fatalf("relations must not appear:\n%s", got)
 	}
@@ -1746,8 +1708,7 @@ func TestQueryDeferredRows(t *testing.T) {
 	}
 }
 
-// rawStreamRow is a DTO target for the RawQuery.Rows tests; "id"/"name" fully
-// cover it, so namedFields accepts the result.
+// rawStreamRow is a fully covered DTO target for the RawQuery.Rows tests.
 type rawStreamRow struct {
 	ID   int64
 	Name string
@@ -1907,8 +1868,7 @@ func TestRawQueryRowsEarlyBreakCloseErrorReachesHook(t *testing.T) {
 	}
 }
 
-// A scan failure mid-stream surfaces on that element; the driver Close error
-// rides underneath it (mergeClose keeps the scan error).
+// A mid-stream scan failure surfaces on that element; mergeClose keeps it over the Close error.
 func TestRawQueryRowsScanErrorSurfaces(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1934,8 +1894,7 @@ func TestRawQueryRowsScanErrorSurfaces(t *testing.T) {
 	}
 }
 
-// A result missing a mapped column is refused before any row streams — the
-// same guard All applies against zeroed-out partial scans.
+// A result missing a mapped column is refused before any row streams.
 func TestRawQueryRowsFullCoverageEnforced(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1952,8 +1911,7 @@ func TestRawQueryRowsFullCoverageEnforced(t *testing.T) {
 	}
 }
 
-// A fully drained stream surfaces the deferred driver Close error on the final
-// yield — the mergeClose discipline shared with All.
+// A fully drained stream surfaces the deferred Close error on the final yield.
 func TestRawQueryRowsSurfacesCloseError(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1972,7 +1930,7 @@ func TestRawQueryRowsSurfacesCloseError(t *testing.T) {
 	}
 }
 
-// Codex v0.3 review: concurrent SyncRelation must serialize on the owner row.
+// Concurrent SyncRelation must serialize on the owner row.
 func TestSyncRelationLocksOwner(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -1999,8 +1957,7 @@ func TestSyncRelationLocksOwner(t *testing.T) {
 		t.Fatal("the locked read must precede the delete")
 	}
 
-	// SQLite: single-writer, no FOR UPDATE — and none rendered, neither on
-	// the owner nor on the join-row read.
+	// SQLite is single-writer: no FOR UPDATE rendered anywhere.
 	f2 := newFakeDB()
 	db2 := f2.open(SQLite)
 	f2.queueRows([]string{"tag_id"})
@@ -2013,8 +1970,7 @@ func TestSyncRelationLocksOwner(t *testing.T) {
 	}
 }
 
-// Same-depth embedded fields with the same name are ambiguous in Go and
-// refused for every caller; WriteColumns surfaces that plan error.
+// Same-depth same-name embedded fields are ambiguous; WriteColumns surfaces the plan error.
 func TestWriteColumnsRefusesDuplicateFieldNames(t *testing.T) {
 	type Meta struct {
 		ID int64 `rio:"meta_id,pk,noautoincr"`
@@ -2033,9 +1989,7 @@ func TestWriteColumnsRefusesDuplicateFieldNames(t *testing.T) {
 	}
 }
 
-// A role tag on a flattened embedded struct would silently vanish — the pk
-// below would never become a key and Find/Update/Delete would use the ID
-// convention instead. The plan must refuse it.
+// A role tag on a flattened embedded struct would silently vanish; the plan must refuse it.
 func TestRoleTagOnFlattenedEmbedRefused(t *testing.T) {
 	type compositeKey struct {
 		Region string
@@ -2076,8 +2030,6 @@ func TestCountOfWithColumnNameRefused(t *testing.T) {
 	}
 }
 
-// --- post-v0.3.0 self-review hardening ---
-
 // Reusable Query.All must run WithCount after the main query.
 func TestQueryAllFillsWithCount(t *testing.T) {
 	ctx := context.Background()
@@ -2110,8 +2062,7 @@ func TestSoleRejectsMultipleRowsBeforePreloading(t *testing.T) {
 	}
 }
 
-// A silently ignored Limit would turn "delete ten rows" into "delete every
-// matching row"; set-based writes refuse shapes they cannot honor.
+// Set-based writes refuse shapes they cannot honor — a dropped Limit would delete every matching row.
 func TestSetOpsRefuseLimitOffsetGroupBy(t *testing.T) {
 	ctx := context.Background()
 	db := newFakeDB().open()
@@ -2154,10 +2105,7 @@ func TestSetOpsRefuseLimitOffsetGroupBy(t *testing.T) {
 	}
 }
 
-// forceDeleteAll is the shared hard-delete render behind both DeleteAll (on a
-// model without a softdelete column) and ForceDeleteAll. On a plain model
-// DeleteAll takes the hard path: a real DELETE that honors Where and returns
-// the driver's affected count.
+// On a model without a softdelete column, DeleteAll is a real DELETE honoring Where.
 func TestDeleteAllHardDeletesModelWithoutSoftColumn(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -2178,11 +2126,7 @@ func TestDeleteAllHardDeletesModelWithoutSoftColumn(t *testing.T) {
 	}
 }
 
-// ForceDeleteAll hard-deletes on a softdelete model. WithTrashed drops the
-// deleted_at filter so trashed rows are deleted too, the Where is honored, and
-// the version column never enters a set-based write (no optimistic-lock
-// predicate, no version bind). The contrast is DeleteAll on the same model,
-// which stays a soft UPDATE stamping deleted_at behind the live-row filter.
+// ForceDeleteAll hard-deletes a softdelete model; the version column never enters a set-based write.
 func TestForceDeleteAllHardDeletesSoftModel(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -2222,10 +2166,7 @@ func TestForceDeleteAllHardDeletesSoftModel(t *testing.T) {
 	}
 }
 
-// Both hard-delete paths refuse a whole-table write without conditions and run
-// once AllRows opts in: OnlyTrashed().AllRows().ForceDeleteAll empties the
-// recycle bin (deleted_at IS NOT NULL), AllRows().DeleteAll clears a plain
-// table.
+// Hard deletes refuse a whole-table write until AllRows opts in.
 func TestHardDeleteRequiresWhere(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -2257,8 +2198,7 @@ func TestHardDeleteRequiresWhere(t *testing.T) {
 	}
 }
 
-// Pluck refuses row-set-changing clauses it does not render, and honors
-// ForUpdate instead of silently skipping the lock.
+// Pluck refuses clauses it does not render and honors ForUpdate.
 func TestPluckShapeGuards(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -2277,8 +2217,7 @@ func TestPluckShapeGuards(t *testing.T) {
 	}
 }
 
-// WhereHas conditions bind inside the EXISTS subquery; a bare ? there can
-// never be an exec-time parameter and must refuse during validation.
+// A bare ? inside WhereHas can never be an exec-time parameter; validation must refuse it.
 func TestQueryValidateRejectsBareWhereHasPlaceholder(t *testing.T) {
 	err := From[User]().Where("age > ?").WhereHas("Posts", RelWhere("title = ?")).Validate()
 	if err == nil || !strings.Contains(err.Error(), "bind inline") {
@@ -2318,8 +2257,7 @@ func TestWriteColumnsRefusesDuplicateModelNames(t *testing.T) {
 	}
 }
 
-// A [16]byte UUID is one value; expanding it into sixteen placeholders would
-// splice a list into "= ?".
+// A [16]byte UUID is one scalar value, not sixteen placeholders.
 func TestByteArrayArgStaysScalar(t *testing.T) {
 	sqlText, args, err := rebind(pgLex, bindDollar, "id = ?", []any{[16]byte{1}})
 	if err != nil {
@@ -2330,8 +2268,7 @@ func TestByteArrayArgStaysScalar(t *testing.T) {
 	}
 }
 
-// sql.NullTime as a query argument must bind rio's own time encoding — on
-// SQLite the driver's format would miss every stored value.
+// sql.NullTime query args must bind rio's own time encoding (SQLite would miss stored values otherwise).
 func TestNormalizeArgsNullTime(t *testing.T) {
 	at := time.Date(2026, 7, 9, 3, 4, 5, 0, time.UTC)
 	out, err := normalizeArgs(SQLite, []any{sql.NullTime{Time: at, Valid: true}, sql.NullTime{}})
@@ -2370,7 +2307,6 @@ func TestUpdateWhitelistOrderInsensitive(t *testing.T) {
 	if len(stmts) != 2 || stmts[0].sql != stmts[1].sql {
 		t.Fatalf("both orders must share one canonical statement:\n%s\n%s", stmts[0].sql, stmts[1].sql)
 	}
-	// The second call must bind in model order, not caller order.
 	if stmts[1].args[0] != "b@x" || stmts[1].args[1] != int64(40) {
 		t.Fatalf("second call bound values in caller order, not canonical: %v", stmts[1].args)
 	}
@@ -2547,10 +2483,8 @@ func TestAttachDetachTypedIDs(t *testing.T) {
 	}
 }
 
-// Attach and Detach chunk to the dialect's bind ceiling like InsertAll —
-// one oversized id set must never surface a driver "too many SQL variables"
-// (AUDIT M14). SQLite's 999-parameter cap keeps the fixture small: an
-// INSERT holds 499 (owner, id) pairs, a DELETE holds 998 ids plus the owner.
+// Attach/Detach chunk to the dialect bind ceiling: SQLite's 999 params fit
+// 499 (owner, id) INSERT pairs, or 998 DELETE ids plus the owner.
 func TestAttachDetachChunkByBindLimit(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -2596,9 +2530,7 @@ func TestAttachDetachChunkByBindLimit(t *testing.T) {
 	}
 }
 
-// SyncRelation's removals chunk the same way: 1200 existing links converging
-// on a single kept id must issue two IN deletes, never one oversized (or a
-// NOT IN) statement — and nothing gets inserted when the id is already there.
+// SyncRelation removals chunk the same way: 1199 stale ids at 999 params is two IN deletes.
 func TestSyncRelationChunksDeletes(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -2627,8 +2559,7 @@ func TestSyncRelationChunksDeletes(t *testing.T) {
 	}
 }
 
-// Row locks never reach the aggregate count shape (PostgreSQL rejects them);
-// Exists keeps the lock — its probe row is well-defined.
+// Count drops ForUpdate (PostgreSQL rejects locked aggregates); Exists keeps it.
 func TestCountForUpdateOmitsLock(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -2655,9 +2586,7 @@ type Reminder struct {
 	Remind sql.NullTime
 }
 
-// sql.NullTime fields bind rio's canonical encoding on the entity write path
-// — the same value must store identically under Insert and Upsert, and on
-// SQLite in rio's own text form.
+// sql.NullTime fields bind rio's canonical encoding on entity writes.
 func TestNullTimeFieldBindsCanonical(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -2683,9 +2612,7 @@ func TestNullTimeFieldBindsCanonical(t *testing.T) {
 	}
 }
 
-// The read side mirrors that ownership: a TEXT column (or an expression
-// column with no decltype for the driver to convert) hands back rio's own
-// format, which sql.NullTime's Scan alone would reject.
+// A TEXT column hands back rio's own format, which sql.NullTime.Scan alone would reject.
 func TestNullTimeFieldScansTextForm(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -2708,9 +2635,7 @@ func TestNullTimeFieldScansTextForm(t *testing.T) {
 	}
 }
 
-// Set-based writes render only their own table with no row order, so Join and
-// OrderBy cannot be honored — refuse loudly rather than drop them silently
-// (a dropped Join leaves the WHERE referencing a table not in the statement).
+// Set-based writes cannot honor Join or OrderBy — refuse loudly rather than drop them silently.
 func TestSetOpsRefuseJoinAndOrderBy(t *testing.T) {
 	ctx := context.Background()
 	db := newFakeDB().open()
@@ -2731,9 +2656,7 @@ func TestSetOpsRefuseJoinAndOrderBy(t *testing.T) {
 	}
 }
 
-// An embedded struct promotes its exported fields even when the embedded
-// type's own name is unexported — matching encoding/json. Silently dropping
-// them (the old behavior) is the kind of data-omission surprise rio refuses.
+// An embedded struct promotes its exported fields even when its type name is unexported, matching encoding/json.
 type embeddedMeta struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
@@ -2781,8 +2704,7 @@ func TestEmbeddedUnexportedTypeFlattens(t *testing.T) {
 	}
 }
 
-// Map-iteration order is nondeterministic, so concurrent whitelisted Updates
-// with differing column orders must still bind each value to its own column.
+// Concurrent whitelisted Updates with differing column orders must bind each value to its own column.
 func TestConcurrentUpdateWhitelistOrder(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -2811,10 +2733,7 @@ func TestConcurrentUpdateWhitelistOrder(t *testing.T) {
 	}
 }
 
-// --- round-2 opus audit regressions ---
-
-// Count must refuse Having (with or without GroupBy): a bare HAVING filters
-// the single implicit aggregate group and silently returns 0.
+// Count refuses Having: a bare HAVING filters the single aggregate group and silently returns 0.
 func TestCountRefusesHaving(t *testing.T) {
 	ctx := context.Background()
 	db := newFakeDB().open()
@@ -2824,8 +2743,7 @@ func TestCountRefusesHaving(t *testing.T) {
 	}
 }
 
-// m2m WithCount must INNER JOIN the target, exactly like the With load, so the
-// count matches the rows With would return even without a softdelete column.
+// m2m WithCount must INNER JOIN the target so the count matches what With loads.
 func TestManyToManyWithCountJoinsTarget(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -2864,8 +2782,7 @@ func TestWithCountDeduplicates(t *testing.T) {
 	}
 }
 
-// A *time.Time CreatedAt/UpdatedAt is auto-stamped, like the value form and
-// like softdelete's *time.Time acceptance.
+// A *time.Time CreatedAt/UpdatedAt is auto-stamped like the value form.
 type PtrStamped struct {
 	ID        int64
 	Name      string
@@ -2904,8 +2821,7 @@ func TestPointerTimestampsStamped(t *testing.T) {
 	}
 }
 
-// Under Go shadowing the outer CreatedAt wins the stamp role and the embedded,
-// renamed one does not map at all; only same-depth duplicates are refused.
+// Under Go shadowing the outer CreatedAt wins the stamp role; the shadowed embed does not map.
 type DupCreatedInner struct {
 	CreatedAt time.Time `rio:"made_at"`
 }
@@ -2928,8 +2844,7 @@ func TestShadowedCreatedRoleResolvesToOuter(t *testing.T) {
 	}
 }
 
-// Detach with a byte-kind id type must expand IN (?) to one placeholder per
-// id, not bind the whole slice as one BLOB.
+// Byte-kind ids must expand IN (?) per id, not bind the slice as one BLOB.
 type ByteTag struct {
 	ID uint8
 }
@@ -2963,9 +2878,7 @@ type CountTag struct {
 
 func (CountAcct) TableName() string { return "count_accts" }
 
-// An explicit role tag wins over the name-based timestamp convention: a field
-// named UpdatedAt but tagged softdelete is the soft-delete column, not also
-// the updated_at stamp (which would fight over the same field).
+// An explicit role tag beats the name-based timestamp convention.
 type SoftDelNamedTimestamp struct {
 	ID        int64
 	Name      string
@@ -2989,10 +2902,7 @@ func TestExplicitTagBeatsTimestampName(t *testing.T) {
 	}
 }
 
-// --- round-3 opus audit regressions ---
-
-// A slice Set value in UpdateAll must be refused, not IN-expanded into a
-// malformed "SET col = ?, ?".
+// A slice Set value in UpdateAll must be refused, not IN-expanded into "SET col = ?, ?".
 func TestUpdateAllRefusesSliceSetValue(t *testing.T) {
 	ctx := context.Background()
 	db := newFakeDB().open()
@@ -3027,8 +2937,7 @@ func TestUpdateAllJSONNilBindsSQLNull(t *testing.T) {
 	}
 }
 
-// WithCount("") must error (unknown relation), not be silently swallowed by
-// the dedup sentinel.
+// WithCount("") must error, not be swallowed by the dedup sentinel.
 func TestWithCountEmptyNameErrors(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -3040,8 +2949,7 @@ func TestWithCountEmptyNameErrors(t *testing.T) {
 	}
 }
 
-// RelLimit's windowed preload must carry an outer ORDER BY so the per-parent
-// child order the user asked for via RelOrder survives.
+// The windowed preload carries an outer ORDER BY so RelOrder survives.
 func TestRelLimitOuterOrderBy(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -3053,8 +2961,6 @@ func TestRelLimitOuterOrderBy(t *testing.T) {
 		t.Fatalf("All: %v", err)
 	}
 	sql := f.logged()[1]
-	// The outer query (after the rio_w subquery) must ORDER BY the partition
-	// and the row number.
 	if !strings.Contains(sql, `AS "rio_w" WHERE "rio_w"."__rio_rn" <= 2 ORDER BY "rio_w"."user_id", "rio_w"."__rio_rn"`) {
 		t.Fatalf("RelLimit missing outer ORDER BY: %s", sql)
 	}
@@ -3075,8 +2981,7 @@ func TestRestoreAllNaming(t *testing.T) {
 	}
 }
 
-// On MySQL a restore-on-upsert clears deleted_at server-side; rio reconciles
-// the in-memory softdelete field so the row reads as visible without a reload.
+// MySQL restore-on-upsert clears deleted_at server-side; rio reconciles the in-memory field.
 func TestMySQLUpsertReconcilesDeletedAt(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -3092,10 +2997,7 @@ func TestMySQLUpsertReconcilesDeletedAt(t *testing.T) {
 	}
 }
 
-// --- round-4 opus audit regressions ---
-
-// A basic-kind field that implements driver.Valuer must bind through Value(),
-// not the unsafe fast read that hands the driver the raw underlying value.
+// A basic-kind field implementing driver.Valuer must bind through Value(), not the raw fast read.
 type lowerName string
 
 func (s lowerName) Value() (driver.Value, error) { return strings.ToLower(string(s)), nil }
@@ -3180,15 +3082,12 @@ func TestRelLimitZeroLoadsNone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("All: %v", err)
 	}
-	// The windowed subquery renders even for limit 0 (rn <= 0 → no rows).
 	if !strings.Contains(f.logged()[1], "ROW_NUMBER()") || !strings.Contains(f.logged()[1], "<= 0") {
 		t.Fatalf("RelLimit(0) must render the bounded window: %s", f.logged()[1])
 	}
 }
 
-// A uint64 above MaxInt64 binds as a decimal string on MySQL/Postgres
-// (BIGINT UNSIGNED / numeric), but fails loud on SQLite, which would coerce
-// the oversized INTEGER literal to REAL and silently lose precision.
+// uint64 above MaxInt64 binds as a decimal string on MySQL/Postgres but fails loud on SQLite (REAL coercion loses precision).
 type BigUint struct {
 	ID int64
 	N  uint64
@@ -3214,11 +3113,7 @@ func TestBigUintDialectBinding(t *testing.T) {
 	}
 }
 
-// --- pre-release audit (fable multi-lens) plan-domain regressions ---
-
-// The ID primary-key convention survives role-neutral tags: a rename,
-// omitzero, or noautoincr does not change what the field is. Only a tag that
-// assigns an incompatible role, or an explicit pk elsewhere, opts out.
+// The ID primary-key convention survives role-neutral tags (rename, omitzero, noautoincr).
 type RenamedID struct {
 	ID   int64 `rio:"gid"`
 	Name string
@@ -3261,9 +3156,7 @@ func TestRenamedIDKeepsPKConvention(t *testing.T) {
 	}
 }
 
-// README documents `rio:",noautoincr"` as "integer single PK that rio must
-// not treat as auto-increment" — the tag opts out of auto-increment, not out
-// of being the primary key.
+// noautoincr opts out of auto-increment, not out of being the primary key.
 type ExternalID struct {
 	ID   int64 `rio:",noautoincr"`
 	Name string
@@ -3300,8 +3193,7 @@ func TestNoAutoIncrIDStaysPrimaryKey(t *testing.T) {
 	}
 }
 
-// An explicit pk tag anywhere in the model turns the ID convention off:
-// explicit declarations beat conventions.
+// An explicit pk tag anywhere in the model turns the ID convention off.
 type CodePK struct {
 	Code string `rio:",pk"`
 	ID   int64
@@ -3336,10 +3228,7 @@ func TestRoleTaggedIDIsNotPK(t *testing.T) {
 	}
 }
 
-// An interface-typed field satisfying sql.Scanner passed plan validation and
-// then panicked inside Rows.Scan — a panic database/sql escalates into a
-// permanently blocked rows.Close (goroutine + connection leak). Refuse at
-// plan time instead.
+// An interface-typed field once panicked inside Rows.Scan, wedging rows.Close; refuse at plan time.
 type IfaceScanned struct {
 	ID  int64
 	Val sql.Scanner
@@ -3365,9 +3254,7 @@ func TestRawInvalidStructDoesNotQuery(t *testing.T) {
 	}
 }
 
-// Defense in depth for the same bug: even if a scanScanner codec ever reaches
-// an interface field again, slowScanner must return an error, not panic —
-// panicking under Rows.Scan wedges rows.Close forever.
+// Defense in depth: slowScanner must error on an interface field, never panic under Rows.Scan.
 func TestSlowScannerInterfaceReturnsError(t *testing.T) {
 	var row struct{ Val sql.Scanner }
 	cs := &colScanner{
@@ -3383,10 +3270,7 @@ func TestSlowScannerInterfaceReturnsError(t *testing.T) {
 	}
 }
 
-// The full-column Update set must not include the softdelete column: a stale
-// live struct (DeletedAt zero) would write deleted_at back to NULL and
-// silently resurrect a row another session tombstoned. Delete, Restore, and
-// ForceDelete are the only APIs that touch it.
+// The full-column Update set excludes the softdelete column: a stale live struct would silently resurrect a tombstoned row.
 type Ghost struct {
 	ID        int64
 	Name      string
@@ -3418,9 +3302,7 @@ func TestUpdateWhitelistRefusesSoftDeleteColumn(t *testing.T) {
 	}
 }
 
-// Flattening honors Go's shadowing semantics: the shallowest of two same-named
-// fields wins even when excluded with rio:"-" or renamed; the shadowed
-// embedded field must not map.
+// Flattening honors Go shadowing: the shallowest field wins even when excluded or renamed.
 type NoteBase struct {
 	Notes string
 }
@@ -3459,8 +3341,7 @@ func TestEmbeddedShadowingFollowsGoSemantics(t *testing.T) {
 	}
 }
 
-// Two same-named fields at the same embedding depth are inaccessible in Go
-// (ambiguous selector); encoding/json drops both silently — rio refuses.
+// Same-depth same-named embedded fields are ambiguous in Go; rio refuses where encoding/json drops both.
 type ClashA struct {
 	Code string
 }
@@ -3480,9 +3361,7 @@ func TestSameDepthEmbeddedNameClashRefused(t *testing.T) {
 	}
 }
 
-// An unexported embedded type may flatten (documented), but tagging it into a
-// column of its own passed every plan check and then panicked at bind time:
-// reflect refuses Interface() on unexported embedded fields.
+// Tagging an unexported embedded type into its own column once panicked at bind time; refuse at plan time.
 type jsonPrefs struct {
 	Theme string
 }
@@ -3954,9 +3833,7 @@ func TestScannerFieldsStillBindThroughValuer(t *testing.T) {
 	}
 }
 
-// #5 boundary: rio owns sql.NullTime / sql.Null[time.Time] encoding (bindArg
-// normalizes and dialect-encodes the inner time); their value-receiver
-// Value() must not be promoted over that.
+// rio owns sql.NullTime / sql.Null[time.Time] encoding; their Value() must not be promoted over it.
 func TestNullTimeStaysRioEncoded(t *testing.T) {
 	type nullTimeRow struct {
 		ID int64
@@ -3991,9 +3868,7 @@ func TestNullTimeStaysRioEncoded(t *testing.T) {
 	}
 }
 
-// #4: a narrow version column wraps at its maximum while the struct keeps
-// counting — every later optimistic Update then reports ErrStaleObject
-// forever. Refused at plan time with the fix.
+// A version column narrow enough to wrap makes every later optimistic Update ErrStaleObject; refuse at plan time.
 func TestNarrowVersionColumnRefused(t *testing.T) {
 	type NarrowVersion struct {
 		ID int64
@@ -4022,8 +3897,7 @@ func TestNarrowVersionColumnRefused(t *testing.T) {
 	}
 }
 
-// #7: when Result.RowsAffected fails, the caller returns that error — the
-// hook must not record the same statement as a success.
+// When RowsAffected fails, the hook must observe the same error the caller returns.
 func TestQueryHookSeesRowsAffectedError(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -4046,10 +3920,7 @@ func TestQueryHookSeesRowsAffectedError(t *testing.T) {
 	}
 }
 
-// #8: a user slice expanding inside IN (?) past the dialect's bind budget
-// fails with rio's own error before any SQL reaches the driver — the server's
-// answer is an opaque protocol error, and ClickHouse (text-budget heuristic)
-// would not object at all.
+// IN (?) expansion past the dialect bind budget fails with rio's own error before any SQL reaches the driver.
 func TestINExpansionOverBindLimitFailsEarly(t *testing.T) {
 	ctx := context.Background()
 	ids := make([]int64, 70000)
@@ -4092,7 +3963,7 @@ func TestINExpansionOverBindLimitFailsEarly(t *testing.T) {
 	}
 }
 
-// #10: WriteColumns(w, pkg, nil) reflected on the nil and panicked.
+// WriteColumns(w, pkg, nil) once reflected on the nil and panicked.
 func TestWriteColumnsNilModelErrors(t *testing.T) {
 	var buf strings.Builder
 	err := WriteColumns(&buf, "models", nil)
@@ -4112,9 +3983,7 @@ type pagedItem struct {
 	Name  string
 }
 
-// The keyset predicate expands per direction — row-value syntax cannot mix
-// ASC and DESC and differs by dialect — and the primary key is appended as
-// the tie-breaker, following the last declared direction.
+// The keyset predicate expands per direction, with the primary key appended as the tie-breaker.
 func TestCursorAfterRendersExpandedKeysetPredicate(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -4154,8 +4023,7 @@ func TestCursorAfterRendersExpandedKeysetPredicate(t *testing.T) {
 	}
 }
 
-// The token round-trips values exactly and pins the ordering: a cursor
-// issued under different OrderKeys fails loudly instead of paging nonsense.
+// The token round-trips exactly and pins the ordering it was issued under.
 func TestCursorTokenRoundTripAndFingerprint(t *testing.T) {
 	q := From[pagedItem]().OrderKeys(SortKey{Column: "score", Desc: true})
 	cur, err := q.CursorAfter(&pagedItem{ID: 3, Score: -12, Name: "x"})
@@ -4187,9 +4055,7 @@ func TestCursorTokenRoundTripAndFingerprint(t *testing.T) {
 	}
 }
 
-// OrderKeys validates like every other structured input: mapped columns
-// only, no nullable keys, no verbatim OrderBy alongside, and a primary key
-// to break ties with.
+// OrderKeys validates: mapped columns only, no nullable keys, no verbatim OrderBy alongside.
 func TestOrderKeysValidation(t *testing.T) {
 	if err := From[pagedItem]().OrderKeys(SortKey{Column: "nope"}).After(Cursor{}).Validate(); err == nil ||
 		!strings.Contains(err.Error(), "no column") {
@@ -4217,10 +4083,7 @@ func TestOrderKeysValidation(t *testing.T) {
 	}
 }
 
-// Pluck pages with the same keyset machinery as entity queries: the shared
-// ORDER BY tail renders alongside the predicate, so the two halves can
-// never drift apart (they once did — the predicate landed in shared
-// renderWhere while ORDER BY was per-renderer).
+// Pluck shares the keyset machinery; the predicate and ORDER BY once drifted apart between renderers.
 func TestCursorPaginationOnPluck(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()

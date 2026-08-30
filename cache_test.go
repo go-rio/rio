@@ -9,8 +9,7 @@ import (
 	"time"
 )
 
-// chunkRow has three always-bound columns (noautoincr keeps explicit IDs off
-// the backfill path), so SQLite's 999-parameter ceiling gives 333-row chunks.
+// chunkRow: three always-bound columns (noautoincr, no backfill), so SQLite's 999-param ceiling gives 333-row chunks.
 type chunkRow struct {
 	ID int64 `rio:",noautoincr"`
 	A  int64
@@ -25,8 +24,7 @@ func mkChunkRows(n int) []chunkRow {
 	return rows
 }
 
-// batchCrudEntries counts grammar.crud entries keyed with a VALUES tuple
-// count — the axis the cache key must bound.
+// batchCrudEntries counts grammar.crud entries keyed with a VALUES tuple count.
 func batchCrudEntries(g *grammar) int {
 	n := 0
 	g.crud.Range(func(k, _ any) bool {
@@ -51,8 +49,7 @@ func TestBatchSQLCacheOnlyFullChunks(t *testing.T) {
 		t.Fatalf("tail-only InsertAll cached %d batch entries, want 0", got)
 	}
 
-	// Sweeping total row counts produces many distinct tail sizes but only
-	// one full-chunk shape (333 rows); the cache must hold exactly that one.
+	// Varied totals produce many tail sizes but only one full-chunk shape (333 rows).
 	totals := []int{333, 400, 500, 665, 666, 800, 999, 47, 1000, 333}
 	for _, n := range totals {
 		if err := InsertAll(ctx, db, mkChunkRows(n)); err != nil {
@@ -63,8 +60,7 @@ func TestBatchSQLCacheOnlyFullChunks(t *testing.T) {
 		t.Fatalf("batch-keyed cache entries = %d, want 1 (the full 333-row chunk only)", got)
 	}
 
-	// Replaying the same mix adds nothing: entries are keyed by shape, and
-	// full-chunk-only keying removes the workload-diversity dimension.
+	// Replaying the same mix adds nothing.
 	for _, n := range totals {
 		if err := InsertAll(ctx, db, mkChunkRows(n)); err != nil {
 			t.Fatal(err)
@@ -83,8 +79,7 @@ func TestBatchSQLCacheHitSkipsRender(t *testing.T) {
 	if err := InsertAll(ctx, db, mkChunkRows(333)); err != nil {
 		t.Fatal(err)
 	}
-	// Swap the cached text for a sentinel: a repeated full chunk must execute
-	// it verbatim — proof the statement came from the cache, not a re-render.
+	// Swap the cached text for a sentinel: a repeated full chunk must execute it verbatim.
 	replaced := false
 	db.g.crud.Range(func(k, _ any) bool {
 		if k.(crudKey).rows == 333 {
@@ -106,8 +101,7 @@ func TestBatchSQLCacheHitSkipsRender(t *testing.T) {
 	}
 }
 
-// upsertShapeRow exercises every key dimension: an omitzero column varies
-// the insert bitmap, and plain columns feed conflict/update variants.
+// upsertShapeRow exercises every key dimension: omitzero varies the insert bitmap.
 type upsertShapeRow struct {
 	ID    int64
 	Email string
@@ -147,10 +141,7 @@ func runUpsertLogged(t *testing.T, f *fakeDB, db *DB, row upsertShapeRow, opts .
 	return logged[before]
 }
 
-// TestUpsertCachedSQLMatchesFreshRender pins the cache-transparency
-// contract: the second call with an identical shape (a cache hit) must
-// execute byte-identical SQL to the first (a fresh render), across dialects
-// and spec shapes.
+// A cache hit must execute byte-identical SQL to a fresh render, across dialects and shapes.
 func TestUpsertCachedSQLMatchesFreshRender(t *testing.T) {
 	row := upsertShapeRow{ID: 1, Email: "a@x", Age: 30, Note: "n"}
 	shapes := []struct {
@@ -177,8 +168,7 @@ func TestUpsertCachedSQLMatchesFreshRender(t *testing.T) {
 	}
 }
 
-// TestUpsertCacheKeySeparation interleaves distinct shapes on one handle and
-// asserts no shape ever receives another shape's cached text.
+// No shape may receive another shape's cached text.
 func TestUpsertCacheKeySeparation(t *testing.T) {
 	f := newFakeDB()
 	db := f.open(Postgres)
@@ -215,9 +205,7 @@ func TestUpsertCacheKeySeparation(t *testing.T) {
 	}
 }
 
-// TestUpsertDoUpdateCanonicalOrder pins the whitelist normalization: listing
-// order and duplicates cannot change the rendered statement (and therefore
-// cannot multiply cache entries).
+// Whitelist order and duplicates cannot change the rendered statement (or multiply cache entries).
 func TestUpsertDoUpdateCanonicalOrder(t *testing.T) {
 	row := upsertShapeRow{ID: 1, Email: "a@x", Age: 30, Note: "n"}
 	variants := [][]UpsertOption{
@@ -240,8 +228,7 @@ func TestUpsertDoUpdateCanonicalOrder(t *testing.T) {
 	}
 }
 
-// TestUpsertSpecKeyDistinctness unit-tests the key encoding against
-// collisions between different conflict shapes.
+// The key encoding must not collide between different conflict shapes.
 func TestUpsertSpecKeyDistinctness(t *testing.T) {
 	p, err := planOf[upsertShapeRow]()
 	if err != nil {
@@ -273,9 +260,7 @@ func TestUpsertSpecKeyDistinctness(t *testing.T) {
 	}
 }
 
-// TestUpsertKeepTrashedRendersDistinct pins the keepTrashed key dimension on
-// a soft-deleting model: with it, the conflict clause must not clear
-// deleted_at, and the two shapes must not share cached text.
+// KeepTrashed is a key dimension: its clause must not clear deleted_at nor share cached text.
 func TestUpsertKeepTrashedRendersDistinct(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -306,9 +291,7 @@ func TestUpsertKeepTrashedRendersDistinct(t *testing.T) {
 	}
 }
 
-// TestUpsertAllFullChunksCached extends the InsertAll bound to UpsertAll:
-// varied totals leave exactly one batch-keyed entry per conflict shape, a
-// repeated full chunk hits the cache, and cached SQL equals a fresh render.
+// UpsertAll shares the InsertAll bound: one batch-keyed entry per conflict shape, cache hits on full chunks.
 func TestUpsertAllFullChunksCached(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -324,8 +307,7 @@ func TestUpsertAllFullChunksCached(t *testing.T) {
 		t.Fatalf("batch-keyed cache entries = %d, want 1", got)
 	}
 
-	// Full-chunk statements must be byte-stable across calls (fresh render
-	// on another handle vs cache hit here).
+	// Full-chunk statements must be byte-stable: fresh render vs cache hit.
 	full := f.loggedContaining("VALUES")
 	var chunkSQL string
 	for _, s := range full {
@@ -366,10 +348,8 @@ func TestUpsertAllFullChunksCached(t *testing.T) {
 	}
 }
 
-// A package-level Must query outlives any one handle. The render cache keys
-// per grammar weakly and the first store arms a cleanup, so churning
-// short-lived handles (dynamic tenants, per-test databases) must neither
-// grow the cache without bound nor pin dead grammars and their crud caches.
+// A package-level Must query outlives any handle; churning short-lived handles
+// must neither grow its cache without bound nor pin dead grammars.
 func TestMustCacheReleasesDeadHandles(t *testing.T) {
 	q := From[User]().Where("age > ?").Must()
 	ctx := context.Background()

@@ -5,26 +5,21 @@ import (
 	"database/sql"
 )
 
-// engine is the execution channel behind a Queryer. Everything above this
-// seam — rendering, hooks, error translation, scanning — is
-// channel-independent: an engine only receives fully rendered, dialect-form
-// SQL and returns results, so the database/sql and driver-native channels
-// share every semantic above the seam.
+// engine is the execution channel behind a Queryer; it receives only fully
+// rendered, dialect-form SQL.
 type engine interface {
 	exec(ctx context.Context, sqlText string, args []any) (sql.Result, error)
 	query(ctx context.Context, sqlText string, args []any) (rows, error)
 }
 
-// dbEngine is a DB-level engine: it opens transactions and owns the
-// channel's resources.
+// dbEngine opens transactions and owns the channel's resources.
 type dbEngine interface {
 	engine
 	begin(ctx context.Context, opts *sql.TxOptions) (txEngine, error)
 	close() error
 }
 
-// txEngine is a transaction-level engine. Both finishers take a context for
-// the seam's sake; callers on cleanup paths stay responsible for the
+// txEngine is a transaction-level engine; callers on cleanup paths own the
 // WithoutCancel discipline (see Tx.Tx).
 type txEngine interface {
 	engine
@@ -32,10 +27,8 @@ type txEngine interface {
 	rollback(ctx context.Context) error
 }
 
-// rows is the minimal result-set surface the scan paths consume. Its method
-// set is exactly the *sql.Rows subset rio uses, so the database/sql engine
-// hands back *sql.Rows values directly — no wrapper, no per-row
-// indirection, and (a pointer being interface-inlinable) no allocation.
+// rows is the *sql.Rows method subset the scan paths consume, so *sql.Rows
+// satisfies it unwrapped.
 type rows interface {
 	Columns() ([]string, error)
 	Next() bool
@@ -44,18 +37,14 @@ type rows interface {
 	Close() error
 }
 
-// sqlEngine executes through database/sql. The prepared-statement cache
-// belongs to the channel, not the handle: engines without a prepare concept
-// never see it.
+// sqlEngine executes through database/sql.
 type sqlEngine struct {
 	db    *sql.DB
 	stmts *stmtCache // nil unless WithStmtCache
 }
 
-// stmt decides whether a statement runs prepared: never without a cache, and
-// never with zero args — preparing buys nothing without binds, a one-off DDL
-// text would pin an LRU slot, and a multi-command script cannot be prepared
-// at all. The Tx engine below inlines the same condition.
+// stmt returns a cached prepared statement; zero-arg statements never prepare
+// (nothing to bind, and multi-command scripts cannot prepare).
 func (e *sqlEngine) stmt(ctx context.Context, sqlText string, nargs int) (*sql.Stmt, bool, error) {
 	if e.stmts == nil || nargs == 0 {
 		return nil, false, nil
@@ -73,8 +62,8 @@ func (e *sqlEngine) exec(ctx context.Context, sqlText string, args []any) (sql.R
 	} else if ok {
 		res, err := st.ExecContext(ctx, args...)
 		if isStmtClosed(err) {
-			// A concurrent eviction closed the handle between get and use;
-			// the statement never ran, so direct execution is safe.
+			// A concurrent eviction closed the handle before it ran; direct
+			// execution is safe.
 			return e.db.ExecContext(ctx, sqlText, args...)
 		}
 		return res, e.evictOnSchemaChange(sqlText, err)
@@ -125,10 +114,8 @@ func (e *sqlEngine) close() error {
 	return e.db.Close()
 }
 
-// evictOnSchemaChange drops a cached statement invalidated by DDL (Postgres:
-// "cached plan must not change result type", SQLSTATE 0A000) and returns the
-// error unchanged. rio never retries on its own — retrying writes risks
-// double execution.
+// evictOnSchemaChange drops a statement invalidated by DDL (SQLSTATE 0A000),
+// returning the error unchanged: rio never retries, a write could run twice.
 func (e *sqlEngine) evictOnSchemaChange(sqlText string, err error) error {
 	if err == nil {
 		return nil
@@ -145,8 +132,6 @@ type sqlTxEngine struct {
 }
 
 func (e *sqlTxEngine) exec(ctx context.Context, sqlText string, args []any) (sql.Result, error) {
-	// Zero-arg statements (SAVEPOINT control among them) skip the cache,
-	// exactly as the DB engine's stmt() decides.
 	if e.stmts == nil || len(args) == 0 {
 		return e.tx.ExecContext(ctx, sqlText, args...)
 	}
@@ -193,9 +178,8 @@ func (e *sqlTxEngine) directQuery(ctx context.Context, sqlText string, args []an
 	return rs, nil
 }
 
-// database/sql's transaction finishers take no context and always reach the
-// driver — exactly the property rio's cleanup discipline relies on — so the
-// seam's context is deliberately unused here.
+// database/sql's finishers take no context and always reach the driver; the
+// seam's context is deliberately unused.
 func (e *sqlTxEngine) commit(context.Context) error {
 	err := e.tx.Commit()
 	if e.stmts != nil {
@@ -211,8 +195,8 @@ func (e *sqlTxEngine) rollback(context.Context) error {
 	return err
 }
 
-// isStmtClosed matches database/sql's unexported "statement is closed"
-// condition — stable text since Go 1.0, and the only signal available.
+// isStmtClosed matches database/sql's unexported error; its text is the only
+// signal available.
 func isStmtClosed(err error) bool {
 	return err != nil && err.Error() == "sql: statement is closed"
 }

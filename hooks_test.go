@@ -7,8 +7,7 @@ import (
 	"time"
 )
 
-// beforeHook is a QueryHook whose BeforeQuery is the wrapped func and whose
-// AfterQuery is a no-op — enough to pin the context-propagation contract.
+// beforeHook is a QueryHook with the wrapped BeforeQuery and a no-op AfterQuery.
 type beforeHook func(ctx context.Context, e *QueryEvent) context.Context
 
 func (h beforeHook) BeforeQuery(ctx context.Context, e *QueryEvent) context.Context {
@@ -18,14 +17,12 @@ func (beforeHook) AfterQuery(context.Context, *QueryEvent) {}
 
 type hookCtxKey struct{}
 
-// deriveHookCtx is a BeforeQuery that installs a sentinel value, so a
-// driver-level probe can prove the statement executed under the hook context.
+// deriveHookCtx installs a sentinel so a driver-level probe can see the hook context.
 func deriveHookCtx(ctx context.Context, _ *QueryEvent) context.Context {
 	return context.WithValue(ctx, hookCtxKey{}, "hooked")
 }
 
-// The context BeforeQuery returns is the execution context: a read reaches the
-// driver's QueryContext under it.
+// The context BeforeQuery returns is the execution context at the driver.
 func TestHookContextReachesReadDriver(t *testing.T) {
 	f := newFakeDB()
 	var saw any
@@ -56,9 +53,7 @@ func TestHookContextReachesWriteDriver(t *testing.T) {
 	}
 }
 
-// Transaction control runs under the hook context too. The native channel is
-// the observable one here: database/sql's Tx.Commit takes no context, so only
-// a native engine can carry the hook's context into the commit.
+// Transaction control runs under the hook context too (observable only on the native channel).
 func TestHookContextReachesTxBeginAndCommit(t *testing.T) {
 	nf := newFakeNative()
 	var beginVal, commitVal any
@@ -83,8 +78,7 @@ func TestHookContextReachesTxBeginAndCommit(t *testing.T) {
 	}
 }
 
-// A hook returning nil must not panic and must leave the incoming context in
-// force as the execution context.
+// A hook returning nil leaves the incoming context in force, without panicking.
 func TestHookNilContextFallsBackToIncoming(t *testing.T) {
 	f := newFakeDB()
 	var saw any
@@ -102,8 +96,7 @@ func TestHookNilContextFallsBackToIncoming(t *testing.T) {
 	}
 }
 
-// afterHook records every AfterQuery event, enough to pin the RowsReturned
-// and Phase observability contract.
+// afterHook records every AfterQuery event.
 type afterHook struct{ events []QueryEvent }
 
 func (h *afterHook) BeforeQuery(ctx context.Context, _ *QueryEvent) context.Context { return ctx }
@@ -119,8 +112,7 @@ func (h *afterHook) byPhase(phase string) []QueryEvent {
 	return out
 }
 
-// Row-returning statements report how many rows they handed back; a preload
-// is labeled so hooks can group it under the main statement.
+// Row-returning statements report RowsReturned; preloads are phase-labeled.
 func TestHookSeesRowsReturnedAndPreloadPhase(t *testing.T) {
 	f := newFakeDB()
 	h := &afterHook{}
@@ -147,8 +139,7 @@ func TestHookSeesRowsReturnedAndPreloadPhase(t *testing.T) {
 	}
 }
 
-// Scalar probes report their result-set rows — one for a hit — and writes
-// stay at RowsReturned -1: the two counts never blur.
+// Scalar probes report result-set rows; writes stay at RowsReturned -1.
 func TestHookRowsReturnedAcrossShapes(t *testing.T) {
 	f := newFakeDB()
 	h := &afterHook{}

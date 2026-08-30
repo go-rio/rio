@@ -10,9 +10,17 @@
 [![Test](https://github.com/go-rio/rio/actions/workflows/test.yml/badge.svg)](https://github.com/go-rio/rio/actions/workflows/test.yml)
 [![License](https://img.shields.io/github/license/go-rio/rio)](https://opensource.org/license/MIT)
 
-rio is a generic ORM for Go. Queries are immutable values that carry no
-connection; writes are explicit; and typed relations load only when requested.
-The core module has no third-party dependencies.
+A generic ORM for Go with zero third-party dependencies in the core.
+
+- **Immutable queries.** `Query[T]` is a value: build once, validate, reuse
+  concurrently, run against any DB or transaction.
+- **Explicit everything.** No lazy loading, no dirty tracking, no hidden
+  transactions, no callbacks. What you call is what runs.
+- **Typed relations.** `HasMany[T]` and friends load in batched `IN` queries
+  when you ask, and panic with guidance when you forgot to.
+- **Fast paths where the driver has them.** The PostgreSQL module runs on pgx
+  natively: preloads share one round trip per layer and bulk inserts stream
+  over `COPY`.
 
 ```go
 users, err := rio.From[User]().
@@ -24,7 +32,7 @@ users, err := rio.From[User]().
 
 ## Getting started
 
-rio requires Go 1.27 or newer. Install the core and one driver module:
+Requires Go 1.27+. Install the core and one driver module:
 
 ```bash
 go get github.com/go-rio/rio
@@ -33,12 +41,10 @@ go get github.com/go-rio/sqlite # or postgres, mysql, clickhouse
 
 | Module | Driver |
 |---|---|
-| [go-rio/postgres](https://github.com/go-rio/postgres) | pgx |
+| [go-rio/postgres](https://github.com/go-rio/postgres) | pgx (database/sql or native) |
 | [go-rio/mysql](https://github.com/go-rio/mysql) | go-sql-driver/mysql |
 | [go-rio/sqlite](https://github.com/go-rio/sqlite) | modernc.org/sqlite, pure Go |
 | [go-rio/clickhouse](https://github.com/go-rio/clickhouse) | clickhouse-go v2 |
-
-Minimal SQLite example:
 
 ```go
 package main
@@ -78,8 +84,7 @@ func main() {
 }
 ```
 
-Schema migrations are provided separately by
-[go-rio/migrate](https://github.com/go-rio/migrate).
+Schema migrations live in [go-rio/migrate](https://github.com/go-rio/migrate).
 
 ## API overview
 
@@ -94,11 +99,10 @@ Schema migrations are provided separately by
 | Relations | `With`, `WithCount`, `WhereHas`, `WhereHasNot`, `Attach`, `Detach`, `SyncRelation` |
 | Validation and reuse | `Query.Validate`, `Query.Must`, `WithStmtCache` |
 
-## Queries and parameters
+## Queries
 
-`Query[T]` is immutable, connection-free, and safe to reuse concurrently. A
-terminal method receives the `context.Context`, a `Queryer`, and any deferred
-arguments:
+`Query[T]` carries no connection. Terminal methods take the context, a
+`Queryer` (`*DB` or `*Tx`), and any deferred arguments:
 
 ```go
 var adults = rio.From[User]().
@@ -111,44 +115,29 @@ users, err := adults.All(ctx, db, 18)
 emails, err := adults.Pluck[string](ctx, db, "email", 18)
 ```
 
-`Validate` checks connection-independent structure and returns an error. `Must`
-performs the same check, panics on failure, and returns the query for package
-variables or repository fields. Neither method accesses a database.
+`Validate` returns structural errors; `Must` panics instead and returns the
+query, for package variables. Neither touches the database.
 
-Each `Where` or `Having` fragment follows one parameter mode:
+Parameters per fragment:
 
-- Inline: `Where("age >= ?", 18)` owns its arguments.
-- Deferred: `Where("age >= ?")` consumes terminal arguments.
-- No placeholders: `Where("active")` consumes nothing.
+- `Where("age >= ?", 18)` — inline, owns its arguments.
+- `Where("age >= ?")` — deferred, consumes terminal arguments in SQL order.
+- `Where("active")` — no placeholders.
 
-Inline and deferred fragments may be mixed. Deferred arguments are consumed in
-final SQL order, and missing or excess arguments fail before the driver and
-query hooks run. Slice arguments expand in `IN (?)`, including deferred slices;
-an empty slice is an error.
+Slices expand inside `IN (?)`; an empty slice is an error. Missing or excess
+arguments fail before the driver sees the query. `??` emits a literal `?`.
+`Join`/`OrderBy`/`GroupBy` take no placeholders, and `RelWhere` arguments are
+always inline.
 
-`Join`, `OrderBy`, and `GroupBy` have no parameter channel and must not contain
-placeholders. `RelWhere` arguments in `With` and `WhereHas` must be inline
-because preloads execute independently and nested `EXISTS` argument order must
-remain explicit. `Raw[T]` receives its arguments when constructed and does not
-accept a second terminal argument list.
-
-Use `?` placeholders with every driver. rio expands slices, applies the
-dialect's placeholder syntax, normalizes supported values, and checks the
-dialect bind limit at execution. `??` emits a literal question mark;
-placeholder-like text inside strings, quoted identifiers, and comments is not
-bound. `Rows` streams without materializing the result and rejects `With` or
-`WithCount`, which require the full parent set.
-
-`WithStmtCache` enables a bounded DB-level cache and a cache local to each
-transaction. It is off by default and is unsuitable for poolers in transaction
-or statement mode.
+`Rows` streams without materializing the slice; it rejects `With`/`WithCount`.
+`WithStmtCache` (off by default) caches prepared statements per DB and per
+transaction — don't use it behind transaction- or statement-mode poolers.
 
 ### Cursor pagination
 
-`OrderKeys` declares a structured ordering over mapped NOT NULL columns —
-unlike verbatim `OrderBy`, rio can read the keys' values back out of a row to
-issue a cursor. Any primary-key column missing from the keys is appended as
-the tie-breaker, so pages never skip or repeat rows sharing a key value:
+`OrderKeys` declares ordering over mapped NOT NULL columns, so rio can read
+key values back out of a row and issue a keyset cursor. A missing primary-key
+column is appended as tie-breaker — pages never skip or repeat:
 
 ```go
 q := rio.From[Post]().OrderKeys(
@@ -161,19 +150,17 @@ cur, err := q.CursorAfter(&page[len(page)-1])
 next, err := q.After(cur).Limit(20).All(ctx, db)
 ```
 
-`Cursor.String` and `rio.ParseCursor` round-trip a URL-safe token. It encodes
-only values, which bind as parameters — a forged token moves the page window,
-never the query — and carries a fingerprint of its ordering, so a cursor
-issued under different `OrderKeys` fails loudly. Backward paging is explicit:
-flip every key's direction and resume `After` the first row of the page.
+`Cursor.String`/`rio.ParseCursor` round-trip a URL-safe token. Tokens carry
+values (bound as parameters) plus an ordering fingerprint — a forged token
+moves the window, never the query, and a cursor from different `OrderKeys`
+fails loudly.
 
 ### Schema-drift lint
 
-The read-only `lint` subpackage compares model expectations against the live
-schema on PostgreSQL, MySQL, and SQLite — missing tables and columns,
-nullability and primary-key disagreements, and type mismatches within known
-equivalence classes. Unknown database types stay silent rather than guessed
-at; run it in CI or a startup probe:
+The read-only `lint` subpackage diffs model expectations against the live
+schema (PostgreSQL, MySQL, SQLite): missing tables and columns, nullability,
+primary keys, and type mismatches in known equivalence classes. Run it in CI
+or a startup probe:
 
 ```go
 report, err := lint.Check(ctx, db, User{}, Post{})
@@ -182,16 +169,12 @@ for _, f := range report.Findings {
 }
 ```
 
-## Databases and transactions
+## Transactions
 
-`*DB` and `*Tx` both implement `rio.Queryer`, so repository code can accept one
-interface and run unchanged in or out of a transaction:
+`*DB` and `*Tx` both implement `Queryer`, so repository code runs unchanged in
+or out of a transaction:
 
 ```go
-func listAdults(ctx context.Context, db rio.Queryer, age int) ([]User, error) {
-    return adults.All(ctx, db, age)
-}
-
 err := db.Tx(ctx, func(tx *rio.Tx) error {
     users, err := adults.ForUpdate().All(ctx, tx, 21)
     if err != nil {
@@ -201,93 +184,60 @@ err := db.Tx(ctx, func(tx *rio.Tx) error {
 })
 ```
 
-Returning an error rolls the transaction back; returning `nil` commits it.
-Calling `Tx` on an existing `*Tx` uses a savepoint. rio does not start hidden
-transactions around batch operations, so wrap a batch in `DB.Tx` when all
-chunks must be atomic.
+Error rolls back, `nil` commits, `Tx` on a `*Tx` opens a savepoint. Batch
+operations never start hidden transactions — wrap them in `DB.Tx` when all
+chunks must land together.
 
 ## Models and relations
 
 | Declaration | Meaning |
 |---|---|
 | `ID int64` | conventional auto-increment primary key |
-| `rio:"column"` | database column name; the default is snake_case |
-| `rio:",pk"` | explicit primary key; repeat for a composite key |
-| `rio:",noautoincr"` | disable automatic generation for a single integer key |
-| `rio:",version"` | optimistic-lock counter; conflicts return `ErrStaleObject` |
-| `rio:",softdelete"` | deletion timestamp used by soft-delete operations and filters |
-| `rio:",json"` | encode and scan the field as JSON |
-| `rio:",omitzero"` | omit a zero field from single-row inserts so a database default applies |
+| `rio:"column"` | column name; default is snake_case |
+| `rio:",pk"` | explicit primary key; repeat for composite |
+| `rio:",noautoincr"` | integer key without auto-generation |
+| `rio:",version"` | optimistic locking; conflicts return `ErrStaleObject` |
+| `rio:",softdelete"` | deletion timestamp driving soft-delete operations |
+| `rio:",json"` | encode and scan as JSON |
+| `rio:",omitzero"` | skip zero value on single-row insert so defaults apply |
 | `rio:",countof:Posts"` | `int64` target for `WithCount("Posts")` |
-| `rio:",nostamp"` | opt out of `CreatedAt` or `UpdatedAt` maintenance |
-| `rio:"-"` | ignore the field |
-| `TableName() string` | override the conventional pluralized table name |
+| `rio:",nostamp"` | opt out of `CreatedAt`/`UpdatedAt` maintenance |
+| `rio:"-"` | ignored field |
+| `TableName() string` | override the pluralized table name |
 
-Relations use `HasMany[T]`, `HasOne[T]`, `BelongsTo[T]`, and `ManyToMany[T]`.
-Use `fk:`, `ref:`, and `join:` tag options when conventions do not match the
-schema. Relation APIs take Go field names, such as `With("Posts.Comments")`;
-column APIs take database column names.
-
-Preloading uses separate `WHERE ... IN` queries rather than JOINs. It never
-lazy-loads: accessing an unloaded relation container panics with guidance.
+Relations are `HasMany[T]`, `HasOne[T]`, `BelongsTo[T]`, `ManyToMany[T]`;
+`fk:`/`ref:`/`join:` tags override conventions. Relation APIs take Go field
+names (`With("Posts.Comments")`), column APIs take column names. Preloads run
+as separate `IN` queries, never JOINs, and never lazily.
 
 ## Writes and errors
 
-`Update` writes all eligible fields, including zero values, unless given an
-explicit database-column whitelist. Set-based writes require a condition; call
-`AllRows()` to opt into an unfiltered write. They do not perform optimistic
-locking.
-
+`Update` writes every eligible field — zero values included — unless given a
+column whitelist. Set-based writes require a condition (`AllRows()` opts out).
 `Upsert` supports conflict targets, update whitelists, `DoNothing`, and
-`KeepTrashed`. A conflict update restores a soft-deleted row unless
-`KeepTrashed` is set. `InsertAll` and `UpsertAll` chunk at the dialect bind
-limit and do not create a transaction automatically. Batch writes use one
-column list, so `omitzero` does not apply; `UpsertAll` does not backfill.
+`KeepTrashed`. `InsertAll`/`UpsertAll` chunk at the dialect bind limit; batch
+writes share one column list, so `omitzero` doesn't apply.
 
-| Condition | Error or result |
+| Condition | Result |
 |---|---|
-| `First`, `Find`, or `Sole` finds no row | `ErrNotFound`, which wraps `sql.ErrNoRows` |
-| `All` finds no rows | empty slice and `nil` error |
-| `Sole` finds multiple rows | `ErrMultipleRows` |
+| `First`/`Find`/`Sole` miss | `ErrNotFound` (wraps `sql.ErrNoRows`) |
+| `All` finds nothing | empty slice, `nil` error |
+| `Sole` finds several | `ErrMultipleRows` |
 | optimistic-lock conflict | `ErrStaleObject` |
-| guarded set write lacks a condition | `ErrMissingWhere` |
-| translated unique or foreign-key violation | `ErrDuplicateKey` or `ErrForeignKeyViolated`, with the driver error retained |
-| NULL scanned into a non-nullable field | error naming the column |
+| set write without condition | `ErrMissingWhere` |
+| unique / FK violation | `ErrDuplicateKey` / `ErrForeignKeyViolated`, driver error retained |
+| NULL into non-nullable field | error naming the column |
 
-Times written through rio are normalized to UTC and microsecond precision.
-Timestamp and version fields may be changed before a write executes, so a
-failed write can still modify the in-memory model.
+Times are normalized to UTC, microsecond precision.
 
 ## Dialect differences
 
-| Dialect | Important behavior |
+| Dialect | Behavior |
 |---|---|
-| PostgreSQL | Uses `RETURNING`, including auto-increment-key backfill for `InsertAll`, and supports row locks. The driver module also exposes pgx pool and native execution modes. |
-| MySQL | `Insert` backfills the auto-increment ID without a hidden SELECT; batch inserts do not backfill. Conflict updates cannot backfill a server-incremented version. `DoUpdate` requires MySQL 8.0.19 or newer and is not supported by MariaDB; `DoNothing` remains supported. |
-| SQLite | `Insert` gets a lone auto-increment key from `LastInsertId`; it keeps `RETURNING` when omitted default columns also need backfill. `InsertAll` uses sorted `RETURNING` backfill. `ForUpdate` is a no-op because SQLite does not provide row locks. The supported driver is pure Go. |
-| ClickHouse | Supports reads, relation preloads, `Insert`, and `InsertAll`. It rejects row locks, transactions, prepared-statement caching, synchronous update/delete APIs, and conflict upserts. Model replacements use inserts into `ReplacingMergeTree` and `Final` reads. Generated values are not backfilled, and conventional IDs must be supplied by the caller. |
-
-See each driver module for connection options and additional driver-specific
-behavior.
-
-## Migrating to the Go 1.27 API
-
-This is a breaking API change with no compatibility wrappers:
-
-- The minimum version is Go 1.27.
-- `Compiled[T]`, `Compile`, and `MustCompile` were removed. Keep the original
-  `Query[T]`, call `Validate` or `Must`, and pass values to terminal methods.
-- Package-level `Pluck[V, T](ctx, db, q, column)` became
-  `q.Pluck[V](ctx, db, column, args...)`.
-- Query terminal methods now accept deferred `args ...any`; set operations and
-  `FirstOrCreate`/`CreateOrFirst` follow the same parameter contract.
-- `RawQuery[T]` is unchanged: arguments still belong to `Raw` construction.
-
-| Before | After |
-|---|---|
-| `rio.MustCompile(q)` | `q.Must()` |
-| `compiled.All(ctx, db, args...)` | `q.All(ctx, db, args...)` |
-| `rio.Pluck[V](ctx, db, q, column)` | `q.Pluck[V](ctx, db, column, args...)` |
+| PostgreSQL | `RETURNING` everywhere, including `InsertAll` backfill; row locks. The driver module adds a pgx-native channel: batched preload round trips and `COPY`-backed bulk inserts. |
+| MySQL | `Insert` backfills via `LastInsertId`; batch inserts don't backfill. `DoUpdate` needs MySQL 8.0.19+ (no MariaDB); `DoNothing` works everywhere. |
+| SQLite | Pure-Go driver. `RETURNING` where backfill needs it; `ForUpdate` is a no-op (no row locks). |
+| ClickHouse | Reads, preloads, `Insert`, `InsertAll`. Rejects row locks, transactions, statement caching, synchronous update/delete, and conflict upserts — use `ReplacingMergeTree` + `Final`. No backfill; supply IDs yourself. |
 
 ## Security
 
@@ -295,38 +245,24 @@ Values always bind as parameters. SQL fragments do not:
 
 | Input | APIs | Rule |
 |---|---|---|
-| Mapped columns | `Update` columns, `Set` keys, `Pluck`, `OnConflict`, `DoUpdate` | validated against model metadata and quoted as identifiers |
-| Relation paths | `With`, `WithCount`, `WhereHas`, relation writes | validated against the model's relation fields |
-| SQL text | `Where`, `Having`, `Join`, `OrderBy`, `GroupBy`, `RelWhere`, `Expr`, `Raw`, `Exec` | rendered verbatim; use constants, never untrusted input |
+| Mapped columns | `Update` columns, `Set` keys, `Pluck`, `OnConflict`, `DoUpdate` | validated against the model, quoted as identifiers |
+| Relation paths | `With`, `WithCount`, `WhereHas`, relation writes | validated against the model's relations |
+| SQL text | `Where`, `Having`, `Join`, `OrderBy`, `GroupBy`, `RelWhere`, `Expr`, `Raw`, `Exec` | rendered verbatim — constants only, never untrusted input |
 
-For a runtime-selected identifier, map the external value to an allowed
-constant instead of concatenating it into SQL. `WriteColumns` can generate
-column constants from rio's model mapping. Reject values absent from the
-allowlist.
+For runtime-selected identifiers, map external values onto generated
+constants: `rio.WriteColumns(os.Stdout, "models", User{}, Post{})` emits
+table and column constants from the model mapping.
 
 ## Observability
 
-`WithQueryHook` installs a read-only `QueryHook` for SQL execution and
-transaction control. Events include the operation, model, SQL, arguments,
-duration, affected rows, and error. `WithoutArgs` removes arguments before
-hooks receive them. The context returned by `BeforeQuery` flows through the
-driver to `AfterQuery`, allowing tracing spans and deadlines. rio does not log
-errors on the caller's behalf.
+`WithQueryHook` observes every statement: operation, model, SQL, arguments,
+duration, row counts, error. Hooks cannot alter SQL. The context returned by
+`BeforeQuery` flows through the driver into `AfterQuery`, so tracing spans and
+deadlines propagate. `WithoutArgs` strips arguments from events.
 
-## Column constants
-
-`WriteColumns` generates table and column constants from rio's model mapping:
-
-```go
-err := rio.WriteColumns(os.Stdout, "models", User{}, Post{})
-```
-
-Use the generated constants in identifier allowlists and verbatim SQL
-fragments. See [DESIGN.md](DESIGN.md) for architecture and scope.
+See [DESIGN.md](DESIGN.md) for architecture and scope decisions.
 
 ## Contributing
-
-Use Go 1.27 or newer, then run:
 
 ```bash
 go test ./...

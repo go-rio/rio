@@ -8,25 +8,7 @@ import (
 )
 
 // WriteColumns generates Go source declaring column-name constants for the
-// given models — typo-proof, IDE-completable column references for query
-// strings:
-//
-//	users, err := rio.From[User]().Where(UserCols.Email+" = ?", e).All(ctx, db)
-//
-// The generator runs on rio's own mapping plans, so the output can never
-// drift from runtime behavior; there is no source parsing and no build-time
-// tool chain. Wire it up with go:generate and a three-line main:
-//
-//	//go:generate sh -c "go run ./internal/gencols > cols_gen.go"
-//
-//	// internal/gencols/main.go
-//	func main() {
-//		if err := rio.WriteColumns(os.Stdout, "models", models.User{}, models.Post{}); err != nil {
-//			log.Fatal(err)
-//		}
-//	}
-//
-// Each model yields a <Name>Table constant (the convention- or
+// given models: per model, a <Name>Table constant (the convention- or
 // TableName-derived name; a WithTableNamer handle may rename it at runtime)
 // and a <Name>Cols struct value with one string field per mapped column.
 func WriteColumns(w io.Writer, pkgName string, models ...any) error {
@@ -56,9 +38,6 @@ func WriteColumns(w io.Writer, pkgName string, models ...any) error {
 		if err != nil {
 			return err
 		}
-		// Two models sharing a struct name (same type twice, or User from two
-		// packages) would emit colliding declarations — code that cannot
-		// compile. Refuse with the fix.
 		if prev, dup := byName[p.structName]; dup {
 			return fmt.Errorf("rio: WriteColumns: %s and %s both generate %sTable/%sCols; generate them into separate files",
 				prev, t.String(), p.structName, p.structName)
@@ -68,7 +47,6 @@ func WriteColumns(w io.Writer, pkgName string, models ...any) error {
 		if p.tableOverride != "" {
 			table = p.tableOverride
 		}
-		// Shadowing resolution already keeps field names unique; this re-checks for the generated struct's sake.
 		seen := make(map[string]string, len(p.fields))
 		for _, f := range p.fields {
 			if prev, dup := seen[f.name]; dup {

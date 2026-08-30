@@ -11,9 +11,7 @@ import (
 	"time"
 )
 
-// ptrKinds exercises every element kind the scanPtr plan-time codec covers:
-// the direct element write must behave exactly like scanning the plain type,
-// plus the NULL→nil rule.
+// ptrKinds exercises every element kind the scanPtr codec covers, plus the NULL→nil rule.
 type ptrKinds struct {
 	ID    int64
 	I8    *int8
@@ -67,8 +65,7 @@ func TestScanPtrWritesEveryElemKind(t *testing.T) {
 func TestScanPtrTextSourcesAndNulls(t *testing.T) {
 	f := newFakeDB()
 	db := f.open(SQLite)
-	// Text-encoded numerics and time (SQLite delivers TEXT affinities), and
-	// NULL into every pointer column.
+	// Text-encoded numerics and time (SQLite delivers TEXT affinities), then NULL into every column.
 	f.queueRows(ptrKindsCols, []driver.Value{
 		int64(1), "-8", "42", "9", "2.5", "1", []byte("hi"), "raw", "2026-07-09 12:00:00+00:00",
 	})
@@ -99,9 +96,7 @@ func TestScanPtrTextSourcesAndNulls(t *testing.T) {
 	}
 }
 
-// TestScanPtrRescanReplacesPointer pins the rebase semantics: scanning a new
-// row over the same struct swaps the pointer for a fresh cell — a previously
-// scanned pointer held by the caller is never overwritten in place.
+// Rescanning over the same struct swaps in a fresh cell; a held pointer is never overwritten in place.
 func TestScanPtrRescanReplacesPointer(t *testing.T) {
 	f := newFakeDB()
 	db := f.open(SQLite)
@@ -132,10 +127,7 @@ func TestScanPtrRescanReplacesPointer(t *testing.T) {
 	}
 }
 
-// TestScanPtrCellsIndependent pins the chunked cell allocator's aliasing
-// contract: cells handed out across rows are distinct slots — writing through
-// one row's pointers never changes another row's values — and values stay
-// intact once the scan (and its chunk bookkeeping) is gone.
+// Cells handed out across rows are distinct slots and survive without the scan's chunk bookkeeping.
 func TestScanPtrCellsIndependent(t *testing.T) {
 	f := newFakeDB()
 	db := f.open(SQLite)
@@ -198,9 +190,7 @@ func TestScanPtrOverflowAndConversionErrors(t *testing.T) {
 	}
 }
 
-// entityFields is the last line of defense against schema drift between
-// render and execution: an entity result set that does not match the plan's
-// column count and order must error by name, never misassign silently.
+// An entity result set that does not match the plan's columns must error by name, never misassign.
 func TestEntityColumnMismatchErrors(t *testing.T) {
 	ctx := context.Background()
 	run := func(cols []string) error {
@@ -235,9 +225,7 @@ func TestEntityColumnMismatchErrors(t *testing.T) {
 	})
 }
 
-// clickhouse-go bypasses database/sql's canonical value set, so every native
-// integer width must convert in every direction: into uint (sign-checked),
-// float, and — for UInt8/Int8, ClickHouse's Bool on the wire — bool.
+// clickhouse-go bypasses database/sql's canonical values, so every native integer width must convert.
 func TestSrcConvertersAcceptNativeWidths(t *testing.T) {
 	f := &field{name: "N", column: "n", typ: reflect.TypeFor[uint64]()}
 
@@ -261,10 +249,7 @@ func TestSrcConvertersAcceptNativeWidths(t *testing.T) {
 	}
 }
 
-// Codex audit #2, read side: scanOne stops after its single row, so the
-// result is never drained and rows.Close performs the real close — an error
-// there (connection loss mid-protocol) must reach the caller instead of
-// returning a half-trusted row as success.
+// scanOne never drains the result, so a rows.Close error must reach the caller, not a half-trusted row.
 func TestFindReportsRowsCloseError(t *testing.T) {
 	f := newFakeDB()
 	db := f.open(SQLite)

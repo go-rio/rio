@@ -6,20 +6,14 @@ import (
 	"reflect"
 )
 
-// Attach links rows to a ManyToMany relation by inserting join-table rows —
-// idempotently: existing links are left alone (bare ON CONFLICT DO NOTHING;
+// Attach links rows to a ManyToMany relation by inserting join-table rows.
+// It is idempotent — existing links are left alone (ON CONFLICT DO NOTHING;
 // a no-op assignment on MySQL), assuming the join table's standard composite
-// unique key. Nothing here is implicit: this is the explicit inverse of
-// hand-writing the join-table INSERT. Typed id slices spread directly:
-// Attach(ctx, db, &u, "Tags", tagIDs...). Attaching zero ids is a no-op
-// (spell the id type as Attach[User, int64] when nothing infers it).
-// SyncRelation is the declarative sibling — it converges the relation on an
-// exact id set instead of adding to it.
+// unique key. Attaching zero ids is a no-op.
 //
-// Large id sets are chunked to the dialect's bind-parameter ceiling, like
-// InsertAll. Outside a transaction each chunk commits independently — a
-// failure leaves earlier chunks linked; wrap the call in db.Tx for
-// atomicity, or simply retry: idempotency makes a rerun converge.
+// Large id sets are chunked to the dialect's bind-parameter ceiling; outside
+// a transaction each chunk commits independently — wrap the call in db.Tx,
+// or retry (idempotency makes a rerun converge).
 func Attach[T any, K any](ctx context.Context, db Queryer, row *T, relation string, ids ...K) error {
 	if len(ids) == 0 {
 		return nil
@@ -29,9 +23,6 @@ func Attach[T any, K any](ctx context.Context, db Queryer, row *T, relation stri
 		return err
 	}
 	if d := db.gram().d; !d.caps().uniqueKeys {
-		// The rendered INSERT leans on ON CONFLICT DO NOTHING (a no-op
-		// assignment on MySQL) over the join table's composite unique key for
-		// its idempotency promise; without unique keys, reruns duplicate.
 		return unsupportedf(
 			"rio: Attach is not supported on %s (idempotency needs a unique key over the join table); "+
 				"insert join rows with rio.Exec or InsertAll on a ReplacingMergeTree join table",
@@ -41,8 +32,7 @@ func Attach[T any, K any](ctx context.Context, db Queryer, row *T, relation stri
 	return insertJoinRows(ctx, db, p, res, ownerKey, anySlice(ids))
 }
 
-// Detach unlinks named rows from a ManyToMany relation. ids must be non-empty;
-// use an explicit set-based delete when clearing the whole join table.
+// Detach unlinks rows from a ManyToMany relation; ids must be non-empty.
 func Detach[T any, K any](ctx context.Context, db Queryer, row *T, relation string, ids ...K) error {
 	if len(ids) == 0 {
 		return fmt.Errorf("rio: Detach needs the ids to unlink; clearing a whole relation is an explicit join-table delete")
@@ -58,9 +48,6 @@ func Detach[T any, K any](ctx context.Context, db Queryer, row *T, relation stri
 			d.name(),
 		)
 	}
-	// Pass the ids as []any, not []K: a byte-kind id type would make []K a
-	// []byte that IN (?) expansion treats as one BLOB (rebind.sliceValue),
-	// silently matching nothing.
 	return deleteJoinRows(ctx, db, p, res, ownerKey, anySlice(ids))
 }
 
@@ -72,9 +59,6 @@ func SyncRelation[T any, K any](ctx context.Context, db Queryer, row *T, relatio
 		return err
 	}
 	if d := db.gram().d; !d.caps().transactions {
-		// The transactions door is the first of three this convergence needs
-		// (transaction, owner row lock, join-table DELETE); one honest error
-		// beats reporting them piecemeal.
 		return unsupportedf("rio: SyncRelation is not supported on %s (needs a transaction and row locks)", d.name())
 	}
 	return db.Tx(ctx, func(tx *Tx) error {
@@ -104,7 +88,6 @@ func SyncRelation[T any, K any](ctx context.Context, db Queryer, row *T, relatio
 			}
 		}
 		if len(ids) == 0 {
-			// Emptying needs no diff: one unconditional delete.
 			b := make([]byte, 0, 96)
 			b = append(b, "DELETE FROM "...)
 			b = d.quote(b, res.joinTable)

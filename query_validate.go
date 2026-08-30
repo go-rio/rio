@@ -12,10 +12,8 @@ func (q Query[T]) Validate() error {
 	return validateQueryState(p, &q.s)
 }
 
-// Must panics if Validate fails. The returned query is suitable for reuse:
-// it carries a private render cache keyed per executing handle, and a
-// handle's entries are reclaimed with the handle — a package-level query
-// run against churning short-lived DBs does not grow without bound.
+// Must panics if Validate fails. The returned query carries a private render
+// cache keyed per executing handle; a handle's entries are reclaimed with it.
 func (q Query[T]) Must() Query[T] {
 	if err := q.Validate(); err != nil {
 		panic(err)

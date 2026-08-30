@@ -6,21 +6,17 @@ import (
 	"time"
 )
 
-// Dialect identifies one of the built-in SQL dialects. The interface is
-// deliberately opaque (all methods unexported): rio's renderers evolve
-// together with the grammars, and a cross-module implementation would freeze
-// them. Driver modules pick a built-in value; they never implement this.
+// Dialect identifies one of the built-in SQL dialects. All methods are
+// unexported: driver modules pick a built-in value, never implement one.
 type Dialect interface {
 	name() string
 	lexer() lexProfile
 	style() bindStyle
 	caps() dialectCaps
-	// quote appends the quoted identifier. Dotted names are quoted per
-	// segment ("analytics"."events") so schema-qualified tables work.
+	// quote appends the quoted identifier; dotted names quote per segment.
 	quote(b []byte, ident string) []byte
-	// translate maps a driver error to a rio sentinel, or nil if unknown.
-	// Only SQLSTATE-carrying errors are recognized here; driver modules
-	// install precise translators for everything else.
+	// translate maps a driver error to a rio sentinel, or nil if unknown;
+	// driver modules install precise translators beyond SQLSTATE.
 	translate(err error) error
 	// bindTime converts a time.Time into the driver-facing bind value.
 	bindTime(t time.Time) any
@@ -48,13 +44,11 @@ type dialectCaps struct {
 	finalTable     bool          // FROM t FINAL merges row versions at read (ClickHouse)
 
 	// bindBytesAsString rebinds []byte arguments as strings: clickhouse-go
-	// interpolates a []byte as an Array(UInt8) literal, while String is
-	// ClickHouse's byte container.
+	// would interpolate them as Array(UInt8) literals.
 	bindBytesAsString bool
 }
 
-// Built-in dialects. Driver modules re-export the matching value from their
-// Open/New constructors.
+// Built-in dialects.
 var (
 	Postgres   Dialect = postgresDialect{}
 	MySQL      Dialect = mysqlDialect{}
@@ -62,10 +56,8 @@ var (
 	ClickHouse Dialect = clickhouseDialect{}
 )
 
-// sqliteTimeFormat is rio's own canonical text encoding for SQLite time
-// columns: lexicographically sortable, accepted by SQLite's date functions,
-// and independent of the driver's optional time handling. Values are always
-// UTC by the time they reach a dialect (see bindArg).
+// sqliteTimeFormat is rio's canonical SQLite time encoding: sortable text,
+// accepted by SQLite's date functions; values are already UTC (bindArg).
 const sqliteTimeFormat = "2006-01-02 15:04:05.999999+00:00"
 
 // --- PostgreSQL ---
@@ -119,10 +111,8 @@ func (mysqlDialect) quote(b []byte, ident string) []byte {
 }
 
 func (mysqlDialect) translate(error) error {
-	// MySQL folds both unique and FK violations into SQLSTATE 23000, so no
-	// honest state-based mapping exists, and go-sql-driver errors carry no
-	// SQLState accessor anyway; the go-rio/mysql module installs the precise
-	// errno-based translator.
+	// MySQL folds unique and FK violations into SQLSTATE 23000; the
+	// go-rio/mysql module installs the precise errno-based translator.
 	return nil
 }
 
@@ -139,9 +129,8 @@ func (sqliteDialect) bindTime(t time.Time) any {
 }
 
 func (sqliteDialect) caps() dialectCaps {
-	// modernc.org/sqlite compiles with SQLITE_MAX_VARIABLE_NUMBER=32766;
-	// stock SQLite builds cap at 999. The conservative ceiling keeps chunked
-	// statements valid everywhere and costs a few extra round-trips at most.
+	// 999 is stock SQLite's bind ceiling (modernc allows 32766); the
+	// conservative cap keeps chunked statements valid everywhere.
 	return dialectCaps{
 		returning: true, conflictTarget: true, forUpdate: forUpdateElide, maxBindParams: 999,
 		mutations: true, transactions: true, uniqueKeys: true, autoIncrPK: true, stmtPrepare: true,
@@ -153,8 +142,8 @@ func (sqliteDialect) quote(b []byte, ident string) []byte {
 }
 
 func (sqliteDialect) translate(err error) error {
-	// modernc.org/sqlite errors expose Code() int; probing the interface
-	// keeps the core dependency-free while translating out of the box.
+	// modernc.org/sqlite errors expose Code() int; the interface probe
+	// keeps the core dependency-free.
 	var coder interface{ Code() int }
 	if !errors.As(err, &coder) {
 		return nil
@@ -170,18 +159,12 @@ func (sqliteDialect) translate(err error) error {
 
 // --- ClickHouse ---
 
-// chTimeFormat is rio's canonical time encoding for ClickHouse: wall-clock
-// text with a fixed six-digit fraction and an explicit UTC offset. The offset
-// overrides the column's timezone attribute during parsing, so the same
-// instant lands in DateTime64(6) and DateTime64(6, 'Asia/Shanghai') alike —
-// unlike bare wall-clock text (read in the column's zone) or fractional
-// epoch strings (which cannot express pre-1970 instants). Text at all
-// because clickhouse-go's client-side binder truncates a time.Time argument
-// to whole seconds; the fixed fraction keeps the behavior uniform per column
-// type instead of per value.
+// chTimeFormat is rio's canonical ClickHouse time encoding: text, because
+// clickhouse-go truncates time.Time binds to whole seconds; the explicit UTC
+// offset overrides the column's timezone attribute during parsing.
 const chTimeFormat = "2006-01-02 15:04:05.000000+00:00"
 
-// ClickHouse 26.7's DateTime64(6) text-binding range.
+// ClickHouse's DateTime64(6) text-binding range.
 var (
 	chTimeMin = time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
 	chTimeMax = time.Date(9999, 12, 31, 23, 59, 59, 999999000, time.UTC)
@@ -196,23 +179,17 @@ func (clickhouseDialect) style() bindStyle  { return bindQuestionEsc }
 func (clickhouseDialect) bindTime(t time.Time) any { return t.Format(chTimeFormat) }
 
 func (clickhouseDialect) caps() dialectCaps {
-	// ClickHouse is an append-only OLAP dialect: UPDATE/DELETE are
-	// asynchronous mutations without an affected-row count (and the driver
-	// reports RowsAffected 0 unconditionally), clickhouse-go's Begin is a
-	// no-op shim for its batch API, unique constraints and generated primary
-	// keys do not exist, and Prepare only works for INSERT batching.
-	// maxBindParams is a text budget, not a protocol limit — every argument
-	// is interpolated into the statement client-side: 8192 keeps IN
-	// expansions under the server's default 256 KiB max_query_size, while
-	// multi-VALUES INSERT data is exempt from that limit entirely.
+	// Append-only OLAP: mutations are asynchronous with no affected-row
+	// count, Begin is a no-op shim, unique keys and generated primary keys
+	// do not exist, and Prepare only covers INSERT batching. maxBindParams
+	// is a client-side text budget (every argument is interpolated), sized
+	// to keep IN expansions under the default 256 KiB max_query_size.
 	return dialectCaps{forUpdate: forUpdateReject, maxBindParams: 8192, finalTable: true, bindBytesAsString: true}
 }
 
 func (clickhouseDialect) quote(b []byte, ident string) []byte {
-	// Backticks, ClickHouse's conventional identifier quoting — but not via
-	// quoteWith: ClickHouse honors backslash escapes inside quoted
-	// identifiers (one lexer routine serves ', " and `), so a literal
-	// backslash must be doubled or it would swallow the closing quote.
+	// Not quoteWith: ClickHouse honors backslash escapes inside quoted
+	// identifiers, so a literal backslash must be doubled.
 	b = append(b, '`')
 	for i := 0; i < len(ident); i++ {
 		switch c := ident[i]; c {
@@ -231,10 +208,8 @@ func (clickhouseDialect) quote(b []byte, ident string) []byte {
 
 func (clickhouseDialect) translate(error) error {
 	// ClickHouse has no unique or foreign key constraints, so no server
-	// error honestly maps to ErrDuplicateKey or ErrForeignKeyViolated — and
-	// *clickhouse.Exception carries its code in a struct field, out of reach
-	// of a dependency-free interface probe anyway. The go-rio/clickhouse
-	// module installs no translator either, for the same reason.
+	// error maps to a rio sentinel; the go-rio/clickhouse module installs
+	// none either.
 	return nil
 }
 
@@ -243,7 +218,7 @@ func quoteWith(b []byte, ident string, q byte) []byte {
 	start := 0
 	for i := 0; i < len(ident); i++ {
 		switch ident[i] {
-		case q: // double the quote character inside the identifier
+		case q: // double the quote character
 			b = append(b, ident[start:i+1]...)
 			b = append(b, q)
 			start = i + 1

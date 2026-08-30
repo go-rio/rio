@@ -74,7 +74,6 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 	argIdx := 0
 	n := 0 // emitted placeholder count
 
-	// rewriteTo copies the unchanged prefix before a rewrite.
 	rewriteTo := func(i int) {
 		if out == nil {
 			out = make([]byte, 0, len(query)+8)
@@ -111,7 +110,6 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 			i = skipQuoted(query, i, '\'', p.backslashEscapes)
 			continue
 		case '"':
-			// Identifier or string, depending on dialect.
 			i = skipQuoted(query, i, '"', (p.backslashEscapes && p.doubleQuoteIsString) || p.quotedIdentBackslash)
 			continue
 		case '`':
@@ -224,8 +222,7 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 				copied = i + 1 // the ? becomes $N
 				emit(arg)
 			} else {
-				// Question style keeps the ? in place: count it, and under
-				// the expanded-args regime collect its argument.
+				// Question style keeps the ? in place.
 				n++
 				if expanded {
 					outArgs = append(outArgs, arg)
@@ -389,17 +386,14 @@ func rebindTemplate(p lexProfile, style bindStyle, query string) (string, int, e
 	return byteString(out), n, nil
 }
 
-// byteString reinterprets b as a string without copying. The caller must
-// guarantee b is never modified afterwards; rio uses it only on freshly
-// built, function-local render buffers whose last use is this conversion.
+// byteString reinterprets b as a string without copying; b must never be
+// modified afterwards.
 func byteString(b []byte) string {
 	return unsafe.String(unsafe.SliceData(b), len(b))
 }
 
-// skipQuoted copies a quoted region starting at the opening quote, honoring
-// doubled-quote escapes and, optionally, backslash escapes. It returns the
-// index after the closing quote; unterminated regions run to the end (the
-// database will reject the statement — rebind must only not miscount).
+// skipQuoted returns the index after the closing quote, honoring doubled and,
+// optionally, backslash escapes; unterminated regions run to the end.
 func skipQuoted(s string, start int, q byte, backslash bool) int {
 	i := start + 1
 	for i < len(s) {
@@ -429,24 +423,21 @@ func skipUntilByte(s string, start int, b byte) int {
 	return len(s)
 }
 
-// identByteBefore reports whether the byte before position i can end an
-// identifier — in which case a following $ or E belongs to that identifier
-// (PostgreSQL identifiers may contain $: col$x$y is one name, not a quote).
+// identByteBefore reports whether the byte before i can end an identifier —
+// then a following $ or E belongs to it (PostgreSQL identifiers may contain $).
 func identByteBefore(s string, i int) bool {
 	if i == 0 {
 		return false
 	}
 	c := s[i-1]
-	// Bytes >= 0x80 are UTF-8 continuation/lead bytes: PostgreSQL allows
-	// non-ASCII identifiers, so treat them as identifier material — never
-	// let café$tag$ open a dollar quote mid-word.
+	// Bytes >= 0x80 count as identifier material: PostgreSQL allows
+	// non-ASCII identifiers.
 	return c == '_' || c == '$' || c >= 0x80 ||
 		(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
-// skipDollarQuoted matches $tag$...$tag$ starting at the $ and returns the
-// index after the closing delimiter. $1-style placeholders do not match: a
-// tag is empty or starts with a letter (ASCII or not) or underscore.
+// skipDollarQuoted matches $tag$...$tag$ and returns the index after the
+// closing delimiter. $1-style placeholders do not match.
 func skipDollarQuoted(s string, start int) (int, bool) {
 	i := start + 1
 	for i < len(s) && isTagByte(s[i], i == start+1) {
@@ -465,21 +456,17 @@ func skipDollarQuoted(s string, start int) (int, bool) {
 }
 
 func isTagByte(c byte, first bool) bool {
-	// Bytes >= 0x80 count as letters, mirroring identByteBefore: PostgreSQL's
-	// scanner classes the tag as [A-Za-z\200-\377_] plus digits after the
-	// first byte, so $å$...$å$ is a real dollar quote and must be skipped.
+	// PostgreSQL classes tag bytes as [A-Za-z\200-\377_], plus digits after
+	// the first.
 	if c == '_' || c >= 0x80 || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
 		return true
 	}
 	return !first && c >= '0' && c <= '9'
 }
 
-// skipHeredoc matches ClickHouse's $tag$...$tag$ heredoc starting at the $
-// and returns the index after the closing delimiter. Two deliberate
-// differences from skipDollarQuoted, both matching the server's Lexer.cpp:
-// tags may be empty or start with a digit, and an unterminated heredoc is
-// not a heredoc at all — the server lexes the $ as an ordinary token then,
-// so the scan must too.
+// skipHeredoc matches ClickHouse's $tag$...$tag$. Per the server's lexer,
+// and unlike skipDollarQuoted: tags may start with a digit, and an
+// unterminated heredoc is not a heredoc at all.
 func skipHeredoc(s string, start int) (int, bool) {
 	i := start + 1
 	for i < len(s) && isWordByte(s[i]) {
@@ -502,18 +489,14 @@ func isWordByte(c byte) bool {
 }
 
 // hashSpaceCommentAt implements ClickHouse's # rule: a comment only when
-// followed by a space or '!' — anything else (`#x`, or # at the end) is a
-// lexer error server-side, so the scan does not swallow it as a comment.
+// followed by ' ' or '!'.
 func hashSpaceCommentAt(p lexProfile, s string, i int) bool {
 	return p.hashSpaceComment && i+1 < len(s) && (s[i+1] == ' ' || s[i+1] == '!')
 }
 
-// checkDriverBlindRegion guards regions the server lexes as literal text but
-// clickhouse-go's client-side binder does not recognize (heredocs, //
-// comments): on an argument-carrying statement the driver would substitute a
-// ? in there, so rio rejects it with the fix instead of letting the
-// statement corrupt. Argument-free statements pass — the driver skips
-// binding entirely then.
+// checkDriverBlindRegion rejects a ? inside regions the server lexes as text
+// but clickhouse-go's client-side binder does not (heredocs, // comments) —
+// the driver would substitute there. Argument-free statements pass.
 func checkDriverBlindRegion(style bindStyle, query string, start, end, argc int, region, fix string) error {
 	if style != bindQuestionEsc || argc == 0 {
 		return nil
@@ -584,9 +567,8 @@ func sliceValue(arg any) (reflect.Value, bool) {
 		return reflect.Value{}, false
 	}
 	if t.Elem().Kind() == reflect.Uint8 {
-		// Byte payloads are one value, not a list — named byte slices
-		// (json.RawMessage) and [16]byte UUIDs alike. Expanding them would
-		// splice a byte-per-placeholder list into "= ?".
+		// Byte payloads (json.RawMessage, [16]byte UUIDs) are one value, not
+		// a list.
 		return reflect.Value{}, false
 	}
 	if t.Implements(valuerType) {

@@ -7,10 +7,8 @@ import (
 	"unsafe"
 )
 
-// The rebinder is the single component that rewrites user SQL, so its
-// behavior is pinned by a golden table: every entry is a promise about how a
-// (profile, style, query, args) tuple lexes and rebinds. Entries are only
-// ever appended, never edited.
+// The rebinder is the single component that rewrites user SQL; a golden table
+// pins its behavior, and entries are only ever appended, never edited.
 
 func TestRebind(t *testing.T) {
 	golden := []struct {
@@ -53,9 +51,7 @@ func TestRebind(t *testing.T) {
 		{"empty string literal", pgLex, bindDollar, "SELECT '' , ?", []any{1}, "SELECT '' , $1", []any{1}, ""},
 		{"unterminated string", pgLex, bindDollar, "SELECT '?", nil, "SELECT '?", nil, ""},
 
-		// Backslashes end strings on MySQL only: the same bytes lex as one
-		// string on MySQL (its ? is dead) but as string-then-placeholder on
-		// PG/SQLite (its ? is live).
+		// Backslashes escape quotes on MySQL only: its ? stays dead where PG/SQLite's is live.
 		{"backslash quote mysql", mysqlLex, bindQuestion, `SELECT '\'? '`, nil, `SELECT '\'? '`, nil, ""},
 		{"backslash quote mysql rejects arg", mysqlLex, bindQuestion, `SELECT '\'? '`, []any{1}, "", nil, "0 placeholder(s) but 1 argument(s)"},
 		{"backslash quote pg", pgLex, bindDollar, `SELECT '\'? '`, []any{1}, `SELECT '\'$1 '`, []any{1}, ""},
@@ -88,8 +84,7 @@ func TestRebind(t *testing.T) {
 		{"bracket sqlite", sqliteLex, bindQuestion, "SELECT [a?b]", nil, "SELECT [a?b]", nil, ""},
 		{"bracket not special on mysql", mysqlLex, bindQuestion, "SELECT [a?b]", []any{1}, "SELECT [a?b]", []any{1}, ""},
 
-		// Line comments. MySQL's -- needs trailing whitespace; PG/SQLite's
-		// does not; # comments on MySQL only.
+		// Line comments: MySQL's -- needs trailing whitespace; # comments on MySQL only.
 		{"tight dash comment pg", pgLex, bindDollar, "SELECT 1--?x", nil, "SELECT 1--?x", nil, ""},
 		{"tight dashes are not a comment on mysql", mysqlLex, bindQuestion, "SELECT 1--?x", []any{7}, "SELECT 1--?x", []any{7}, ""},
 		{"spaced dash comment pg", pgLex, bindDollar, "SELECT 1 -- ?", nil, "SELECT 1 -- ?", nil, ""},
@@ -102,8 +97,7 @@ func TestRebind(t *testing.T) {
 		{"hash not a comment on pg", pgLex, bindDollar, "SELECT 1 # ?", []any{1}, "SELECT 1 # $1", []any{1}, ""},
 		{"hash not a comment on sqlite", sqliteLex, bindQuestion, "SELECT 1 # ?", []any{1}, "SELECT 1 # ?", []any{1}, ""},
 
-		// Block comments nest on PostgreSQL only: the inner */ pops
-		// MySQL/SQLite out early, so their second ? is live.
+		// Block comments nest on PostgreSQL only.
 		{"block comment pg", pgLex, bindDollar, "SELECT /* ? */ 1", nil, "SELECT /* ? */ 1", nil, ""},
 		{"block comment mysql", mysqlLex, bindQuestion, "SELECT /* ? */ 1", nil, "SELECT /* ? */ 1", nil, ""},
 		{"block comment sqlite", sqliteLex, bindQuestion, "SELECT /* ? */ 1", nil, "SELECT /* ? */ 1", nil, ""},
@@ -112,8 +106,7 @@ func TestRebind(t *testing.T) {
 		{"block comments do not nest on sqlite", sqliteLex, bindQuestion, "SELECT /* /* ? */ ? */ 1", []any{1}, "SELECT /* /* ? */ ? */ 1", []any{1}, ""},
 		{"unterminated block comment", pgLex, bindDollar, "SELECT /* ?", nil, "SELECT /* ?", nil, ""},
 
-		// IN expansion is flat, the sqlx convention: "IN (?)" keeps the
-		// caller's own parentheses and the single ? multiplies in place.
+		// IN expansion is flat (the sqlx convention): the caller keeps their own parentheses.
 		{"int slice pg", pgLex, bindDollar, "SELECT * FROM t WHERE id IN (?)", []any{[]int{1, 2, 3}},
 			"SELECT * FROM t WHERE id IN ($1, $2, $3)", []any{1, 2, 3}, ""},
 		{"int slice mysql", mysqlLex, bindQuestion, "SELECT * FROM t WHERE id IN (?)", []any{[]int{1, 2, 3}},
@@ -134,9 +127,7 @@ func TestRebind(t *testing.T) {
 		{"array expands", pgLex, bindDollar, "SELECT * FROM t WHERE id IN (?)", []any{[2]int{7, 8}},
 			"SELECT * FROM t WHERE id IN ($1, $2)", []any{7, 8}, ""},
 
-		// A digit straight after ? would glue onto an emitted $N ($1 + "0"
-		// reads back as $10), and ?N numbered placeholders are not part of
-		// the unified syntax: rejected on every dialect rather than corrupted.
+		// ?N is rejected everywhere: a digit after ? would glue onto an emitted $N ($1+"0" reads as $10).
 		{"digit after placeholder", pgLex, bindDollar, "SELECT ?0", []any{1}, "", nil, "followed by a digit"},
 		{"digit after placeholder mysql", mysqlLex, bindQuestion, "SELECT ?1", []any{1}, "", nil, "followed by a digit"},
 		{"digit after placeholder sqlite", sqliteLex, bindQuestion, "SELECT ?1", []any{1}, "", nil, "followed by a digit"},
@@ -170,12 +161,9 @@ func TestRebind(t *testing.T) {
 	}
 }
 
-// TestRebindDialectDivergence feeds byte-identical SQL to two profiles and
-// pins the spots where their lexers must disagree; if a refactor ever
-// unifies these paths, one side of each pair fails.
+// Byte-identical SQL fed to two profiles must disagree at the pinned spots.
 func TestRebindDialectDivergence(t *testing.T) {
-	// MySQL's backslash keeps the string open, so its ? is dead; PostgreSQL
-	// ends the string at the backslash-preceded quote, so its ? is live.
+	// MySQL's backslash keeps the string open (? dead); PG ends it (? live).
 	q := `SELECT '\'? '`
 	myOut, _, err := rebind(mysqlLex, bindQuestion, q, nil)
 	if err != nil {
@@ -189,8 +177,7 @@ func TestRebindDialectDivergence(t *testing.T) {
 		t.Errorf("backslash handling: mysql and pg agreed on %q: both %q", q, myOut)
 	}
 
-	// -- without trailing whitespace comments on PG but not on MySQL, where
-	// the ? stays live and is rewritten.
+	// A tight -- comments on PG but not MySQL, where the ? stays live.
 	q = "SELECT 1--?x"
 	pgOut, _, err = rebind(pgLex, bindDollar, q, nil)
 	if err != nil {
@@ -207,8 +194,7 @@ func TestRebindDialectDivergence(t *testing.T) {
 		t.Errorf("dash comment handling: mysql and pg agreed on %q: both %q", q, pgOut)
 	}
 
-	// Block comments nest on PG only: the inner */ pops MySQL out early, so
-	// the second ? is live there.
+	// Block comments nest on PG only; MySQL's second ? is live.
 	q = "SELECT /* /* ? */ ? */ 1"
 	pgOut, _, err = rebind(pgLex, bindDollar, q, nil)
 	if err != nil {
@@ -226,9 +212,7 @@ func TestRebindDialectDivergence(t *testing.T) {
 	}
 }
 
-// BenchmarkRebind pins the per-execution cost of the rebind pass on the
-// three shapes that matter: question-style with nothing to rewrite (the
-// MySQL/SQLite common case), dollar renumbering, and slice expansion.
+// Pins the per-execution rebind cost on the three shapes that matter.
 func BenchmarkRebind(b *testing.B) {
 	q := `SELECT "users"."id", "users"."email", "users"."age" FROM "users" WHERE (age > ?) AND (email = ?) AND "users"."deleted_at" IS NULL ORDER BY created_at DESC LIMIT 10`
 	args := []any{18, "a@x"}
@@ -303,8 +287,7 @@ func TestRebindTemplate(t *testing.T) {
 	}
 }
 
-// equalArgs compares argument lists by value, treating nil and empty as the
-// same so table entries can spell "no arguments" as nil.
+// equalArgs treats nil and empty as the same, so table entries can spell "no arguments" as nil.
 func equalArgs(a, b []any) bool {
 	if len(a) != len(b) {
 		return false
@@ -317,9 +300,7 @@ func equalArgs(a, b []any) bool {
 	return true
 }
 
-// AUDIT LB4 regression: when nothing rewrites — question style, no slice
-// expansion, no ?? escape — rebind must return the input string itself
-// instead of an identical copy, so the unchanged path allocates nothing.
+// An unchanged rebind must return the input string itself, not an identical copy.
 func TestRebindReusesInputWhenUnchanged(t *testing.T) {
 	q := "SELECT * FROM t WHERE a = ? AND b = ?"
 	got, gotArgs, err := rebind(sqliteLex, bindQuestion, q, []any{1, 2})
@@ -347,9 +328,7 @@ func TestRebindReusesInputWhenUnchanged(t *testing.T) {
 	}
 }
 
-// BenchmarkRenderSelect measures the uncompiled query render pipeline —
-// clause rendering plus the rebind pass in finishSQL — the per-execution
-// cost every builder query pays before the driver sees it.
+// Measures the uncompiled render pipeline: clause rendering plus the rebind pass in finishSQL.
 func BenchmarkRenderSelect(b *testing.B) {
 	p, err := planOf[User]()
 	if err != nil {
@@ -376,8 +355,7 @@ func BenchmarkRenderSelect(b *testing.B) {
 	}
 }
 
-// BenchmarkQueryBuild measures builder-call cost, including the per-fragment
-// arity check Where runs at build time.
+// Measures builder-call cost, including Where's build-time arity check.
 func BenchmarkQueryBuild(b *testing.B) {
 	b.ReportAllocs()
 	for range b.N {

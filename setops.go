@@ -13,8 +13,8 @@ import (
 // verbatim; never construct them from untrusted input.
 type Set map[string]any
 
-// Expr is a verbatim UpdateAll value for database-side expressions. Never
-// construct it from untrusted input; whitelist dynamic identifiers.
+// Expr is a verbatim UpdateAll value for database-side expressions; never
+// construct it from untrusted input.
 type Expr string
 
 // UpdateAll updates matching rows and returns the affected count. It requires
@@ -164,7 +164,6 @@ func (q Query[T]) updateAll(
 				bindArgs = append(bindArgs, nil)
 				continue
 			}
-			// Marshal JSON columns consistently with entity writes.
 			data, err := json.Marshal(v)
 			if err != nil {
 				return 0, fmt.Errorf("rio: UpdateAll: column %q: encoding JSON: %w", k, err)
@@ -173,7 +172,6 @@ func (q Query[T]) updateAll(
 			continue
 		}
 		if _, expands := sliceValue(v); expands {
-			// Slices expand only in placeholder lists, not assignments.
 			return 0, fmt.Errorf(
 				"rio: UpdateAll: column %q value is a slice, which SET cannot expand; "+
 					"wrap it in a driver.Valuer (e.g. pq.Array) or use rio.Expr",
@@ -233,7 +231,6 @@ func checkSetOpShape(op string, s *queryState) error {
 		)
 	}
 	if len(s.joins) > 0 {
-		// The write renders only its own table, so joined references are invalid.
 		return fmt.Errorf(
 			"rio: %s cannot honor Join (UPDATE/DELETE across joined tables is not portable SQL); "+
 				"filter with WhereHas or an IN subquery in Where",

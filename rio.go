@@ -9,10 +9,7 @@ import (
 	"time"
 )
 
-// Queryer is what every execution point accepts: a *DB or a *Tx. Data-access
-// code written against Queryer runs unchanged inside and outside
-// transactions. Tx opens a transaction on a DB and a savepoint on a Tx, so
-// transactional helpers compose transparently.
+// Queryer is the execution target every rio entry point accepts: a *DB or a *Tx.
 type Queryer interface {
 	// Tx runs fn inside a transaction (on *DB) or a savepoint (on *Tx),
 	// committing when fn returns nil and rolling back when it returns an
@@ -35,27 +32,20 @@ type DB struct {
 	handle any // driver-owned handle (WithDriverHandle / NativeConfig.Handle)
 }
 
-// Tx is a transaction handle. It satisfies Queryer, so every rio entry point
-// accepts it in place of a *DB. Like *sql.Tx it is bound to one connection
-// and must not be used concurrently.
+// Tx is a transaction handle. Like *sql.Tx it is bound to one connection and
+// must not be used concurrently.
 type Tx struct {
-	tx  *sql.Tx // Unwrap's view of the engine's transaction
+	tx  *sql.Tx // Unwrap's view; nil without a *sql.Tx
 	e   txEngine
 	g   *grammar
 	cfg *config
-	// spSeq is shared across every Tx wrapper of the same root transaction
-	// and increases monotonically, so savepoint names are never reused by
-	// siblings or nested levels.
+	// spSeq is shared by every Tx wrapper of one root transaction and only
+	// grows, so savepoint names are never reused.
 	spSeq *int
 }
 
-// New wraps an existing *sql.DB. Driver modules (go-rio/postgres, go-rio/mysql,
-// go-rio/sqlite) call this for you and add driver-specific error translation;
-// use New directly when you bring your own driver.
-//
-// Panics on a nil db or dialect, and on WithStmtCache with the ClickHouse
-// dialect (clickhouse-go prepares only INSERT batches, so a prepared SELECT
-// fails on first use).
+// New wraps an existing *sql.DB. Panics on a nil db or dialect, and on
+// WithStmtCache with a dialect that cannot prepare statements (ClickHouse).
 func New(db *sql.DB, dialect Dialect, opts ...Option) *DB {
 	if db == nil {
 		panic("rio: New: db must not be nil")
@@ -68,7 +58,6 @@ func New(db *sql.DB, dialect Dialect, opts ...Option) *DB {
 		opt(cfg)
 	}
 	if cfg.stmtCache && !dialect.caps().stmtPrepare {
-		// Construction-time misuse, like a nil db: no configuration makes this work, so panic.
 		panic("rio: WithStmtCache is not supported on " + dialect.name() +
 			" (clickhouse-go implements Prepare only for INSERT batching; a prepared SELECT fails on first use)")
 	}
@@ -79,28 +68,17 @@ func New(db *sql.DB, dialect Dialect, opts ...Option) *DB {
 	return &DB{db: db, e: e, g: newGrammar(dialect, cfg), cfg: cfg, handle: cfg.driverHandle}
 }
 
-// Unwrap returns the underlying *sql.DB for anything rio does not cover. On
-// the native channel it returns the database/sql view the driver module
-// supplied over the same pool (NativeConfig.SQLView; go-rio/postgres always
-// provides one), or nil when the driver module supplied none. Never tune
-// pooling on a native view — the pool belongs to the driver's configuration.
+// Unwrap returns the underlying *sql.DB. On the native channel it is the
+// driver module's database/sql view over the same pool (NativeConfig.SQLView),
+// or nil when none was supplied; never tune pooling on that view.
 func (d *DB) Unwrap() *sql.DB { return d.db }
 
-// Native identifies the execution channel: it returns NativeConfig.Handle —
-// a *pgxpool.Pool under go-rio/postgres — on the native channel and nil on
-// the database/sql channel. Driver accessors (postgres.PoolOf) are built on
-// DriverHandle, which carries the handle on either channel; Native answers
-// only "is this the native channel". Its transaction-scoped sibling is
-// Tx.NativeTx, which returns the SPI transaction adapter.
+// Native returns NativeConfig.Handle on the native channel and nil on the
+// database/sql channel.
 func (d *DB) Native() any { return d.native }
 
-// DriverHandle returns the driver-owned handle attached to this DB — the
-// value a driver module passed through WithDriverHandle (a database/sql
-// adapter over its own pool) or NativeConfig.Handle (the native channel) —
-// and nil when none was attached. Unlike Native, which identifies the
-// execution channel, this is pure ownership: driver modules build their
-// typed accessors (postgres.PoolOf) on it, so a handle's lifecycle rides on
-// the DB instead of a side registry.
+// DriverHandle returns the driver-owned handle attached through
+// WithDriverHandle or NativeConfig.Handle, or nil when none was attached.
 func (d *DB) DriverHandle() any { return d.handle }
 
 // Close closes the prepared-statement cache (if enabled) and the underlying
@@ -116,9 +94,6 @@ func (d *DB) Tx(ctx context.Context, fn func(tx *Tx) error) error {
 // read-only).
 func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) error) (err error) {
 	if !d.g.d.caps().transactions {
-		// clickhouse-go's Begin returns the connection itself and opens
-		// nothing: fn would run with every statement committing independently
-		// while looking transactional — the heaviest silent surprise there is.
 		return unsupportedf(
 			"rio: transactions are not supported on %s "+
 				"(the driver's Begin is a no-op and statements would commit independently); "+
@@ -127,9 +102,8 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 			d.g.d.name(),
 		)
 	}
-	// Armed before BEGIN: its AfterQuery hook can panic with the transaction
-	// already open, and the connection must be rolled back before the panic
-	// continues. te is nil until begin succeeds — nothing to clean up then.
+	// Armed before BEGIN: a hook may panic with the transaction already open —
+	// roll back, then re-panic.
 	var te txEngine
 	defer func() {
 		if p := recover(); p != nil {
@@ -150,7 +124,7 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 
 	rtx := &Tx{e: te, g: d.g, cfg: d.cfg, spSeq: new(int)}
 	if se, ok := te.(*sqlTxEngine); ok {
-		rtx.tx = se.tx // Unwrap's view; engines without a *sql.Tx leave it nil
+		rtx.tx = se.tx
 	}
 	if err = fn(rtx); err != nil {
 		if rbErr := d.finishTx(ctx, te, err); rbErr != nil {
@@ -161,16 +135,11 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 	return observe(ctx, d.cfg, d.g.d, "commit", "COMMIT", func(ctx context.Context) error { return te.commit(ctx) })
 }
 
-// Unwrap returns the underlying *sql.Tx — and nil on the native channel,
-// which has no *sql.Tx to give. Use the driver module's typed accessor
-// there: postgres.TxOf returns the pgx.Tx this transaction runs on.
+// Unwrap returns the underlying *sql.Tx, or nil on the native channel.
 func (t *Tx) Unwrap() *sql.Tx { return t.tx }
 
-// NativeTx returns the NativeTx SPI transaction adapter the native channel
-// runs this transaction on, and nil on the database/sql channel. Like
-// (*DB).Native — which hands back the driver pool handle — it is the raw door:
-// application code uses the driver module's typed accessor (postgres.TxOf)
-// instead.
+// NativeTx returns the NativeTx SPI adapter this transaction runs on, or nil
+// on the database/sql channel.
 func (t *Tx) NativeTx() any {
 	if ne, ok := t.e.(nativeTxEngine); ok {
 		return ne.nt
@@ -178,10 +147,8 @@ func (t *Tx) NativeTx() any {
 	return nil
 }
 
-// Tx runs fn inside a savepoint, giving nested transactional code partial
-// rollback. Savepoints commit ("RELEASE") when fn returns nil; on error the
-// savepoint is rolled back and the error returned, leaving the outer
-// transaction usable.
+// Tx runs fn inside a savepoint: released when fn returns nil, rolled back
+// when fn returns an error or panics, leaving the outer transaction usable.
 func (t *Tx) Tx(ctx context.Context, fn func(tx *Tx) error) (err error) {
 	*t.spSeq++
 	name := "rio_sp_" + strconv.Itoa(*t.spSeq)
@@ -189,14 +156,9 @@ func (t *Tx) Tx(ctx context.Context, fn func(tx *Tx) error) (err error) {
 	if err := t.spExec(ctx, "SAVEPOINT "+name); err != nil {
 		return err
 	}
-	// Cleanup statements run on a cancellation-decoupled context. fn failing
-	// *because* its context died is exactly when ROLLBACK TO must still reach
-	// the database: on the caller's ctx, database/sql short-circuits before
-	// sending it, the savepoint's writes silently survive, and the outer
-	// transaction — its own context still live — would commit them. The
-	// connection itself is healthy; only the context is dead. SAVEPOINT above
-	// keeps the caller's ctx: refusing to *open* work under a canceled
-	// context is the correct half of cancellation.
+	// Cleanup runs cancellation-decoupled: when fn fails because ctx died,
+	// ROLLBACK TO must still reach the database or the savepoint's writes
+	// survive into the outer commit.
 	cleanup := context.WithoutCancel(ctx)
 	inner := &Tx{tx: t.tx, e: t.e, g: t.g, cfg: t.cfg, spSeq: t.spSeq}
 	defer func() {
@@ -206,15 +168,12 @@ func (t *Tx) Tx(ctx context.Context, fn func(tx *Tx) error) (err error) {
 		}
 	}()
 	if err = fn(inner); err != nil {
-		// Roll back first: after a failed statement PostgreSQL aborts the
-		// transaction and accepts nothing but ROLLBACK TO. The rollback can
-		// itself fail legitimately — a MySQL deadlock (1213) rolls back the
-		// whole transaction and destroys every savepoint — so its error is
-		// joined rather than allowed to mask the cause.
+		// An aborted transaction (PostgreSQL) accepts nothing but ROLLBACK TO,
+		// so roll back before releasing.
 		if rbErr := t.spRollback(cleanup, name); rbErr != nil {
 			return errors.Join(err, rbErr)
 		}
-		_ = t.spExec(cleanup, "RELEASE SAVEPOINT "+name) // keep the stack clean; failure is harmless here
+		_ = t.spExec(cleanup, "RELEASE SAVEPOINT "+name) // failure is harmless
 		return err
 	}
 	return t.spExec(cleanup, "RELEASE SAVEPOINT "+name)
@@ -224,14 +183,8 @@ func (d *DB) eng() engine    { return d.e }
 func (d *DB) gram() *grammar { return d.g }
 func (d *DB) conf() *config  { return d.cfg }
 
-// finishTx rolls the transaction back. Unlike the savepoint statements below,
-// a canceled ctx cannot suppress this cleanup: the rollback runs on a
-// cancellation-decoupled context — the caller-owned WithoutCancel discipline
-// the engine seam documents. database/sql's Tx.Rollback ignores the context
-// anyway; a native engine's rollback honors it, and a dead one there would
-// strand the transaction (pgx fails fast and tears down the connection).
-// Either channel reports a transaction the driver already finished — a begin
-// context that died, for one — as sql.ErrTxDone, tolerated here.
+// finishTx rolls the transaction back on a cancellation-decoupled context
+// (a dead ctx must not suppress cleanup) and tolerates sql.ErrTxDone.
 func (d *DB) finishTx(ctx context.Context, te txEngine, cause error) error {
 	err := observeCleanup(ctx, d.cfg, d.g.d, "rollback", "ROLLBACK", func(ctx context.Context) error {
 		return te.rollback(ctx)
@@ -261,8 +214,8 @@ func (t *Tx) spExec(ctx context.Context, stmt string) error {
 	})
 }
 
-// observeCleanup guarantees fn runs even when a BeforeQuery hook panics. The
-// hook panic still propagates after the resource cleanup attempt.
+// observeCleanup runs fn even when a BeforeQuery hook panics; the panic then
+// propagates.
 func observeCleanup(
 	ctx context.Context,
 	cfg *config,
@@ -287,10 +240,7 @@ func observeCleanup(
 }
 
 // observe wraps transaction-control statements with hooks and error
-// translation. fn runs under the context BeforeQuery returned (hooks.go), so
-// a hook's span or deadline reaches begin/commit/rollback/savepoint. COMMIT
-// in particular must translate: deferred constraints surface their violations
-// at commit time.
+// translation; fn runs under the context BeforeQuery returned.
 func observe(
 	ctx context.Context,
 	cfg *config,
@@ -311,9 +261,7 @@ func observe(
 }
 
 // run executes a non-row-returning statement through the shared pipeline:
-// statement cache (DB only), hooks, error translation. The statement runs
-// under the context BeforeQuery returned (hooks.go). Without hooks the event
-// is never materialized — the hot path allocates nothing here.
+// statement cache, hooks, error translation.
 func run(
 	ctx context.Context,
 	q Queryer,
@@ -343,9 +291,7 @@ func run(
 		if n, aerr := res.RowsAffected(); aerr == nil {
 			rows = n
 		} else {
-			// Record the failure for the hook so it never logs a success, but
-			// run still returns (res, nil): the write-path callers re-check
-			// RowsAffected and decide which errors abort.
+			// The hook sees the failure; callers re-check RowsAffected themselves.
 			hookErr = aerr
 		}
 	}
@@ -353,8 +299,6 @@ func run(
 	return res, err
 }
 
-// runAffected executes a write through run and reports its affected-row
-// count; the write paths branch on that count, never on the raw Result.
 func runAffected(
 	ctx context.Context,
 	q Queryer,
@@ -371,11 +315,7 @@ func runAffected(
 }
 
 // runQuery executes a row-returning statement through the shared pipeline.
-// The statement — and the row consumption its context governs — runs under
-// the context BeforeQuery returned (hooks.go). The returned finish callback
-// (nil without hooks — the hot path stays allocation-free) fires AfterQuery
-// once the rows are consumed, so hooks see scan errors, the returned row
-// count, and a duration that includes row consumption.
+// The finish callback (nil without hooks) must fire once the rows are consumed.
 func runQuery(
 	ctx context.Context,
 	q Queryer,
@@ -387,9 +327,8 @@ func runQuery(
 	return runQueryPhase(ctx, q, "", op, model, sqlText, args)
 }
 
-// runQueryPhase is runQuery for the secondary statements a logical operation
-// issues — preloads, WithCount queries, write probes — labeled so hooks can
-// group them under the main statement.
+// runQueryPhase is runQuery with a phase label for derived statements
+// (preloads, counts, write probes).
 func runQueryPhase(
 	ctx context.Context,
 	q Queryer,
@@ -425,9 +364,6 @@ func runQueryPhase(
 	return rs, finish, nil
 }
 
-// oneIf converts a single-row outcome into its consumed-row count: one when
-// the row was scanned, zero otherwise (a miss consumed nothing, and a failed
-// scan's count is not meaningful).
 func oneIf(scanned bool) int64 {
 	if scanned {
 		return 1
@@ -435,23 +371,24 @@ func oneIf(scanned bool) int64 {
 	return 0
 }
 
-// finishQuery fires a runQuery finish callback, tolerating the no-hook nil.
-// returned is the consumed row count. A miss (ErrNotFound) is a successfully
-// executed query, not a failure — telemetry would otherwise count every
-// First/Find miss as an error.
+// missIsSuccess scrubs ErrNotFound from hook reporting: a miss is a
+// successfully executed query, not a failure.
+func missIsSuccess(err error) error {
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	return err
+}
+
 func finishQuery(finish func(error, int64), err error, returned int64) {
 	if finish == nil {
 		return
 	}
-	if errors.Is(err, ErrNotFound) {
-		err = nil
-	}
-	finish(err, returned)
+	finish(missIsSuccess(err), returned)
 }
 
-// relStatement is one derived statement of a relation-loading layer — a
-// preload or count query — carrying its consumer. consume owns draining and
-// closing the rows and reports the consumed row count for hooks.
+// relStatement is one derived relation-loading statement; consume owns
+// draining and closing the rows.
 type relStatement struct {
 	phase   string
 	model   string
@@ -460,14 +397,26 @@ type relStatement struct {
 	consume func(rows) (int64, error)
 }
 
-// runRelStatements executes one layer's derived statements: in a single
-// driver round trip when the channel batches (NativeBatcher), one by one
-// otherwise. Semantics are identical either way — the same per-statement
-// hook events, the same first-error-stops contract.
+// runRelLayer runs a relation layer's statements first, then its finishes,
+// so nested layers start only once their parents' buffers are complete.
+func runRelLayer(ctx context.Context, q Queryer, stmts []relStatement, finishes []func(context.Context) error) error {
+	if err := runRelStatements(ctx, q, stmts); err != nil {
+		return err
+	}
+	for _, finish := range finishes {
+		if err := finish(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// runRelStatements executes a layer's statements — one round trip on a
+// batching channel, sequential otherwise; the first error stops either way.
 func runRelStatements(ctx context.Context, q Queryer, stmts []relStatement) error {
 	if be, ok := q.eng().(batchEngine); ok && len(stmts) > 1 {
-		if err, handled := runRelBatch(ctx, q, be, stmts); handled {
-			return err
+		if b, ok := be.batcher(); ok {
+			return runRelBatch(ctx, q, b, stmts)
 		}
 	}
 	for i := range stmts {
@@ -485,12 +434,9 @@ func runRelStatements(ctx context.Context, q Queryer, stmts []relStatement) erro
 	return nil
 }
 
-// runRelBatch is the batched leg. Hooks still see one event per statement;
-// since the round trip is shared, every BeforeQuery fires before the send and
-// their contexts chain into the one execution context — a tracing span from
-// any hook covers the whole batch — and each Duration runs from the send to
-// that statement's consumption.
-func runRelBatch(ctx context.Context, q Queryer, be batchEngine, stmts []relStatement) (error, bool) {
+// runRelBatch is the batched leg; hooks still get one Before/After pair per
+// statement, every BeforeQuery chained before the shared send.
+func runRelBatch(ctx context.Context, q Queryer, b NativeBatcher, stmts []relStatement) error {
 	cfg := q.conf()
 	d := q.gram().d
 	batch := make([]BatchStatement, len(stmts))
@@ -508,13 +454,10 @@ func runRelBatch(ctx context.Context, q Queryer, be batchEngine, stmts []relStat
 		}
 	}
 	start := time.Now()
-	res, ok, err := be.queryBatch(hctx, batch)
-	if !ok {
-		return nil, false
-	}
+	res, err := b.QueryBatch(hctx, batch)
 	after := func(i int, err error, n int64) {
 		if evs != nil {
-			cfg.afterQuery(hctx, evs[i], start, err, -1, n)
+			cfg.afterQuery(hctx, evs[i], start, missIsSuccess(err), -1, n)
 		}
 	}
 	if err != nil {
@@ -522,9 +465,10 @@ func runRelBatch(ctx context.Context, q Queryer, be batchEngine, stmts []relStat
 		for i := range stmts {
 			after(i, err, -1)
 		}
-		return err, true
+		return err
 	}
 	var firstErr error
+	var nrw nativeRows // consume closes it, so one adapter serves every statement
 	consumed := 0
 	for i := range stmts {
 		nr, done, rerr := res.Rows()
@@ -535,7 +479,8 @@ func runRelBatch(ctx context.Context, q Queryer, be batchEngine, stmts []relStat
 			firstErr = translateErr(rerr, cfg, d)
 			break
 		}
-		n, cerr := stmts[i].consume(&nativeRows{nr: nr})
+		nrw.nr = nr
+		n, cerr := stmts[i].consume(&nrw)
 		cerr = translateErr(cerr, cfg, d)
 		after(i, cerr, n)
 		consumed++
@@ -548,12 +493,11 @@ func runRelBatch(ctx context.Context, q Queryer, be batchEngine, stmts []relStat
 	if firstErr == nil {
 		firstErr = closeErr
 	}
-	// Statements the abort skipped still close their events, so hooks stay
-	// paired; they carry the batch's failure.
-	for i := consumed; i < len(stmts); i++ {
-		if firstErr != nil {
+	if firstErr != nil {
+		// Skipped statements still close their events so hooks stay paired.
+		for i := consumed; i < len(stmts); i++ {
 			after(i, firstErr, -1)
 		}
 	}
-	return firstErr, true
+	return firstErr
 }

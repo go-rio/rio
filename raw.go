@@ -7,21 +7,18 @@ import (
 	"reflect"
 )
 
-// RawQuery is the escape hatch: hand-written SQL through the same rebind
-// pipeline, hooks, error translation, and scanner as everything else, into
-// any target shape — DTO structs, scalars, entities. Like builders it is a
-// connection-free value; placeholders are ? with IN (?) expansion.
+// RawQuery is hand-written SQL through the shared pipeline, scanning into any
+// target shape — DTO structs, scalars, entities. It is a connection-free
+// value; placeholders are ? with IN (?) expansion.
 type RawQuery[T any] struct {
 	sql  string
 	args []any
 }
 
-// Raw builds a raw query. Scanning into a struct matches by column name and
-// errors on result columns with no matching field: silently dropped data is
-// how schema drift hides. Scanning half an entity and then calling Update
-// writes zero values to the columns you did not select — project into DTOs.
-// The SQL text is used verbatim; never build it from untrusted input — dynamic
-// identifiers belong in column whitelists or rio.WriteColumns constants.
+// Raw builds a raw query. Struct scanning matches by column name and errors
+// on result columns with no matching field. Scanning half an entity and then
+// calling Update writes zero values to the unselected columns — project into
+// DTOs. The SQL is verbatim; never build it from untrusted input.
 func Raw[T any](sqlText string, args ...any) RawQuery[T] {
 	return RawQuery[T]{sql: sqlText, args: copyArgs(args)}
 }
@@ -56,7 +53,7 @@ func (r RawQuery[T]) First(ctx context.Context, db Queryer) (*T, error) {
 }
 
 // Sole returns the single row, ErrNotFound when none match, and
-// ErrMultipleRows when several do — same contract as Query.Sole.
+// ErrMultipleRows when several do.
 func (r RawQuery[T]) Sole(ctx context.Context, db Queryer) (*T, error) {
 	rows, err := r.scan(ctx, db, 2)
 	if err != nil {
@@ -71,13 +68,9 @@ func (r RawQuery[T]) Sole(ctx context.Context, db Queryer) (*T, error) {
 	return nil, ErrMultipleRows
 }
 
-// Rows streams the raw query's rows without materializing them, for result
-// sets too large to hold: for v, err := range Raw[T](...).Rows(ctx, db).
-// Iteration stops on the first error (yielded with a zero T) and the rows
-// close automatically, including on early break. Like All it scans scalars,
-// DTOs, or entities and holds the result to the same full-column-coverage rule
-// — a struct target missing a mapped column is an error, not a silent partial
-// scan.
+// Rows streams rows without materializing them. Iteration stops on the first
+// error (yielded with a zero T) and the rows close automatically, including
+// on early break. Struct targets follow All's full-column-coverage rule.
 func (r RawQuery[T]) Rows(ctx context.Context, db Queryer) iter.Seq2[T, error] {
 	return func(yield func(T, error) bool) {
 		var zero T
@@ -103,9 +96,6 @@ func (r RawQuery[T]) Rows(ctx context.Context, db Queryer) iter.Seq2[T, error] {
 			yield(zero, err)
 			return
 		}
-		// The per-column scan plan: a synthetic single column for scalars,
-		// else the entity's columns matched by name with full coverage
-		// enforced (namedFields) — the same shapes All scans.
 		drainRows(rows, finish, func() ([]*field, error) {
 			if scalar {
 				f, err := scalarField(tt)

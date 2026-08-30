@@ -14,14 +14,13 @@ type TableNamer interface {
 	TableName() string
 }
 
-// plan is the immutable mapping of one struct type. Plans are built once,
-// cached forever, and shared by every DB handle; nothing grammar-dependent
-// (table names as rendered SQL) lives here.
+// plan is the immutable mapping of one struct type, cached and shared by
+// every DB handle; nothing grammar-dependent lives here.
 type plan struct {
 	typ           reflect.Type
 	structName    string
 	tableOverride string // from TableName(), "" otherwise
-	defaultTable  string // convention-derived, pre-computed
+	defaultTable  string // convention-derived
 
 	fields    []*field
 	byColumn  map[string]*field
@@ -33,10 +32,8 @@ type plan struct {
 	created   *field
 	updated   *field
 
-	// Precomputed insert partitions. Without omitzero columns the per-row
-	// partition depends only on whether the auto-increment PK participates,
-	// so both shapes are fixed at plan time: every column (allBits), or
-	// every column but the skipped PK (insCols/insBack/insBits).
+	// Precomputed insert partitions: every column (allBits), or every column
+	// but the auto-increment PK (insCols/insBack/insBits).
 	insCols     []*field
 	insBack     []*field
 	allBits     uint64
@@ -65,9 +62,8 @@ type field struct {
 	code fieldCodec // scan/bind strategy, decided once at plan time
 }
 
-// relField is a relation declaration. Target plan and key resolution are
-// deferred to first use: eager resolution would recurse forever on mutually
-// referencing models (User ↔ Post).
+// relField is a relation declaration. Resolution is deferred to first use:
+// eager resolution would recurse on mutually referencing models.
 type relField struct {
 	name   string
 	kind   relKind
@@ -121,11 +117,9 @@ func (p *plan) addFields(t reflect.Type) error {
 	var raw []rawField
 	collectFields(t, nil, 0, &raw, &errs)
 
-	// Go shadowing semantics, matching encoding/json: for one Go field name
-	// the shallowest declaration wins — even a rio:"-" or renamed winner
-	// shadows deeper same-named fields entirely, because that is the field a
-	// selector resolves to. Two at the shallowest depth are inaccessible in
-	// Go (ambiguous selector); json drops both silently, rio refuses loudly.
+	// Shadowing matches encoding/json: for one Go field name the shallowest
+	// declaration wins, even a rio:"-" or renamed one. Two at the same
+	// shallowest depth are a Go ambiguous selector; rio rejects them.
 	type nameState struct {
 		winner int // index into raw of the shallowest occurrence
 		clash  int // second occurrence at the same depth, -1 when unique
@@ -146,7 +140,7 @@ func (p *plan) addFields(t reflect.Type) error {
 		}
 	}
 
-	var idConv *field // the ID-convention candidate, decided once all fields exist
+	var idConv *field // ID-convention candidate, decided after all fields exist
 	for i := range raw {
 		r := &raw[i]
 		st := names[r.sf.Name]
@@ -160,20 +154,19 @@ func (p *plan) addFields(t reflect.Type) error {
 			continue
 		}
 		if st.winner != i {
-			continue // shadowed by a shallower field, exactly as a Go selector resolves
+			continue // shadowed by a shallower field
 		}
 		if r.opts.skip {
 			continue
 		}
 		if r.flatten {
-			// A role tag on a flattened embed would silently vanish — a pk
-			// that never became a key — so it is a plan error, not a no-op.
+			// A role tag on a flattened embed would silently vanish.
 			if opt := roleOptName(r.opts); opt != "" {
 				errs = append(errs, fmt.Errorf(
 					"field %s: %s does not apply to a flattened embedded struct; tag the embedded type's fields",
 					r.sf.Name, opt))
 			}
-			continue // flattened embeds contributed their inner fields in collect
+			continue // inner fields already collected
 		}
 		sf, tag, opts := r.sf, r.tag, r.opts
 
@@ -191,8 +184,7 @@ func (p *plan) addFields(t reflect.Type) error {
 			continue
 		}
 		if opts.countOf != "" {
-			// A count target is populated by WithCount, never mapped to a
-			// column of its own.
+			// Count targets are populated by WithCount, never mapped to a column.
 			if tag != "" {
 				errs = append(errs, fmt.Errorf("field %s: countof targets take no column name", sf.Name))
 				continue
@@ -221,10 +213,8 @@ func (p *plan) addFields(t reflect.Type) error {
 			continue
 		}
 		if sf.Anonymous && !sf.IsExported() {
-			// A tag kept this embedded field out of the flatten path, so it is
-			// about to map to a column of its own — but reflect refuses
-			// Interface() on unexported embedded fields, and binding would
-			// panic on the first write. Flattening is the only supported use.
+			// reflect refuses Interface() on unexported embedded fields;
+			// binding would panic on the first write.
 			errs = append(errs, fmt.Errorf(
 				"field %s: an unexported embedded type cannot map to a column itself; "+
 					"export the type or use an exported named field",
@@ -255,10 +245,8 @@ func (p *plan) addFields(t reflect.Type) error {
 		}
 		if !opts.noStamp && !opts.softDelete && !opts.version &&
 			(sf.Type == timeType || sf.Type == timePtrType) {
-			// The CreatedAt/UpdatedAt convention is name-based, so an explicit
-			// role tag wins. *time.Time is accepted like softdelete —
-			// setTime/stampForInsert maintain the pointer form, so it must
-			// not silently go unstamped.
+			// The CreatedAt/UpdatedAt convention is name-based; an explicit
+			// role tag wins. *time.Time is stamped too.
 			switch sf.Name {
 			case "CreatedAt":
 				f.isCreated = true
@@ -286,10 +274,8 @@ func (p *plan) addFields(t reflect.Type) error {
 		f.code = codec
 	}
 
-	// The ID primary-key convention survives role-neutral tags (a rename,
-	// omitzero, noautoincr): it yields only to an explicit pk tag — on ID
-	// itself or on any other field — or to a tag assigning an incompatible
-	// role, filtered out of the candidate above.
+	// The ID primary-key convention survives role-neutral tags; it yields
+	// only to an explicit pk tag or an incompatible role.
 	if idConv != nil {
 		explicit := false
 		for _, f := range p.fields {
@@ -322,9 +308,6 @@ func (p *plan) classify() []error {
 				reflect.Uint, reflect.Uint32, reflect.Uint64:
 				// wide enough: version = version + 1 forever
 			case reflect.Int8, reflect.Int16, reflect.Uint8, reflect.Uint16:
-				// The database wraps the column at 127/255/32767/… while the
-				// struct keeps counting, so every later optimistic Update
-				// misses and reports ErrStaleObject.
 				errs = append(errs, fmt.Errorf(
 					"version field %s is %s, too narrow to count updates "+
 						"(wraps at its maximum and then reports ErrStaleObject forever); use int64",
@@ -361,10 +344,8 @@ func (p *plan) classify() []error {
 	}
 	for _, f := range p.fields {
 		if f.isPK || f.isCreated || f.isVersion || f.isSoftDelete {
-			// The softdelete column is excluded like the other rio-maintained
-			// columns: a full-column Update from a stale live struct would
-			// write deleted_at back to NULL and silently resurrect the row.
-			// Delete/Restore/ForceDelete are the only APIs that touch it.
+			// Softdelete stays out of updatable: a full-column Update would
+			// write deleted_at back to NULL and resurrect the row.
 			continue
 		}
 		p.updatable = append(p.updatable, f)
@@ -442,25 +423,21 @@ func buildPlan(t reflect.Type) (*plan, error) {
 	if err := errors.Join(errs...); err != nil {
 		return nil, fmt.Errorf("rio: invalid model %s: %w", t.Name(), err)
 	}
-	// Only valid models teach notLoadedPanic their relation field names —
-	// registering earlier would let a rejected model shape poison the hint.
+	// Only valid models register: a rejected shape must not poison the hint.
 	for name, rf := range p.rels {
 		registerRelFieldName(t.FieldByIndex(rf.index).Type, name)
 	}
 	return p, nil
 }
 
-// collectFields gathers the raw field set depth-first. Only tag syntax errors
-// are reported here; role and mapping validation waits until shadowing has
-// decided which fields exist at all.
+// collectFields gathers the raw field set depth-first; only tag syntax
+// errors are reported here — the rest waits for shadowing resolution.
 func collectFields(t reflect.Type, prefix []int, baseOffset uintptr, raw *[]rawField, errs *[]error) {
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
 		if !sf.IsExported() {
-			// An embedded struct promotes its exported fields even when the
-			// embedded type's own name is unexported — encoding/json flattens
-			// these too, and silently dropping mapped columns is exactly the
-			// surprise rio refuses. Genuinely private fields stay skipped.
+			// Unexported embedded structs still promote exported fields (as
+			// encoding/json does); genuinely private fields stay skipped.
 			embeddedStruct := sf.Anonymous && (sf.Type.Kind() == reflect.Struct ||
 				(sf.Type.Kind() == reflect.Pointer && sf.Type.Elem().Kind() == reflect.Struct))
 			if !embeddedStruct {
@@ -477,9 +454,8 @@ func collectFields(t reflect.Type, prefix []int, baseOffset uintptr, raw *[]rawF
 			sf: sf, owner: t, index: index, offset: baseOffset + sf.Offset,
 			tag: tag, opts: opts,
 
-			// Anonymous value structs flatten into the parent unless a tag makes
-			// them a column. The embedded field still occupies its Go name: it
-			// shadows, and is shadowed like, any other field.
+			// Anonymous value structs flatten unless a tag makes them a column;
+			// the field still shadows, and is shadowed, by its Go name.
 			flatten: sf.Anonymous && !opts.skip && tag == "" && !opts.json &&
 				sf.Type.Kind() == reflect.Struct && sf.Type != timeType && !isRelContainer(sf.Type)}
 		*raw = append(*raw, r)

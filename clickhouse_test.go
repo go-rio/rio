@@ -11,10 +11,8 @@ import (
 	"time"
 )
 
-// This file freezes the ClickHouse dialect's public behavior: the supported
-// surface byte for byte, and the rejected surface message for message with
-// proof that no SQL was sent. The three older dialects' goldens live in their
-// existing tests and must never move because of anything here.
+// This file freezes the ClickHouse dialect's public behavior: golden SQL for
+// the supported surface, exact rejection messages with proof no SQL was sent.
 
 // chTS is testNow under chTimeFormat — what every stamped column binds.
 const chTS = "2026-07-09 12:00:00.000000+00:00"
@@ -68,9 +66,7 @@ func TestClickHouseBareOffset(t *testing.T) {
 	}
 }
 
-// Insert on ClickHouse: every column binds (the explicit ID included), no
-// RETURNING, and nothing backfills — the fake's LastInsertId of 1 must not
-// leak into the struct.
+// Insert on ClickHouse binds every column (explicit ID included), no RETURNING, no backfill.
 func TestClickHouseInsertGolden(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -117,8 +113,7 @@ func TestClickHouseInsertAllGolden(t *testing.T) {
 	}
 }
 
-// maxBindParams is 8192 on ClickHouse: a 1025-row insert of the 8-column User
-// (8192/8 = 1024 rows per statement) must split into exactly two statements.
+// maxBindParams 8192 / 8 User columns = 1024 rows per statement, so 1025 rows split into two.
 func TestClickHouseInsertAllChunksAt8192(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -140,8 +135,7 @@ func TestClickHouseInsertAllChunksAt8192(t *testing.T) {
 	}
 }
 
-// The noautoincr escape hatch keeps working: zero is a real value there, and
-// the zero-ID rejection must not fire.
+// noautoincr makes zero a real value; the zero-ID rejection must not fire.
 func TestClickHouseNoAutoIncrZeroIDInserts(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -297,9 +291,7 @@ func TestClickHouseFinalGolden(t *testing.T) {
 	}
 }
 
-// Final does not propagate into preload statements: those are independent
-// SELECTs with no propagation rule worth guessing (RelFinal is a deliberate
-// non-feature for now).
+// Final does not propagate into preload statements (RelFinal is a deliberate non-feature).
 func TestClickHouseFinalDoesNotPropagateToPreload(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -329,8 +321,7 @@ func TestClickHouseFinalReusableQuery(t *testing.T) {
 		t.Fatalf("reusable Query must render FINAL: %s", got)
 	}
 
-	// The same Query renders per grammar: on postgres it errors at first use,
-	// consistent with "Must passing does not mean execution cannot fail".
+	// The same Query renders per grammar: on postgres it errors at first use.
 	fpg := newFakeDB()
 	pg := fpg.open(Postgres)
 	_, err := q.All(ctx, pg, 1)
@@ -364,8 +355,7 @@ func TestFinalRejectedPerDialect(t *testing.T) {
 
 // --- rejected surface: exact messages, zero SQL sent ---
 
-// requireRejected asserts the exact rejection text and that nothing reached
-// the driver — the rejection layer must sit before any SQL is sent.
+// requireRejected asserts the exact rejection text and that nothing reached the driver.
 func requireRejected(t *testing.T, f *fakeDB, err error, want string) {
 	t.Helper()
 	if err == nil || err.Error() != want {
@@ -484,11 +474,7 @@ func TestClickHouseRejectionMatrix(t *testing.T) {
 	}
 }
 
-// TestCapabilityRejectionsAreErrUnsupported wires dialect-capability
-// rejections to errors.ErrUnsupported, so callers branch on the stdlib
-// sentinel instead of matching message text (the text itself is unchanged and
-// still asserted by TestClickHouseRejectionMatrix). Validation errors such as
-// ErrMissingWhere stay outside the family.
+// Capability rejections answer to errors.ErrUnsupported; validation errors stay outside the family.
 func TestCapabilityRejectionsAreErrUnsupported(t *testing.T) {
 	ctx := context.Background()
 	u := &User{ID: 5, Email: "a@x", Version: 1}
@@ -519,9 +505,7 @@ func TestCapabilityRejectionsAreErrUnsupported(t *testing.T) {
 		}
 	})
 
-	// Negative: a missing-conditions guard is a validation error, not a
-	// capability rejection — it fires before the dialect check and must not
-	// answer to errors.ErrUnsupported.
+	// Negative: ErrMissingWhere is validation, not a capability rejection.
 	t.Run("MissingWhereNotUnsupported", func(t *testing.T) {
 		_, err := From[User]().UpdateAll(ctx, newFakeDB().open(ClickHouse), Set{"age": 1})
 		if !errors.Is(err, ErrMissingWhere) {
@@ -556,8 +540,7 @@ func TestClickHouseForUpdateRejected(t *testing.T) {
 	requireRejected(t, f, err, want)
 }
 
-// All-defaults inserts have no ClickHouse spelling: no DEFAULT VALUES
-// statement exists.
+// ClickHouse has no DEFAULT VALUES statement.
 func TestClickHouseAllDefaultsInsertRejected(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -583,9 +566,7 @@ func TestClickHouseStmtCachePanics(t *testing.T) {
 	newFakeDB().openWith(ClickHouse, WithStmtCache())
 }
 
-// ForUpdate on the count shape stays elided on every dialect (aggregates
-// lock nothing); ClickHouse's rejection therefore applies to row and exists
-// shapes only — pinned here so the cross-dialect invariant does not drift.
+// ForUpdate on the count shape is elided on every dialect, so ClickHouse's rejection never fires there.
 func TestClickHouseForUpdateCountStillElides(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -607,8 +588,7 @@ func TestClickHouseQuestionEscape(t *testing.T) {
 	db := f.open(ClickHouse)
 	f.queueRows([]string{"v"}, []driver.Value{"y"})
 
-	// The ternary operator's ? must reach the server as a literal: the user
-	// writes ??, rio emits the driver's \? escape, the driver un-escapes.
+	// The user writes ??, rio emits the driver's \? escape, the driver un-escapes to a literal ?.
 	_, err := Raw[string]("SELECT age > ? ?? 'y' : 'n' FROM t", 1).All(ctx, db)
 	if err != nil {
 		t.Fatalf("All: %v", err)
@@ -619,8 +599,7 @@ func TestClickHouseQuestionEscape(t *testing.T) {
 	}
 }
 
-// A hand-written \? is already the driver's literal-? escape: it passes
-// through, consumes no argument, and the accounting matches the driver's.
+// A hand-written \? passes through and consumes no argument.
 func TestClickHouseBackslashQuestionPassthrough(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -666,8 +645,7 @@ func TestClickHouseDriverBlindRegionsRejected(t *testing.T) {
 			"or bind the value as an argument")
 }
 
-// Argument-free statements pass those same regions untouched: the driver
-// skips its binder entirely when no arguments ride along.
+// Argument-free statements pass the blind regions untouched (the driver skips its binder).
 func TestClickHouseDriverBlindRegionsPassWithoutArgs(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -687,8 +665,7 @@ func TestClickHouseDriverBlindRegionsPassWithoutArgs(t *testing.T) {
 	}
 }
 
-// ClickHouse's # comments only exist before a space or '!' — `#x` is a
-// server-side lexer error, so its trailing ? stays a live placeholder.
+// A # comment needs a following space or '!'; the ? after a bare #x stays live.
 func TestClickHouseHashCommentRules(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -710,8 +687,7 @@ func TestClickHouseHashCommentRules(t *testing.T) {
 	}
 }
 
-// Backslashes escape inside every ClickHouse quote flavor — a ? behind an
-// escaped quote must stay quoted, not become a placeholder.
+// Backslashes escape inside every quote flavor; a ? behind an escaped quote stays quoted.
 func TestClickHouseQuotedRegionEscapes(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -754,8 +730,7 @@ func TestClickHouseTimeFormatRoundTrip(t *testing.T) {
 	if bound != "2024-01-02 03:04:05.123456+00:00" {
 		t.Fatalf("bindTime: %s", bound)
 	}
-	// The emitted text parses back to the same instant through rio's own
-	// scan formats — a full write/read round trip stays Equal.
+	// The emitted text parses back to the same instant through rio's own scan formats.
 	parsed, err := parseTime(bound, &field{column: "at"})
 	if err != nil {
 		t.Fatalf("parse back: %v", err)

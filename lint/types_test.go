@@ -12,8 +12,7 @@ func col(t reflect.Type, json bool) rio.ColumnSchema {
 	return rio.ColumnSchema{GoType: t, JSON: json}
 }
 
-// The verdict table splits three ways: a matching class confirms, a known
-// type in the wrong class refutes, and anything else stays silent.
+// A matching class confirms, a known type in the wrong class refutes, anything else stays silent.
 func TestVerdictFor(t *testing.T) {
 	i64 := col(reflect.TypeFor[int64](), false)
 	str := col(reflect.TypeFor[string](), false)

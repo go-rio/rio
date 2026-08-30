@@ -19,8 +19,7 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-// Real-network MySQL benchmarks, same three legs and five shapes as the
-// SQLite file. Gated on RIO_BENCH_MYSQL_DSN so `go test ./...` stays hermetic:
+// Real-network MySQL benchmarks, gated on RIO_BENCH_MYSQL_DSN:
 //
 //	docker run -d --name rio-bench-mysql -e MYSQL_ROOT_PASSWORD=bench \
 //	  -e MYSQL_DATABASE=bench -p 13306:3306 mysql:8.4 \
@@ -28,10 +27,8 @@ import (
 //	RIO_BENCH_MYSQL_DSN='root:bench@tcp(127.0.0.1:13306)/bench?parseTime=true' \
 //	  go test -bench MySQL -benchmem -run NONE ./...
 //
-// All three legs share go-sql-driver/mysql (default DSN options beyond
-// parseTime=true, which rio requires and GORM recommends), so the delta is
-// ORM overhead. The GORM leg runs GORM's default configuration — PrepareStmt
-// off — plus QueryFields to select explicit columns like rio does.
+// All legs share go-sql-driver/mysql, so the delta is ORM overhead; the GORM
+// leg runs defaults plus QueryFields.
 const mysqlDDL = `CREATE TABLE bench_users (
 	id BIGINT AUTO_INCREMENT PRIMARY KEY,
 	email VARCHAR(191) NOT NULL,
@@ -106,9 +103,8 @@ func BenchmarkMySQLReadOne_Rio(b *testing.B) {
 	}
 }
 
-// BenchmarkMySQLReadOne_RioStmtCache measures rio.WithStmtCache on MySQL.
-// go-sql-driver runs every parameterized query as prepare+execute (two
-// blocking round-trips); a cached prepared statement drops that to one.
+// BenchmarkMySQLReadOne_RioStmtCache: go-sql-driver runs each query as
+// prepare+execute; a cached statement drops two round-trips to one.
 func BenchmarkMySQLReadOne_RioStmtCache(b *testing.B) {
 	raw := benchMySQLRaw(b)
 	seedMySQL(b, raw, 100)

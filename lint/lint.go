@@ -1,15 +1,10 @@
-// Package lint compares rio model expectations against a live database
-// schema and reports the drift — missing tables and columns, nullability
-// and primary-key disagreements, and type mismatches the dialect's
-// equivalence classes can rule on.
+// Package lint compares rio model expectations against a live database schema
+// and reports the drift: missing tables/columns, nullability and primary-key
+// disagreements, and type mismatches the dialect's equivalence classes can rule on.
 //
-// Check is read-only: it issues introspection queries and never touches the
-// schema. It reports only what it can decide — a database type outside the
-// known equivalence classes produces no finding rather than a guess. It
-// covers the PostgreSQL, MySQL, and SQLite dialects; ClickHouse's
-// read-and-append surface has its own toolchain and is out of scope. Table
-// names are taken as unqualified (the connection's current schema/database);
-// schema-qualified TableName overrides are not introspected yet.
+// Check is read-only and reports only what it can decide. It covers PostgreSQL,
+// MySQL, and SQLite, and takes table names as unqualified (the connection's
+// current schema/database).
 package lint
 
 import (

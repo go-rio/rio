@@ -49,23 +49,17 @@ func WithErrorTranslator(f func(error) error) Option {
 	return func(c *config) { c.translator = f }
 }
 
-// WithTableNamer overrides conventional table names for this handle. A model's
-// TableName method takes precedence, and SQL caches remain handle-specific.
-//
-// The function must be a pure, stable mapping: rendered SQL is cached per
-// handle, so a namer that reads mutable state (a request-scoped tenant
-// variable) would leave earlier shapes pointing at the old names. Dynamic
-// tenancy is a handle decision — construct one *DB per naming universe and
-// pick at the call site, exactly as with read/write splitting.
+// WithTableNamer overrides conventional table names for this handle; a
+// model's TableName method still takes precedence. The function must be a
+// pure, stable mapping — rendered SQL is cached per handle — so for dynamic
+// tenancy construct one *DB per naming universe.
 func WithTableNamer(f func(structName string) string) Option {
 	return func(c *config) { c.tableNamer = f }
 }
 
-// WithDriverHandle attaches a driver-owned handle (a connection pool the
-// driver module built the *sql.DB over) to the DB, retrievable through
-// DB.DriverHandle. It exists for driver modules: their typed accessors
-// (postgres.PoolOf) read it back, and the handle's lifecycle rides on the DB
-// instead of a package-level registry. rio itself never touches the value.
+// WithDriverHandle attaches a driver-owned handle to the DB, retrievable
+// through DB.DriverHandle. rio never touches the value; it exists for driver
+// modules' typed accessors.
 func WithDriverHandle(h any) Option {
 	return func(c *config) { c.driverHandle = h }
 }
@@ -75,11 +69,11 @@ func WithoutArgs() Option {
 	return func(c *config) { c.logArgs = false }
 }
 
-// WithStmtCache enables bounded prepared-statement caches. The DB and each
-// transaction own separate caches; transactions never share the DB cache. It
-// is off by default and unsuitable for transaction/statement-mode poolers.
-// Schema-change errors evict entries and are not retried. New panics if this
-// option is used with ClickHouse, which cannot prepare general queries.
+// WithStmtCache enables bounded prepared-statement caches; the DB and each
+// transaction own separate caches. Off by default; unsuitable for
+// transaction/statement-mode poolers. Schema-change errors evict entries and
+// are not retried. New panics if used with ClickHouse, which cannot prepare
+// general queries.
 func WithStmtCache(capacity ...int) Option {
 	return func(c *config) {
 		c.stmtCache = true
@@ -94,10 +88,8 @@ type grammar struct {
 	d          Dialect
 	tableNamer func(string) string
 
-	// weakSelf keys Must-query render caches without pinning the grammar:
-	// a package-level Query outlives any one handle, and a strong key would
-	// keep every closed handle's grammar — and its crud cache — reachable
-	// forever. Made once here so the hot path never calls weak.Make.
+	// weakSelf keys package-level render caches without pinning closed
+	// handles' grammars; made once so the hot path never calls weak.Make.
 	weakSelf weak.Pointer[grammar]
 
 	// crud caches rendered entity-CRUD SQL by crudKey.
@@ -139,8 +131,7 @@ func (g *grammar) cachedSQL(
 	return actual.(string), nil
 }
 
-// table resolves a plan's table name under this grammar: a TableName()
-// override always wins, then the handle's namer, then convention.
+// table resolves a plan's table name: override, then namer, then convention.
 func (g *grammar) table(p *plan) string {
 	if p.tableOverride != "" {
 		return p.tableOverride

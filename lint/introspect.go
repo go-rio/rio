@@ -15,9 +15,8 @@ type dbColumn struct {
 	pk       bool
 }
 
-// An introspector lists a table's columns; found is false when the table
-// does not exist. Queries run through rio's own Raw pipeline, so the ?
-// placeholder rebinds per dialect like everything else.
+// An introspector lists a table's columns; found is false when the table does
+// not exist. Queries run through rio's Raw pipeline, so ? rebinds per dialect.
 type introspector func(ctx context.Context, db *rio.DB, table string) (cols []dbColumn, found bool, err error)
 
 var introspectors = map[rio.Dialect]introspector{
@@ -111,8 +110,7 @@ func introspectSQLite(ctx context.Context, db *rio.DB, table string) ([]dbColumn
 		out = append(out, dbColumn{
 			name:     r.Name,
 			dataType: strings.ToLower(r.Type),
-			// An INTEGER PRIMARY KEY is the rowid: NOT NULL in effect even
-			// though pragma reports notnull=0.
+			// An INTEGER PRIMARY KEY is the rowid: NOT NULL in effect though pragma reports notnull=0.
 			nullable: r.Notnull == 0 && r.Pk == 0,
 			pk:       r.Pk > 0,
 		})

@@ -2,10 +2,8 @@ package rio
 
 import "testing"
 
-// The golden tables below freeze the inflector's published behavior; they
-// are a compatibility promise, so entries are only ever appended, never
-// edited. A model that dislikes a derived name overrides it with a tag,
-// TableName, or WithTableNamer — not by changing the rules.
+// The golden tables freeze the inflector's published behavior — a compatibility
+// promise, so entries are only ever appended, never edited.
 
 func TestSnakeCase(t *testing.T) {
 	golden := []struct {
@@ -160,10 +158,7 @@ func TestTableName(t *testing.T) {
 	}
 }
 
-// FuzzSnakeCase checks the safety properties snakeCase promises for
-// arbitrary input, not just Go identifiers: the output never contains a
-// byte outside [a-z0-9_], the function never panics, and it is idempotent,
-// so feeding a derived name back through the inflector is harmless.
+// snakeCase must emit only [a-z0-9_], never panic, and be idempotent on arbitrary input.
 func FuzzSnakeCase(f *testing.F) {
 	for _, seed := range []string{
 		"",

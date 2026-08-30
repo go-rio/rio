@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -14,10 +15,8 @@ import (
 // generated keys only where ordering is reliable; omitzero does not apply.
 //
 // On a native channel whose driver streams bulk loads (go-rio/postgres via
-// COPY), an explicit-key batch — no generated keys to backfill — goes
-// through the copy protocol instead: one exchange, atomic as a whole, and
-// several times faster at scale. Values bind through the same encoding
-// either way.
+// COPY), an explicit-key batch goes through the copy protocol instead: one
+// exchange, atomic as a whole, values bound through the same encoding.
 func InsertAll[T any](ctx context.Context, db Queryer, rows []T) error {
 	if len(rows) == 0 {
 		return nil
@@ -56,16 +55,12 @@ func InsertAll[T any](ctx context.Context, db Queryer, rows []T) error {
 	}
 
 	bn := binder{d: d, now: now}
-	if !backfill {
-		if ce, ok := db.eng().(copyEngine); ok {
-			if done, err := copyInsertAll(ctx, db, ce, p, cols, rows, &bn); done {
-				return err
-			}
+	if ce, ok := db.eng().(copyEngine); ok && !backfill {
+		if c, ok := ce.copier(); ok {
+			return copyInsertAll(ctx, db, c, p, cols, rows, &bn)
 		}
 	}
 	chunk := max(d.caps().maxBindParams/len(cols), 1)
-	// Size by the actual batch: a full chunk on PG/MySQL is 65535 binds, and
-	// a three-row insert should not pay a ~1 MiB buffer for it.
 	args := make([]any, 0, min(chunk, len(rows))*len(cols))
 	for start := 0; start < len(rows); start += chunk {
 		end := min(start+chunk, len(rows))
@@ -140,8 +135,6 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 	table := g.table(p)
 	bits, cacheable := setBits(p, cols)
 	bn := binder{d: d, now: now}
-	// Size by the actual batch, as in InsertAll: never a full-chunk buffer
-	// for a handful of rows.
 	args := make([]any, 0, min(chunk, len(rows))*len(cols))
 	for start := 0; start < len(rows); start += chunk {
 		end := min(start+chunk, len(rows))
@@ -187,65 +180,53 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 }
 
 // copyInsertAll streams an explicit-key batch through the channel's copy
-// protocol: one protocol exchange, atomic as a whole — the fast path COPY
-// exists for. done is false when the driver declined (no copier), sending
-// the caller down the chunked multi-VALUES path.
+// protocol: one exchange, atomic as a whole.
 func copyInsertAll[T any](
 	ctx context.Context,
 	db Queryer,
-	ce copyEngine,
+	c NativeCopier,
 	p *plan,
 	cols []*field,
 	rows []T,
 	bn *binder,
-) (done bool, err error) {
+) error {
 	g := db.gram()
 	colNames := make([]string, len(cols))
 	for i, f := range cols {
 		colNames[i] = f.column
 	}
+	// One reused row buffer: the SPI contract makes each returned slice
+	// valid only until the next call.
+	vals := make([]any, 0, len(cols))
 	i := 0
 	next := func() ([]any, error) {
 		if i >= len(rows) {
 			return nil, nil
 		}
-		rv := reflect.ValueOf(&rows[i]).Elem()
-		base := rv.Addr().UnsafePointer()
-		vals := make([]any, len(cols))
-		for c, f := range cols {
-			v, err := fieldValue(f, base, rv, bn)
-			if err != nil {
-				return nil, err
-			}
-			vals[c] = v
+		var err error
+		if vals, err = bindRowArgs(vals[:0], rows[i:i+1], cols, bn); err != nil {
+			return nil, err
 		}
 		i++
 		return vals, nil
 	}
 	cfg := db.conf()
 	table := g.table(p)
+	segments := strings.Split(table, ".")
 	if len(cfg.hooks) == 0 {
-		n, ok, err := ce.copyIn(ctx, table, colNames, next)
-		if !ok {
-			return false, nil
-		}
-		_ = n
-		return true, translateErr(err, cfg, g.d)
+		_, err := c.CopyIn(ctx, segments, colNames, next)
+		return translateErr(err, cfg, g.d)
 	}
 	ev := &QueryEvent{Op: "copy", Model: p.structName, Query: "COPY " + table}
 	hctx := cfg.beforeQuery(ctx, ev)
 	start := time.Now()
-	n, ok, err := ce.copyIn(hctx, table, colNames, next)
-	if !ok {
-		return false, nil
-	}
+	n, err := c.CopyIn(hctx, segments, colNames, next)
 	err = translateErr(err, cfg, g.d)
-	affected := n
 	if err != nil {
-		affected = -1
+		n = -1
 	}
-	cfg.afterQuery(hctx, ev, start, err, affected, -1)
-	return true, err
+	cfg.afterQuery(hctx, ev, start, err, n, -1)
+	return err
 }
 
 // batchColumns requires generated keys to be either all zero or all explicit.

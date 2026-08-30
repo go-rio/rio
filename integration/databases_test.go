@@ -43,11 +43,7 @@ func TestSQLiteV02Suite(t *testing.T) {
 	runHardDelete(t, db, "sqlite")
 }
 
-// sql.NullTime round-trips through a TEXT column: the write side binds rio's
-// own text encoding, and without a DATETIME decltype the driver hands the
-// text straight back — the read side must parse it, not delegate to
-// NullTime.Scan (which rejects strings). Storage parity with time.Time no
-// longer depends on the column's declared type.
+// sql.NullTime round-trips through a TEXT column without a DATETIME decltype.
 func TestSQLiteNullTimeTextColumnRoundTrip(t *testing.T) {
 	db := sqliteDB(t)
 	ctx := context.Background()
@@ -85,10 +81,7 @@ func TestSQLiteNullTimeTextColumnRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSQLiteRawRowsStream is a leak smoke for RawQuery.Rows: stream a few rows,
-// break early, and prove the connection was returned by running more work on
-// the same single-connection in-memory database afterwards — a leaked cursor
-// would wedge it.
+// RawQuery.Rows must release the connection on early break (single-conn DB).
 func TestSQLiteRawRowsStream(t *testing.T) {
 	db := sqliteDB(t)
 	ctx := context.Background()
@@ -105,8 +98,7 @@ func TestSQLiteRawRowsStream(t *testing.T) {
 		ID int64
 		N  int64
 	}
-	// Early break after two rows: RawQuery.Rows must close the underlying
-	// cursor on break.
+	// Break early after two rows.
 	var seen []int64
 	for r, err := range rio.Raw[streamRow]("SELECT id, n FROM stream_rows ORDER BY id").Rows(ctx, db) {
 		if err != nil {
@@ -121,14 +113,13 @@ func TestSQLiteRawRowsStream(t *testing.T) {
 		t.Fatalf("early-break stream: %v", seen)
 	}
 
-	// No leak: on a MaxOpenConns(1) in-memory DB a leaked cursor would block
-	// this forever. It returns, so Rows released the connection on break.
+	// A leaked cursor would block this forever on MaxOpenConns(1).
 	cnt, err := rio.Raw[int64]("SELECT count(*) FROM stream_rows").First(ctx, db)
 	if err != nil || cnt == nil || *cnt != 5 {
 		t.Fatalf("follow-up query after early break: cnt=%v err=%v", cnt, err)
 	}
 
-	// And a full drain still works and reads every row in order.
+	// Full drain still works.
 	full := 0
 	for r, err := range rio.Raw[streamRow]("SELECT id, n FROM stream_rows ORDER BY id").Rows(ctx, db) {
 		if err != nil {
@@ -164,10 +155,7 @@ func TestPostgresSuite(t *testing.T) {
 	runPostgresTextArray(t, db)
 }
 
-// TestPostgresNativeSuite replays the entire PostgreSQL suite through the
-// pgx-native channel (postgres.OpenNative): same DSN, same schema, same
-// assertions. The double run is the design's keystone test — every rio
-// semantic the stdlib channel passes must hold natively too.
+// The full PostgreSQL suite must hold identically on the pgx-native channel.
 func TestPostgresNativeSuite(t *testing.T) {
 	dsn := os.Getenv("RIO_POSTGRES_DSN")
 	if dsn == "" {
@@ -183,8 +171,7 @@ func TestPostgresNativeSuite(t *testing.T) {
 	runV03Sync(t, db, "postgres")
 	runHardening(t, db, "postgres")
 	runHardDelete(t, db, "postgres")
-	// jsonb holds natively too; the text[] wrapper is stdlib-only (native
-	// hands a bare Scanner the binary array wire format — see the runner).
+	// text[] wrapper is stdlib-only: native hands Scanners the binary wire format.
 	runPostgresJSONB(t, db)
 }
 
@@ -197,9 +184,7 @@ func TestMySQLSuite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// MySQL errors carry no probe-able interface, so precise translation is
-	// the driver module's job — github.com/go-rio/mysql installs this for
-	// you; here the suite drives the core directly and installs its own.
+	// The suite drives the core directly, so it installs its own MySQL error translator.
 	db := rio.New(raw, rio.MySQL, rio.WithErrorTranslator(func(err error) error {
 		var me *mysql.MySQLError
 		if !errors.As(err, &me) {
@@ -221,9 +206,7 @@ func TestMySQLSuite(t *testing.T) {
 	runHardDelete(t, db, "mysql")
 }
 
-// TestModerncTimeProbe pins how the modernc driver round-trips rio's own
-// time encoding. If a driver upgrade changes scan types or formats, this
-// fails before any user does.
+// Pins the modernc driver's round-trip of rio's time encoding across upgrades.
 func TestModerncTimeProbe(t *testing.T) {
 	db := sqliteDB(t)
 	ctx := t.Context()
@@ -249,8 +232,7 @@ func TestModerncTimeProbe(t *testing.T) {
 		t.Fatalf("time round-trip drifted: wrote %v, read %v", want, got.At)
 	}
 
-	// The stored text must be rio's own canonical format, parseable by
-	// SQLite's date functions — independent of driver time handling.
+	// Stored text must be rio's canonical format, parseable by SQLite date functions.
 	raw, err := rio.Raw[*string]("SELECT datetime(at) FROM probes WHERE id = 1").First(ctx, db)
 	if err != nil {
 		t.Fatalf("reading datetime(at): %v", err)
@@ -260,9 +242,7 @@ func TestModerncTimeProbe(t *testing.T) {
 	}
 }
 
-// Cursor pagination walks the whole set without gaps or repeats — heavy
-// ties on the leading key make the PK tie-breaker do real work, and every
-// page resumes through the string token round-trip.
+// Cursor pagination: no gaps or repeats under heavy leading-key ties.
 func TestSQLiteCursorPaginationWalk(t *testing.T) {
 	db := sqliteDB(t)
 	ctx := context.Background()
@@ -343,9 +323,7 @@ func TestSQLiteCursorPaginationWalk(t *testing.T) {
 	}
 }
 
-// The drift lint reads the live schema and reports exactly the decidable
-// disagreements: every finding kind fires once against a deliberately
-// skewed table, and a clean table reports nothing.
+// Every lint finding kind fires once against a skewed table; a clean table reports nothing.
 func TestSQLiteSchemaDriftLint(t *testing.T) {
 	db := sqliteDB(t)
 	ctx := context.Background()
@@ -408,10 +386,7 @@ func TestSQLiteSchemaDriftLint(t *testing.T) {
 	}
 }
 
-// The soft-delete state machine holds under arbitrary Delete/Restore
-// interleavings, stale versions included: a deterministic random walk
-// compares every step's error, write-back, and stored row against a pure
-// in-memory model of the documented semantics.
+// Soft-delete property test: a random walk against an in-memory model.
 func TestSQLiteSoftDeleteStateMachine(t *testing.T) {
 	db := sqliteDB(t)
 	ctx := context.Background()
@@ -436,7 +411,7 @@ func TestSQLiteSoftDeleteStateMachine(t *testing.T) {
 		if err := rio.Insert(ctx, db, row); err != nil {
 			t.Fatal(err)
 		}
-		// The model mirrors the documented semantics.
+		// In-memory model of the documented semantics.
 		model := struct {
 			trashed bool
 			version int64
@@ -444,8 +419,7 @@ func TestSQLiteSoftDeleteStateMachine(t *testing.T) {
 		}{version: row.Version}
 
 		for step := range 200 {
-			// Half the time act on a stale snapshot: the stored version
-			// minus one, which never matches a live row.
+			// Half the steps act on a stale version that matches no live row.
 			attempt := &propItem{ID: row.ID, Version: model.version}
 			stale := rng.Intn(2) == 0
 			if stale {
@@ -460,10 +434,7 @@ func TestSQLiteSoftDeleteStateMachine(t *testing.T) {
 				err = rio.Restore(ctx, db, attempt)
 			}
 
-			// What the documented semantics demand of this step:
-			// already in the target state → idempotent success adopting the
-			// stored stamp and version, stale or not; otherwise a stale
-			// version is a conflict, and a fresh one performs the write.
+			// Already in target state → idempotent success; stale version → conflict; fresh → write.
 			switch {
 			case del && model.trashed:
 				if err != nil {
@@ -498,7 +469,6 @@ func TestSQLiteSoftDeleteStateMachine(t *testing.T) {
 				model.version++
 			}
 
-			// The stored row must match the model exactly.
 			stored, err := rio.From[propItem]().WithTrashed().Where("id = ?", row.ID).First(ctx, db)
 			if err != nil {
 				t.Fatalf("seed %d step %d: read back: %v", seed, step, err)
@@ -564,8 +534,7 @@ func TestPostgresNativeCopyMatchesValuesPath(t *testing.T) {
 	if stored[0].Name != "a" || stored[2].Name != "c" {
 		t.Fatalf("values drifted: %+v", stored)
 	}
-	// The struct holds what the database stores on both paths, so the copy
-	// rows' stamps must round-trip exactly like the VALUES rows'.
+	// Stamps written over COPY must round-trip exactly like VALUES stamps.
 	if !stored[0].CreatedAt.Equal(rows[0].CreatedAt) || !stored[2].CreatedAt.Equal(more[0].CreatedAt) {
 		t.Fatalf("timestamps drifted across paths: %+v vs %+v / %+v", stored, rows, more)
 	}

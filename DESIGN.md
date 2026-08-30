@@ -41,8 +41,7 @@ Four layers inside `github.com/go-rio/rio`:
    `rio.ClickHouse`); capability flags replace type switches: returning,
    conflict target, max bind params, FOR UPDATE render/elide/reject, mutations,
    transactions, unique keys, generated PKs, statement prepare, FINAL.
-   The dialect interface stays internal so capabilities can evolve without
-   freezing a cross-module implementation contract.
+   The dialect interface stays internal so capabilities can evolve freely.
 3. **Mapping layer** — reflection-based struct↔table plans, computed once per
    type and cached forever (plans are immutable once published). Scanning has a
    reflect slow path and an unsafe fast path (see Performance).
@@ -82,28 +81,18 @@ Three mechanisms cover structure, rendering, and preparation:
    emails, err := adults.Pluck[string](ctx, tx, "email", 18)
    ```
 
-   - `Validate` returns the first connection-independent model, builder, or
-     relation error. `Must` panics on the same error and otherwise preserves the
-     query description while enabling its private cache.
-   - Deferred main-query placeholders pass validation. At execution, the
-     actual dialect lexer classifies each Where/Having fragment independently.
-     Each fragment is either fully inline or fully deferred; the two forms may
-     be mixed across fragments.
-   - Missing and excess arguments fail before driver execution and before query
-     hooks. Runtime slices expand in `IN (?)` on every terminal path.
-   - `WhereHas` and `With` relation conditions stay fully inline because nested
-     EXISTS and preload statements do not share the main query's argument
-     order.
-   - SQL renders under the executing handle's grammar. Stable scalar shapes on
-     a `Must` query reuse a grammar-and-terminal-specific internal render;
-     runtime slices and function-valued relation options bypass it. The same
-     Query can run across DBs, transactions, dialects, table namers, and
-     argument values. Dialect capabilities and driver execution remain runtime
-     checks. Cache entries key their handle weakly and are reclaimed when the
-     handle's grammar is collected, so a package-level query over churning
-     short-lived handles stays bounded.
-   - Limit/Offset take int values and are not parameterizable; rebuild paged
-     queries per page (builder cost is negligible).
+   - `Validate` returns the first connection-independent error; `Must` panics
+     on it and enables the private cache.
+   - Each Where/Having fragment is fully inline or fully deferred; forms mix
+     across fragments. Missing and excess arguments fail before the driver and
+     hooks. Slices expand in `IN (?)` on every terminal path.
+   - `WhereHas` and `With` conditions stay inline: nested EXISTS and preloads
+     do not share the main query's argument order.
+   - SQL renders under the executing handle's grammar; one Query runs across
+     DBs, transactions, dialects, and namers. Stable scalar shapes reuse a
+     cached render; slices and function-valued options bypass it. Cache
+     entries key handles weakly and die with the grammar.
+   - Limit/Offset are ints, not parameters; rebuild paged queries per page.
 3. **`rio.WithStmtCache()`** (opt-in, **default off**) caches `*sql.Stmt` per
    SQL text on the `*rio.DB` and within each transaction. Both caches are
    LRU-bounded because each expanded slice length creates a distinct statement.
@@ -134,11 +123,10 @@ type User struct {
 ```
 
 - Table names: snake_case plural via a built-in inflector (`User` → `users`,
-  `APIKey` → `api_keys`); override per-model with `TableName() string`, or
-  per-DB with `rio.WithTableNamer` — a pure, stable mapping, because rendered
-  SQL caches per handle (one handle, one naming universe; dynamic tenancy
-  means one `*DB` per tenant scheme, never a namer reading mutable state).
-  Column names: snake_case with initialism handling (`UserID` → `user_id`).
+  `APIKey` → `api_keys`); override with `TableName() string` or
+  `rio.WithTableNamer`. Namers must be pure and stable — SQL caches per
+  handle, so dynamic tenancy means one `*DB` per tenant scheme. Column names:
+  snake_case with initialism handling (`UserID` → `user_id`).
 - **Convention-vs-explicit rule**: harmless conventions (timestamps, ID,
   naming) are automatic; anything that changes query semantics or error paths
   (optimistic locking, soft delete) requires an explicit tag.
@@ -156,11 +144,9 @@ type User struct {
   at the same depth are a plan-time error. An unexported embedded type may only
   flatten; pointer embedding is rejected because offset-based scanning cannot
   cross nil pointers.
-- Structs containing relation containers are not comparable (they hold slices),
-  and `cmp.Diff` panics on the containers' unexported state: pass
-  `cmpopts.IgnoreUnexported(rio.HasMany[Post]{}, ...)` and compare relation
-  contents through the exported accessors (`Rows`/`Row`), or diff those
-  accessors directly.
+- Structs holding relation containers are not comparable; for `cmp.Diff`,
+  pass `cmpopts.IgnoreUnexported(rio.HasMany[Post]{}, ...)` and diff through
+  `Rows`/`Row`.
 
 ### Relations are containers, not slices
 
@@ -190,29 +176,29 @@ row matches. Many-to-many relations across composite keys are unsupported.
 | `Update/Delete` with `version` mismatch | `rio.ErrStaleObject` (0 rows affected) |
 | `UpdateAll/DeleteAll` without WHERE | `rio.ErrMissingWhere`; `.AllRows()` opts in explicitly |
 | Set-based write with `Limit/Offset/GroupBy/Having` | refused — silently ignoring a Limit would turn "delete ten" into "delete all matching" |
-| Idempotent `Update/Restore` (values already identical) | succeeds on PostgreSQL, MySQL, and SQLite — MySQL counts changed rows, so rio issues one PK probe on the ambiguous zero-affected path instead of misreporting `ErrNotFound` |
-| `UpdateAll` affected count | the driver's number, undoctored: MySQL reports changed rows, PostgreSQL/SQLite report matched rows — an all-identical update counts 0 on MySQL and N elsewhere; only the entity path gets the probe above |
-| All-defaults insert (every column skipped) | renders `DEFAULT VALUES` (PG/SQLite) / `() VALUES ()` (MySQL); the equivalent Upsert is refused — SQLite cannot attach a conflict clause to DEFAULT VALUES |
+| Idempotent `Update/Restore` (values already identical) | succeeds everywhere — MySQL counts changed rows, so the ambiguous zero-affected path gets one PK probe |
+| `UpdateAll` affected count | the driver's number, undoctored: MySQL counts changed rows, PostgreSQL/SQLite count matched |
+| All-defaults insert (every column skipped) | `DEFAULT VALUES` (PG/SQLite) / `() VALUES ()` (MySQL); the equivalent Upsert is refused |
 | `Update` column whitelist | rendered and bound in canonical field order regardless of caller order — the SQL cache keys on an order-free column bitmap |
 | Unique violation | `rio.ErrDuplicateKey` (translated by driver modules, driver error stays in chain) |
 | FK violation | `rio.ErrForeignKeyViolated` |
 | NULL into non-pointer field | error naming the column — sole exception: the `softdelete` column reads NULL as zero time |
 | MySQL insert | fills the auto-increment ID only and never issues a hidden second SELECT |
 | SQLite insert | uses `LastInsertId` when only the auto-increment key needs backfill; uses `RETURNING` when omitted default columns must also be loaded |
-| Batch backfill | InsertAll backfills auto-inc PKs only (PG by position; SQLite sorted-by-PK since RETURNING order is documented as undefined; MySQL none — interleaved autoinc); UpsertAll never backfills (DoNothing shrinks the row set) |
-| ClickHouse writes | **never backfilled** — no RETURNING, no generated IDs, the driver's LastInsertId always errors: after Insert/InsertAll the struct holds exactly what you set. A zero conventional `ID` errors instead of silently storing constraint-less `0` duplicates; `rio:",noautoincr"` stays the "zero is a real value" escape hatch |
+| Batch backfill | InsertAll backfills auto-inc PKs only (PG by position, SQLite sorted by PK, MySQL none); UpsertAll never backfills |
+| ClickHouse writes | never backfilled: the struct holds exactly what you set. A zero conventional `ID` errors; `rio:",noautoincr"` marks zero as a real value |
 | Soft-deleted model queries | filtered by default *because the tag is explicit*; `WithTrashed()` / `OnlyTrashed()`; `Delete` becomes UPDATE, `ForceDelete` is real |
-| Entity writes on a soft-deleted row | `Update` addresses by PK and writes the row reads hide (reaching one takes `WithTrashed` first). `Delete`/`Restore` carry trash predicates and are idempotent: a second `Delete` keeps the original deletion stamp, restoring a live row bumps neither version nor UpdatedAt — the zero-matched path probes by PK and the struct adopts the stored stamp and version |
+| Entity writes on a soft-deleted row | `Update` addresses by PK and writes rows reads hide. `Delete`/`Restore` are idempotent: repeats keep the stored stamp and version (the zero-matched path probes by PK) |
 | Upsert on a soft-deleted row | **invariant: a successful Upsert leaves the row visible** — DoUpdate automatically sets `deleted_at = NULL` (+updated_at); `rio.KeepTrashed()` opts out; DoNothing never revives |
-| Upsert `updated_at` | reset to the clock on every non-DoNothing upsert, even when nonzero — the conflict branch applies the would-be inserted row's stamp, so it must be this call's now (entity Update's unconditional rule) |
-| Zero `omitzero` column in `Upsert` | skipped from the INSERT list **and** the default conflict update set — a conflict preserves the existing value instead of resetting it to the DB DEFAULT; naming it in `DoUpdate` errors; `UpsertAll` binds every column and writes zeros on conflict |
-| MySQL Upsert version floor | the DoUpdate branch names the new row with the 8.0.19+ row alias (`VALUES()` is deprecated); MySQL <8.0.19 and MariaDB reject that syntax — `DoNothing` renders alias-free and runs everywhere |
-| `First` ordering | no implicit ORDER BY — LIMIT 1 (unless the caller set an explicit Limit, which is respected) over whatever order the DB returns; add OrderBy for determinism |
-| Placeholders | always `?`, rebound by a dialect lexer; `IN (?)` expands slices. `??` escapes a literal `?` where rendered SQL can carry one (PostgreSQL renders `$n`, ClickHouse has a driver escape); on MySQL/SQLite the rendered `?` *is* the bind marker — no syntax there needs a literal `?`, and `??` cannot produce one |
-| `Count`/`Exists` with Limit/Offset | `Count` refuses them (COUNT aggregates before LIMIT applies; count the window with Raw); `Exists` honors them — `Limit(0)` is always false, `Offset(n)` probes for row n+1 (the paging probe) |
+| Upsert `updated_at` | reset to the clock on every non-DoNothing upsert — the conflict branch applies this call's stamp |
+| Zero `omitzero` column in `Upsert` | skipped from the INSERT list and the default conflict update set, so a conflict preserves the existing value; naming it in `DoUpdate` errors; `UpsertAll` binds every column |
+| MySQL Upsert version floor | `DoUpdate` uses the 8.0.19+ row alias, rejected by older MySQL and MariaDB; `DoNothing` renders alias-free and runs everywhere |
+| `First` ordering | no implicit ORDER BY; add OrderBy for determinism |
+| Placeholders | always `?`, rebound per dialect; `IN (?)` expands slices. `??` escapes a literal `?` where the rendered SQL can carry one (PG, ClickHouse); on MySQL/SQLite the rendered `?` is the bind marker and `??` cannot produce a literal |
+| `Count`/`Exists` with Limit/Offset | `Count` refuses them (COUNT aggregates before LIMIT); `Exists` honors them — `Limit(0)` is false, `Offset(n)` probes row n+1 |
 | Scan priority | `rio:"-"` → `json` tag (beats Scanner, documented) → `sql.Scanner` (NULL handed to Scan(nil); `sql.NullTime`/`sql.Null[time.Time]` additionally parse rio's own text form first — a TEXT or expression column round-trips without a decltype) → pointer fields (NULL→nil) → `[]byte` (NULL→nil) → basic conversions (overflow-checked; MySQL unsigned BIGINT > MaxInt64 arrives as bytes and is parsed) → NULL into anything else errors with the column name |
-| Times | written as UTC, monotonic-stripped, truncated to microseconds (PG/MySQL precision — otherwise reload-and-Equal never holds), and the normalized value is written back to the struct as it binds, so the struct holds exactly what the database stores; trigger-rewritten columns are not read back; SQLite text format is rio's own, not the driver's |
-| Failed `Insert/Update/Upsert` | the struct may already carry this attempt's stamps (CreatedAt/UpdatedAt filled, a zero version set to 1) — stamping happens before execution, so when the statement itself fails the database is untouched and retrying with the same struct is safe. The one exception is a failure while scanning RETURNING back (a NULL default into a non-pointer field): the error then names a row the database kept — reconcile before retrying |
+| Times | UTC, monotonic-stripped, microsecond precision; the normalized value is written back to the struct as it binds, so the struct holds what the database stores. SQLite text format is rio's own |
+| Failed `Insert/Update/Upsert` | stamping happens before execution, so the struct may carry this attempt's stamps while the database stays untouched; retrying the same struct is safe. Exception: a failure scanning RETURNING back names a row the database kept |
 | Partial scans | `Raw[T]` into an entity must cover every mapped column; partial projections use a DTO |
 
 ### ClickHouse: the read + append dialect
@@ -221,23 +207,20 @@ ClickHouse supports analytical reads and append-oriented writes. APIs whose
 contracts depend on row locks, synchronous mutations, affected-row counts, or
 unique constraints return an error instead of a weaker approximation.
 
-- The server floor is **26.x**, which supports rio's offset-carrying time
-  encoding, correlated EXISTS, and correct pre-1970 fractional timestamps.
-- Reads support the full builder, relations, `WithCount`, `RelLimit`,
-  `WhereHas`, soft-delete filtering, Raw, and reusable Query templates.
-  `Query.Final` exposes the ReplacingMergeTree `FINAL` modifier.
-- Writes are limited to `Insert`, `InsertAll`, and explicit `Exec` mutations.
-  UPDATE/DELETE/Upsert families, transactions, `ForUpdate`, and rio's statement
-  cache are rejected.
-- clickhouse-go interpolates arguments client-side. rio therefore binds time as
-  offset-carrying microsecond text, rejects values ClickHouse would clamp, and
-  binds `[]byte` as String instead of `Array(UInt8)`.
-- The dialect lexer follows ClickHouse quoting, heredoc, and comment rules.
-  `??` produces the driver's literal-question-mark escape; regions its binder
-  cannot parse are rejected on argument-carrying statements.
-- Duplicate-key and foreign-key sentinels do not apply because ClickHouse has
-  neither constraint. Integration probes pin the upstream driver behavior rio
-  relies on.
+- Server floor **26.x**: rio's offset-carrying time encoding, correlated
+  EXISTS, pre-1970 fractional timestamps.
+- Reads: full builder, relations, `WithCount`, `RelLimit`, `WhereHas`,
+  soft-delete filters, Raw, Query templates, `Query.Final`.
+- Writes: `Insert`, `InsertAll`, explicit `Exec`. UPDATE/DELETE/Upsert,
+  transactions, `ForUpdate`, and the statement cache are rejected.
+- clickhouse-go interpolates client-side, so rio binds time as
+  offset-carrying microsecond text, rejects values the server would clamp,
+  and binds `[]byte` as String (`Array(UInt8)` corrupts).
+- The lexer follows ClickHouse quoting and comment rules; `??` produces the
+  driver's literal escape; unparseable regions reject argument-carrying
+  statements.
+- No duplicate-key or FK sentinels — the constraints don't exist. Integration
+  probes pin the upstream behaviors rio relies on.
 
 ## Performance
 
@@ -321,14 +304,10 @@ Each of these is a decision, not a gap:
 The core ships mapping, immutable queries, entity and set writes, upsert and
 batch paths, four relation types, nested preloading and counts, optimistic
 locking, soft delete, timestamps, Raw/Exec, reusable validated Query templates,
-cursor pagination (`OrderKeys`/`After`/`CursorAfter`: structured sort keys
-over mapped NOT NULL columns, an automatic primary-key tie-breaker, an
-expanded per-direction keyset predicate identical on every dialect, and
-value-only tokens fingerprinted against their ordering), column generation,
+cursor pagination (`OrderKeys`/`After`/`CursorAfter`: keyset predicates with
+an automatic primary-key tie-breaker and fingerprinted value-only tokens),
+column generation,
 opt-in statement caching, transactions/savepoints, hooks, error translation,
 and composite keys. ClickHouse implements the read-and-append subset plus
-`Query.Final`. The `lint` subpackage compares model expectations against the
-live schema (PostgreSQL, MySQL, SQLite) read-only, reporting only decidable
-drift — missing tables/columns, nullability and primary-key disagreements,
-and type mismatches within known equivalence classes; unknown types stay
-silent rather than guessed at.
+`Query.Final`. The `lint` subpackage reports decidable drift between models and the live
+schema (PostgreSQL, MySQL, SQLite); unknown types stay silent.

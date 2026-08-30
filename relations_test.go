@@ -6,12 +6,8 @@ import (
 	"testing"
 )
 
-// Contract tests for the relation containers' JSON and Loaded surface.
-// Pinned behavior: an unloaded container marshals as null; a loaded slice
-// marshals as its array ([] when empty); a loaded pointer marshals as its
-// object, or null when the row is nil. UnmarshalJSON treats null as "reset to
-// unloaded" and any other payload as "loaded"; malformed input errors without
-// mutating the container. Loaded() reports false before, true after.
+// Contract tests for the relation containers' JSON and Loaded surface: unloaded
+// marshals null, loaded marshals its payload, and null input resets to unloaded.
 
 func mustJSON(t *testing.T, v any) string {
 	t.Helper()
@@ -198,8 +194,7 @@ func TestHasOneJSON(t *testing.T) {
 		t.Fatalf("row: %+v", row)
 	}
 
-	// Loaded-nil does not survive a JSON round-trip: it marshals to null,
-	// which unmarshals back to the unloaded state.
+	// Loaded-nil does not survive a JSON round-trip: null unmarshals back to unloaded.
 	var rt HasOne[Profile]
 	if err := json.Unmarshal([]byte(mustJSON(t, none)), &rt); err != nil {
 		t.Fatalf("round-trip loaded-nil: %v", err)

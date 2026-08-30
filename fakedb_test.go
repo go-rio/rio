@@ -11,9 +11,8 @@ import (
 	"time"
 )
 
-// fakeDB is a zero-dependency database/sql driver that records every
-// statement and serves scripted results, so tests assert exact SQL
-// sequences, arguments, and transaction boundaries without a database.
+// fakeDB is a zero-dependency database/sql driver that records every statement
+// and serves scripted results, so tests assert exact SQL without a database.
 type fakeDB struct {
 	mu          sync.Mutex
 	log         []fakeStmt
@@ -27,9 +26,7 @@ type fakeDB struct {
 	columnScan  bool     // serve Go 1.27 driver.RowsColumnScanner rows
 	nextCalls   int      // legacy Rows.Next calls made on columnScan rows
 	scanCalls   int      // direct ScanColumn calls made on columnScan rows
-	// probe, when non-nil, receives the context of every ExecContext and
-	// QueryContext call, so context-propagation tests read the context the
-	// statement executes under at the driver.
+	// probe, when non-nil, receives the context every ExecContext/QueryContext executes under.
 	probe          func(context.Context)
 	prepareStarted chan struct{}
 	prepareBlock   <-chan struct{}
@@ -43,8 +40,7 @@ type fakeStmt struct {
 type fakeRows struct {
 	cols []string
 	rows [][]driver.Value
-	// closeErr is returned by the driver rows' Close — the channel where real
-	// drivers surface deferred protocol errors on partially consumed results.
+	// closeErr is returned by the driver rows' Close — where real drivers surface deferred protocol errors.
 	closeErr error
 }
 
@@ -81,24 +77,21 @@ func (f *fakeDB) queueRows(cols []string, rows ...[]driver.Value) {
 	f.results = append(f.results, fakeRows{cols: cols, rows: rows})
 }
 
-// queueRowsCloseErr scripts the next row-returning statement's result with a
-// Close that fails after the rows were served.
+// queueRowsCloseErr scripts a result whose Close fails after the rows were served.
 func (f *fakeDB) queueRowsCloseErr(closeErr error, cols []string, rows ...[]driver.Value) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.results = append(f.results, fakeRows{cols: cols, rows: rows, closeErr: closeErr})
 }
 
-// queueExec scripts the next non-query statement's result. Unscripted execs
-// report (1, 1).
+// queueExec scripts the next non-query result; unscripted execs report (1, 1).
 func (f *fakeDB) queueExec(lastID, affected int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.execs = append(f.execs, fakeResult{lastID: lastID, affected: affected})
 }
 
-// queueExecAffectedErr scripts the next non-query statement's result whose
-// RowsAffected() fails.
+// queueExecAffectedErr scripts a result whose RowsAffected() fails.
 func (f *fakeDB) queueExecAffectedErr(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -350,10 +343,8 @@ func (r *fakeRowsIter) Next(dest []driver.Value) error {
 	return nil
 }
 
-// fakeRowsColumnIter exercises Go 1.27's driver.RowsColumnScanner path. Its
-// typed setters write directly into rio's colScanner when available; the
-// ConvertAssign fallback matches what a general-purpose driver would do for
-// destinations it does not recognize.
+// fakeRowsColumnIter exercises Go 1.27's driver.RowsColumnScanner path: typed
+// setters when the dest offers them, ConvertAssign otherwise.
 type fakeRowsColumnIter struct {
 	*fakeRowsIter
 	current []driver.Value

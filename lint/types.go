@@ -9,9 +9,7 @@ import (
 	"github.com/go-rio/rio"
 )
 
-// verdict is a type comparison's outcome. Unknown means the database type is
-// outside the known equivalence classes; lint stays silent then — a missing
-// finding is honest, a guessed one is not.
+// verdict is a type comparison's outcome; on Unknown lint stays silent rather than guess.
 type verdict int
 
 const (
@@ -38,9 +36,7 @@ var timeType = reflect.TypeFor[time.Time]()
 
 func classOf(c rio.ColumnSchema) goClass {
 	if c.Scanner {
-		// The type's own Scan/Value decide its representation; judging the
-		// underlying kind would second-guess them (a custom ID with a Scan
-		// method is not a plain integer to the database).
+		// The type's own Scan/Value decide its representation; judging the underlying kind would second-guess them.
 		return classOther
 	}
 	if c.JSON {
@@ -71,8 +67,7 @@ func classOf(c rio.ColumnSchema) goClass {
 	return classOther
 }
 
-// acceptable maps, per dialect and Go class, the database types that scan
-// and bind cleanly. A type in no class at all stays unknown.
+// acceptable maps, per dialect and Go class, the database types that scan and bind cleanly.
 var acceptable = map[rio.Dialect]map[goClass][]string{
 	rio.Postgres: {
 		classInt:    {"smallint", "integer", "bigint"},
@@ -100,8 +95,7 @@ func verdictFor(dialect rio.Dialect, dataType string, c rio.ColumnSchema) verdic
 		return verdictUnknown
 	}
 	if dialect == rio.SQLite {
-		// SQLite's type affinity stores anything in any column; a declared
-		// type is advisory. Matching declarations confirm, nothing refutes.
+		// SQLite affinity stores anything anywhere: matching declarations confirm, nothing refutes.
 		return sqliteVerdict(dataType, class)
 	}
 	classes, ok := acceptable[dialect]
@@ -120,8 +114,7 @@ func verdictFor(dialect rio.Dialect, dataType string, c rio.ColumnSchema) verdic
 	return verdictUnknown
 }
 
-// sqliteVerdict matches by declared-type affinity and never returns
-// verdictMismatch: any SQLite column can hold any value.
+// sqliteVerdict matches by declared-type affinity and never refutes.
 func sqliteVerdict(declared string, class goClass) verdict {
 	has := func(subs ...string) bool {
 		for _, s := range subs {

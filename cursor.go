@@ -11,10 +11,9 @@ import (
 	"time"
 )
 
-// SortKey is one column of a structured, cursor-ready ordering. Unlike
-// OrderBy's verbatim SQL, a SortKey names a mapped column, so rio can both
-// render the ORDER BY and read the column's value back out of a row when it
-// issues a cursor.
+// SortKey is one column of a structured ordering. It names a mapped column —
+// not verbatim SQL — so rio can read its value back out of rows to issue
+// cursors.
 type SortKey struct {
 	Column string
 	Desc   bool
@@ -22,12 +21,9 @@ type SortKey struct {
 
 // Cursor marks a position in a keyset-ordered result: the sort-key values of
 // the row it points past, plus a fingerprint of the ordering that issued it.
-// The zero Cursor is "no position" and After rejects it.
-//
-// The token String returns is opaque but not tamper-proof: it encodes only
-// values, which bind as parameters — a forged token can move the page
-// window, never change the query. Sign it at the application layer when
-// that matters.
+// The zero Cursor is "no position" and After rejects it. Tokens are opaque
+// but not tamper-proof: values bind as parameters, so a forged token can move
+// the page window, never change the query.
 type Cursor struct {
 	fp     uint64
 	values []any
@@ -36,7 +32,7 @@ type Cursor struct {
 // IsZero reports whether the cursor marks no position.
 func (c Cursor) IsZero() bool { return c.fp == 0 && c.values == nil }
 
-// cursorVersion prefixes every token; a future encoding bumps it.
+// cursorVersion prefixes every token.
 const cursorVersion = byte(1)
 
 // String encodes the cursor as a URL-safe token.
@@ -61,9 +57,8 @@ func (c Cursor) String() string {
 		case time.Time:
 			tag, body = 't', t.UTC().Format(time.RFC3339Nano)
 		default:
-			// CursorAfter only produces the cases above; a hand-built Cursor
-			// with another type still encodes deterministically as its print
-			// form and binds as a string.
+			// Hand-built cursors with other types encode as their print form
+			// and bind as strings.
 			tag, body = 's', fmt.Sprint(t)
 		}
 		b = append(b, tag)
@@ -77,9 +72,8 @@ func appendCursorString(b []byte, s string) []byte {
 	return append(b, s...)
 }
 
-// ParseCursor decodes a token String produced. It fails loudly on any
-// malformed input; a valid token for a different ordering fails later, when
-// After checks the fingerprint against the query's sort keys.
+// ParseCursor decodes a token String produced. Malformed input fails here; a
+// token for a different ordering fails at After's fingerprint check.
 func ParseCursor(s string) (Cursor, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(s)
 	if err != nil {
@@ -149,11 +143,7 @@ type resolvedKey struct {
 }
 
 // resolveSortKeys validates the declared keys against the plan and appends
-// the primary-key tie-breaker. Keyset pagination needs a total order:
-// without a unique tail, rows sharing the last key's value would be skipped
-// or repeated across pages, so any PK column missing from the declaration is
-// appended (following the last declared direction — the harmless-convention
-// rule; declare it yourself to control the direction).
+// missing PK columns as the tie-breaker: keyset pagination needs a total order.
 func resolveSortKeys(p *plan, s *queryState) ([]resolvedKey, error) {
 	if len(s.orderKeys) == 0 {
 		return nil, fmt.Errorf("rio: cursor pagination needs OrderKeys (OrderBy is verbatim SQL rio cannot read values back from)")
@@ -189,10 +179,8 @@ func resolveSortKeys(p *plan, s *queryState) ([]resolvedKey, error) {
 	return keys, nil
 }
 
-// checkSortable rejects columns whose values cannot honestly take part in a
-// keyset comparison: a NULL never orders totally (its position is a dialect
-// default rio would have to guess), and Scanner/JSON/byte columns have no
-// canonical comparable form to put in a token.
+// checkSortable rejects nullable columns (NULL has no portable order) and
+// non-scalar columns (no canonical token form).
 func checkSortable(p *plan, f *field) error {
 	if f.nullable() {
 		return fmt.Errorf(
@@ -210,8 +198,8 @@ func checkSortable(p *plan, f *field) error {
 	)
 }
 
-// sortKeyFingerprint hashes the resolved ordering, so a cursor issued under
-// one ordering fails loudly under another instead of paging nonsense.
+// sortKeyFingerprint hashes the resolved ordering so a cursor issued under
+// one ordering fails loudly under another.
 func sortKeyFingerprint(keys []resolvedKey) uint64 {
 	h := fnv.New64a()
 	for _, k := range keys {
@@ -225,8 +213,7 @@ func sortKeyFingerprint(keys []resolvedKey) uint64 {
 	return h.Sum64()
 }
 
-// cursorValue reads one sort-key cell out of a row, folded to the cursor's
-// canonical scalar set.
+// cursorValue reads one sort-key cell, folded to the cursor's canonical scalars.
 func cursorValue(f *field, rv reflect.Value) (any, error) {
 	v := rv.FieldByIndex(f.index)
 	switch f.code.kind {
@@ -241,16 +228,13 @@ func cursorValue(f *field, rv reflect.Value) (any, error) {
 	case scanBool:
 		return v.Bool(), nil
 	case scanTime:
-		// The struct already holds the normalized value the database stores
-		// (times are written back as they bind).
+		// The struct already holds the normalized value the database stores.
 		return v.Interface().(time.Time), nil
 	}
 	return nil, fmt.Errorf("rio: cursor: column %q is not a cursor scalar", f.column)
 }
 
-// check verifies the cursor against the query's resolved ordering. It is
-// connection-independent, so Validate owns it; execution reaches rendering
-// only through the same validation.
+// check verifies the cursor against the query's resolved ordering.
 func (c *Cursor) check(keys []resolvedKey) error {
 	if c.IsZero() {
 		return fmt.Errorf("rio: After: the zero Cursor marks no position; omit After for the first page")
@@ -264,13 +248,8 @@ func (c *Cursor) check(keys []resolvedKey) error {
 	return nil
 }
 
-// renderAfter appends the keyset predicate for resuming past the cursor:
-//
-//	AND ((k0 > ?) OR (k0 = ? AND k1 > ?) OR ...)
-//
-// The expanded form works identically on every dialect — row-value
-// comparison syntax does not — and cannot express a mixed-direction
-// ordering any other way. Each comparison flips per key direction.
+// renderAfter appends the expanded keyset predicate, ((k0 > ?) OR (k0 = ? AND
+// k1 > ?) OR ...): row-value syntax is neither portable nor mixed-direction.
 func renderAfter(b []byte, args []any, d Dialect, table string, keys []resolvedKey, c *Cursor) ([]byte, []any) {
 	b = append(b, '(')
 	for i, k := range keys {
@@ -300,9 +279,7 @@ func renderAfter(b []byte, args []any, d Dialect, table string, keys []resolvedK
 	return b, args
 }
 
-// appendOrderKeys renders the resolved structured ordering. Every
-// row-returning renderer shares it, so the ORDER BY can never drift from
-// the keyset predicate built over the same keys.
+// appendOrderKeys renders the resolved structured ordering.
 func appendOrderKeys(b []byte, d Dialect, table string, keys []resolvedKey) []byte {
 	if len(keys) == 0 {
 		return b
@@ -322,22 +299,20 @@ func appendOrderKeys(b []byte, d Dialect, table string, keys []resolvedKey) []by
 	return b
 }
 
-// OrderKeys sets a structured ordering over mapped columns — the form cursor
-// pagination needs, since rio must read the columns' values back out of rows
-// to issue cursors. It renders as the query's ORDER BY and excludes verbatim
-// OrderBy. Any primary-key column missing from keys is appended as the
-// tie-breaker, following the last declared direction.
+// OrderKeys sets the structured ordering cursor pagination requires, rendered
+// as the query's ORDER BY; it cannot mix with verbatim OrderBy. Primary-key
+// columns missing from keys are appended as tie-breakers, following the last
+// declared direction.
 func (q Query[T]) OrderKeys(keys ...SortKey) Query[T] {
 	q.cache = nil
 	q.s.orderKeys = append(append([]SortKey(nil), q.s.orderKeys...), keys...)
 	return q
 }
 
-// After resumes the query past the position c marks: rows strictly after it
-// in the OrderKeys ordering. The cursor must come from CursorAfter on a
-// query with the same OrderKeys — a different ordering fails loudly. Backward
-// paging is explicit: flip every key's direction and resume After the first
-// row of the current page.
+// After resumes past the position c marks: rows strictly after it in the
+// OrderKeys ordering. c must come from CursorAfter under the same OrderKeys;
+// a different ordering fails loudly. For backward paging, flip every key's
+// direction and resume After the first row of the page.
 func (q Query[T]) After(c Cursor) Query[T] {
 	q.cache = nil
 	q.s.after = &c
@@ -345,8 +320,8 @@ func (q Query[T]) After(c Cursor) Query[T] {
 }
 
 // CursorAfter issues the cursor marking row's position under the query's
-// OrderKeys — hand it the last row of a page to resume there. The row must
-// hold the values the database stores (any row rio scanned does).
+// OrderKeys. The row must hold the values the database stores (any row rio
+// scanned does).
 func (q Query[T]) CursorAfter(row *T) (Cursor, error) {
 	p, err := planOf[T]()
 	if err != nil {

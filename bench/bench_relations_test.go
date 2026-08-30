@@ -9,8 +9,8 @@ import (
 	"github.com/go-rio/rio"
 )
 
-// Relation-path benchmarks: 100 parents × 5 children on real SQLite, rio's
-// preload against the hand-written two-query equivalent it generates.
+// Relation benchmarks on SQLite: 100 parents × 5 children, rio preload vs
+// the hand-written two-query plan.
 
 type BenchAuthor struct {
 	ID        int64
@@ -99,8 +99,7 @@ type stdAuthor struct {
 	posts []BenchArticle
 }
 
-// readAuthorsWithPostsStdlib is the two-query plan rio generates, written by
-// hand: select the parents, then one IN query grouped back per parent.
+// readAuthorsWithPostsStdlib hand-writes rio's two-query preload plan.
 func readAuthorsWithPostsStdlib(ctx context.Context, db *sql.DB) ([]stdAuthor, error) {
 	rows, err := db.QueryContext(ctx, "SELECT id, name FROM bench_authors")
 	if err != nil {

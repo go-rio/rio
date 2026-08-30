@@ -116,8 +116,7 @@ func TestInsertReturningBackfillsGenerated(t *testing.T) {
 	if err := Insert(context.Background(), db, u); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
-	// RETURNING covers exactly what the database generates — here only the
-	// auto-increment PK; timestamps and version are client-set and known.
+	// RETURNING covers only what the database generates — here the auto-increment PK.
 	want := `INSERT INTO "users" ("email", "age", "bio", "version", "deleted_at", "created_at", "updated_at") VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING "id"`
 	if got := f.logged()[0]; got != want {
 		t.Fatalf("sql:\n got: %s\nwant: %s", got, want)
@@ -133,11 +132,7 @@ func TestInsertReturningBackfillsGenerated(t *testing.T) {
 	}
 }
 
-// Codex audit #2: on a single-row RETURNING result the rows are never
-// drained, so rows.Close is where the driver reports whether the statement
-// actually completed (pgx reads the trailing command status there). A
-// deferred Close whose error is dropped turns a failed INSERT into a nil
-// return with a stale backfill.
+// A dropped rows.Close error on the undrained RETURNING result would turn a failed INSERT into a nil return.
 func TestInsertReturningReportsRowsCloseError(t *testing.T) {
 	f := newFakeDB()
 	db := f.open() // postgres: RETURNING path
@@ -163,8 +158,7 @@ func TestUpsertReturningReportsRowsCloseError(t *testing.T) {
 	}
 }
 
-// And the MySQL zero-affected probe: its single row also leaves the result
-// undrained.
+// The MySQL zero-affected probe's single row also leaves the result undrained.
 func TestUpdateProbeReportsRowsCloseError(t *testing.T) {
 	f := newFakeDB()
 	db := f.open(MySQL)
@@ -248,9 +242,7 @@ func TestUpdateFullColumnWithOptimisticLock(t *testing.T) {
 		t.Fatalf("Update: %v", err)
 	}
 	got := f.logged()[0]
-	// created_at is never updated; version renders as an atomic increment;
-	// deleted_at is owned by Delete/Restore/ForceDelete and never rides along
-	// (a stale live struct would silently resurrect a tombstoned row).
+	// created_at never updates; version is an atomic increment; deleted_at never rides along.
 	want := `UPDATE "users" SET "email" = ?, "age" = ?, "bio" = ?, "updated_at" = ?, "version" = "version" + 1 WHERE "id" = ? AND "version" = ?`
 	if got != want {
 		t.Fatalf("sql:\n got: %s\nwant: %s", got, want)
@@ -329,16 +321,13 @@ func TestDeleteSoftAndForce(t *testing.T) {
 	}
 }
 
-// The trash predicates make Delete and Restore idempotent on every dialect:
-// a second Delete keeps the original deletion stamp, restoring a live row
-// bumps nothing, and the idempotent paths adopt what the database stores.
+// The trash predicates make Delete and Restore idempotent; the idempotent paths adopt what the database stores.
 func TestSoftDeleteAndRestoreIdempotent(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
 	db := f.open()
 
-	// Delete of an already-trashed row: zero matched, the probe sees the
-	// stored stamp — success, adopting stamp and version, never re-stamping.
+	// Delete of an already-trashed row: the probe sees the stored stamp and adopts it.
 	stored := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	f.queueExec(0, 0)
 	f.queueRows([]string{"deleted_at", "version"}, []driver.Value{stored, int64(7)})
@@ -356,8 +345,7 @@ func TestSoftDeleteAndRestoreIdempotent(t *testing.T) {
 		t.Fatalf("the struct must adopt the stored state: %+v", u)
 	}
 
-	// Restore of a live row: zero matched, the probe sees NULL — success,
-	// version adopted rather than bumped, UpdatedAt untouched.
+	// Restore of a live row: the probe sees NULL; version adopted, not bumped.
 	f.queueExec(0, 0)
 	f.queueRows([]string{"deleted_at", "version"}, []driver.Value{nil, int64(7)})
 	v := &User{ID: 5, Version: 7, DeletedAt: &stored}
@@ -621,9 +609,7 @@ func TestUpsertDoNothing(t *testing.T) {
 	}
 }
 
-// Codex audit #12: a repeated conflict-target column — one OnConflict call or
-// several — must collapse: ON CONFLICT (email, email) matches no unique index
-// and PostgreSQL answers with its famously opaque constraint-matching error.
+// Repeated conflict-target columns must collapse: ON CONFLICT (email, email) matches no unique index.
 func TestUpsertConflictTargetDeduped(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -658,8 +644,7 @@ func TestUpsertConflictTargetDeduped(t *testing.T) {
 	}
 }
 
-// Codex audit #6: a failing Result.RowsAffected on the MySQL upsert path must
-// propagate, not silently skip the ID backfill and report success.
+// A failing RowsAffected on the MySQL upsert path must propagate, not silently skip the backfill.
 func TestUpsertMySQLRowsAffectedErrorPropagates(t *testing.T) {
 	f := newFakeDB()
 	db := f.open(MySQL)
@@ -737,14 +722,11 @@ func TestNestedTxUsesSavepoints(t *testing.T) {
 	}
 }
 
-// DESIGN.md, savepoint failure paths: ROLLBACK TO SAVEPOINT can itself fail,
-// and its error must be joined to the cause, never allowed to mask it.
+// ROLLBACK TO SAVEPOINT can itself fail; its error must be joined to the cause, never mask it.
 func TestSavepointRollbackFailureJoinsErrors(t *testing.T) {
 	ctx := context.Background()
 
-	// PostgreSQL flavor: the failed statement aborts the transaction; if the
-	// ROLLBACK TO then fails too (dead connection, missing savepoint), rio
-	// reports both errors and skips the RELEASE that could only fail as well.
+	// PostgreSQL flavor: both errors reported, and no RELEASE after a failed ROLLBACK TO.
 	t.Run("postgres aborted state", func(t *testing.T) {
 		f := newFakeDB()
 		db := f.open(Postgres)
@@ -771,15 +753,12 @@ func TestSavepointRollbackFailureJoinsErrors(t *testing.T) {
 		if !strings.Contains(logs, "ROLLBACK TO SAVEPOINT rio_sp_1") {
 			t.Fatalf("rollback must be attempted before giving up: %s", logs)
 		}
-		// The outer transaction saw the inner error and rolled back whole.
 		if f.logged()[len(f.logged())-1] != "ROLLBACK" {
 			t.Fatalf("outer transaction must roll back: %s", logs)
 		}
 	})
 
-	// MySQL flavor: a deadlock (1213) rolls back the entire transaction and
-	// destroys every savepoint, so the ROLLBACK TO fails with 1305. Both
-	// errors must reach the caller — the deadlock is the one worth retrying.
+	// MySQL flavor: a 1213 deadlock destroys every savepoint (ROLLBACK TO fails 1305); the deadlock must stay visible for retry.
 	t.Run("mysql 1213 kills savepoints", func(t *testing.T) {
 		f := newFakeDB()
 		db := f.open(MySQL)
@@ -805,11 +784,7 @@ func TestSavepointRollbackFailureJoinsErrors(t *testing.T) {
 	})
 }
 
-// Codex audit #1: a savepoint's ROLLBACK TO / RELEASE must still reach the
-// database when the inner fn's context died — database/sql short-circuits
-// statements on a canceled ctx before sending them, so on the caller's ctx
-// the savepoint's writes would silently survive and the outer transaction
-// (its own context alive) would commit them.
+// Savepoint cleanup must survive a dead inner context — otherwise its writes silently reach the outer commit.
 func TestSavepointCleanupSurvivesCanceledContext(t *testing.T) {
 	f := newFakeDB()
 	db := f.open(SQLite)
@@ -849,8 +824,7 @@ func TestSavepointCleanupSurvivesCanceledContext(t *testing.T) {
 	}
 }
 
-// The panic flavor of the same leak: the recover-path ROLLBACK TO runs on the
-// cancellation-decoupled context too.
+// The panic flavor: the recover-path ROLLBACK TO runs on the decoupled context too.
 func TestSavepointPanicRollbackSurvivesCanceledContext(t *testing.T) {
 	f := newFakeDB()
 	db := f.open(SQLite)
@@ -900,8 +874,7 @@ func TestTxBeginHookPanicRollsBack(t *testing.T) {
 	if ran {
 		t.Fatal("fn must not run when the BEGIN hook panics")
 	}
-	// The transaction was already open when AfterQuery fired; the connection
-	// must go back to the pool via ROLLBACK, not leak.
+	// The transaction was already open when the hook panicked; the connection must not leak.
 	joined := strings.Join(f.logged(), " | ")
 	if !strings.Contains(joined, "BEGIN") || !strings.Contains(joined, "ROLLBACK") {
 		t.Fatalf("BEGIN hook panic must roll back the open transaction: %s", joined)

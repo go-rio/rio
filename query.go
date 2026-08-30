@@ -49,8 +49,8 @@ type queryState struct {
 	hasConds []hasCond
 	counts   []string
 
-	// orderKeys is the structured ordering cursor pagination reads values
-	// through; after is the position to resume past.
+	// orderKeys is the structured ordering for cursor pagination; after is
+	// the position to resume past.
 	orderKeys []SortKey
 	after     *Cursor
 }
@@ -63,8 +63,7 @@ type hasCond struct {
 }
 
 // Query is an immutable, connection-free query description safe for
-// concurrent reuse. Builder methods return derived values. Must may attach an
-// internal SQL-shape cache, but never a database, transaction, or statement.
+// concurrent reuse; builder methods return derived values.
 type Query[T any] struct {
 	s     queryState
 	cache *queryCache
@@ -83,10 +82,9 @@ func From[T any]() Query[T] {
 	return Query[T]{}
 }
 
-// Where adds an AND-ed condition written in SQL with ? placeholders.
-// Slice arguments expand inside IN (?). The expression is included verbatim;
-// never build it from untrusted input — dynamic identifiers belong in column
-// whitelists or rio.WriteColumns constants.
+// Where adds an AND-ed condition in SQL with ? placeholders; slice arguments
+// expand inside IN (?). The expression is verbatim — never build it from
+// untrusted input.
 func (q Query[T]) Where(expr string, args ...any) Query[T] {
 	q.cache = nil
 	q.s.wheres = appendOne(q.s.wheres, cond{expr: expr, args: copyArgs(args)})
@@ -94,26 +92,23 @@ func (q Query[T]) Where(expr string, args ...any) Query[T] {
 	return q
 }
 
-// OrderBy appends an ORDER BY term, verbatim SQL ("created_at DESC"). Never
-// build the term from untrusted input — dynamic identifiers belong in column
-// whitelists or rio.WriteColumns constants.
+// OrderBy appends an ORDER BY term, verbatim SQL ("created_at DESC"); never
+// build it from untrusted input.
 func (q Query[T]) OrderBy(expr string) Query[T] {
 	q.cache = nil
 	q.s.orders = appendOne(q.s.orders, expr)
 	return q
 }
 
-// GroupBy appends a verbatim GROUP BY term. Never build it from untrusted
-// input; whitelist dynamic identifiers or use WriteColumns constants.
+// GroupBy appends a verbatim GROUP BY term; never build it from untrusted input.
 func (q Query[T]) GroupBy(expr string) Query[T] {
 	q.cache = nil
 	q.s.groups = appendOne(q.s.groups, expr)
 	return q
 }
 
-// Having adds an AND-ed HAVING condition. The expression is included verbatim;
-// never build it from untrusted input — dynamic identifiers belong in column
-// whitelists or rio.WriteColumns constants.
+// Having adds an AND-ed HAVING condition. The expression is verbatim — never
+// build it from untrusted input.
 func (q Query[T]) Having(expr string, args ...any) Query[T] {
 	q.cache = nil
 	q.s.havings = appendOne(q.s.havings, cond{expr: expr, args: copyArgs(args)})
@@ -121,9 +116,8 @@ func (q Query[T]) Having(expr string, args ...any) Query[T] {
 	return q
 }
 
-// Join appends a verbatim JOIN clause. Entity queries still select only T's
-// columns. Never build the clause from untrusted input; whitelist dynamic
-// identifiers or use WriteColumns constants.
+// Join appends a verbatim JOIN clause; entity queries still select only T's
+// columns. Never build the clause from untrusted input.
 func (q Query[T]) Join(clause string) Query[T] {
 	q.cache = nil
 	q.s.joins = appendOne(q.s.joins, clause)
@@ -144,9 +138,8 @@ func (q Query[T]) Offset(n int) Query[T] {
 	return q
 }
 
-// ForUpdate renders SELECT ... FOR UPDATE for read-modify-write inside a
-// transaction. SQLite locks the whole database anyway; there it is a no-op.
-// ClickHouse has no row locks at all and rejects it at render.
+// ForUpdate renders SELECT ... FOR UPDATE. A no-op on SQLite; rejected on
+// ClickHouse.
 func (q Query[T]) ForUpdate() Query[T] {
 	q.cache = nil
 	q.s.forUpdate = true
@@ -321,16 +314,13 @@ func (q Query[T]) Sole(ctx context.Context, db Queryer, args ...any) (*T, error)
 	return nil, ErrMultipleRows
 }
 
-// Count returns the number of matching rows. GroupBy and Having projections
-// are rejected, and so are Limit/Offset — COUNT aggregates before LIMIT
-// applies, so honoring them needs a subquery; use Raw for those queries.
+// Count returns the number of matching rows. GroupBy, Having, Limit, and
+// Offset are rejected; use Raw for those queries.
 func (q Query[T]) Count(ctx context.Context, db Queryer, args ...any) (int64, error) {
 	if len(q.s.groups) > 0 || len(q.s.havings) > 0 {
 		return 0, errors.New("rio: Count with GroupBy/Having is a projection (rows or groups?); use Raw")
 	}
 	if q.s.limitSet || q.s.offsetSet {
-		// Silently counting the whole match would answer a different
-		// question than the windowed query the caller described.
 		return 0, errors.New("rio: Count cannot honor Limit/Offset (COUNT aggregates before LIMIT applies); drop them, or count the window with Raw")
 	}
 	g := db.gram()
@@ -444,9 +434,8 @@ func (q Query[T]) Rows(ctx context.Context, db Queryer, args ...any) iter.Seq2[T
 	}
 }
 
-// Pluck extracts a single column under the query's conditions:
-// emails, err := q.Pluck[string](ctx, db, "email", 18). The column must be one
-// of T's mapped columns — expressions go through Raw.
+// Pluck extracts a single column under the query's conditions. The column
+// must be one of T's mapped columns — expressions go through Raw.
 func (q Query[T]) Pluck[V any](ctx context.Context, db Queryer, column string, args ...any) ([]V, error) {
 	if len(q.s.groups) > 0 || len(q.s.havings) > 0 {
 		return nil, errors.New("rio: Pluck with GroupBy/Having is a projection; use Raw")
@@ -612,7 +601,6 @@ func (s *queryState) noteCondArity(clause, expr string, argc int) {
 	if argc == 0 || s.err != nil {
 		return
 	}
-	// Avoid the remaining lexer passes on the common, matching path.
 	var sqliteCount int
 	_, _, _ = rebindCount(sqliteLex, expr, &sqliteCount)
 	if sqliteCount == argc {
@@ -670,15 +658,8 @@ func loadQueryRelations[T any](
 	}
 	stmts = append(stmts, countStmts...)
 	finishes = append(finishes, countFinishes...)
-	// The whole top layer — every preload and every counting query — shares
-	// one round trip on a batching channel.
-	if err := runRelStatements(ctx, db, stmts); err != nil {
+	if err := runRelLayer(ctx, db, stmts, finishes); err != nil {
 		return err
-	}
-	for _, finish := range finishes {
-		if err := finish(ctx); err != nil {
-			return err
-		}
 	}
 	return reuseCounts(p, rv, reusable)
 }
@@ -708,8 +689,6 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 		return "", nil, err
 	}
 	table := g.table(p)
-	// One resolution serves the keyset predicate and the ORDER BY: the two
-	// halves can never drift apart.
 	var sortKeys []resolvedKey
 	if len(s.orderKeys) > 0 || s.after != nil {
 		var err error
@@ -801,10 +780,8 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 			return "", nil, err
 		}
 	case selectExists:
-		// One probe row decides the answer, so any Limit >= 1 collapses to
-		// LIMIT 1 — but Limit(0) means "no rows", exactly as it does on All,
-		// and Offset shifts which row must exist (paging probes ask "is
-		// there a row past this page"), so both render.
+		// Limit >= 1 collapses to LIMIT 1; Limit(0) still means "no rows",
+		// and Offset still shifts which row must exist.
 		probe := *s
 		if !probe.limitSet || probe.limit > 1 {
 			probe.limit, probe.limitSet = 1, true
@@ -850,9 +827,8 @@ func checkFinal(d Dialect, s *queryState) error {
 	return nil
 }
 
-// appendLimitOffset renders LIMIT/OFFSET. PostgreSQL accepts a bare OFFSET;
-// MySQL and SQLite require a LIMIT before it, so one is synthesized with the
-// dialect's "no limit" spelling.
+// appendLimitOffset renders LIMIT/OFFSET; MySQL and SQLite need a synthetic
+// LIMIT before a bare OFFSET.
 func appendLimitOffset(b []byte, d Dialect, s *queryState) ([]byte, error) {
 	if s.limitSet && s.limit < 0 {
 		return nil, fmt.Errorf("rio: Limit requires a non-negative value, got %d", s.limit)
@@ -1063,8 +1039,7 @@ func finishSQLText(d Dialect, sqlText string, args []any) (string, []any, error)
 	return out, outArgs, nil
 }
 
-// checkBindCount enforces the dialect's post-expansion bind budget before
-// execution. Internal batch operations chunk automatically; user queries do not.
+// checkBindCount enforces the dialect's post-expansion bind budget.
 func checkBindCount(d Dialect, n int) error {
 	if limit := d.caps().maxBindParams; n > limit {
 		return fmt.Errorf(

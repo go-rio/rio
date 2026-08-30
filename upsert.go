@@ -398,11 +398,8 @@ func upsertSpecKey(spec *upsertSpec, update []*field) upsertCacheKey {
 	return key
 }
 
-// appendConflictBranch renders the dialect's conflict clause and update set:
-// ON CONFLICT … DO NOTHING/DO UPDATE on conflict-target dialects, otherwise
-// MySQL's ON DUPLICATE KEY UPDATE — where DoNothing still needs one no-op
-// assignment, keyed by the PK when the model has one. Upsert and UpsertAll
-// share this tail verbatim.
+// appendConflictBranch renders the dialect's conflict clause and update set;
+// Upsert and UpsertAll share this tail.
 func appendConflictBranch(b []byte, d Dialect, table string, p *plan, update []*field, spec *upsertSpec) []byte {
 	if d.caps().conflictTarget {
 		b = appendConflictClause(b, d, spec)
@@ -472,7 +469,7 @@ func upsertUpdateSet(p *plan, spec *upsertSpec, skipped []*field) ([]*field, err
 				)
 			}
 			if fieldIn(out, f) {
-				continue // dedup by identity; whitelists are a handful of columns
+				continue // dedup by identity
 			}
 			out = append(out, f)
 		}

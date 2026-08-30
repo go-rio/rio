@@ -30,10 +30,8 @@ func (k relKind) String() string {
 	return "relation"
 }
 
-// relContainer is how the mapper recognizes relation fields and how the
-// preloader assembles them. It stays unexported: matching happens via
-// reflect.Type.Implements, and calls happen through plain type assertions in
-// this package (reflect cannot Call unexported methods).
+// relContainer marks relation fields for the mapper and preloader. Calls go
+// through type assertions: reflect cannot Call unexported methods.
 type relContainer interface {
 	relKind() relKind
 	targetType() reflect.Type
@@ -43,24 +41,16 @@ type relContainer interface {
 	setLoaded(v reflect.Value)
 }
 
-// relFieldNames maps a container type (HasMany[Post]) to the Go struct field
-// name it is declared under, recorded when a plan builds, so notLoadedPanic
-// can name the exact With argument — With takes the field name, not the
-// target type name (a Posts HasMany[Post] field needs With("Posts")). Two
-// models declaring the same container type under different names collapse
-// the entry to "" and the panic falls back to generic wording.
+// relFieldNames records each container type's declared field name so
+// notLoadedPanic can name the exact With argument.
 var (
-	relFieldNames    sync.Map // reflect.Type → field name string; "" once ambiguous
+	relFieldNames    sync.Map // container reflect.Type → field name; "" once ambiguous
 	relContainerType = reflect.TypeFor[relContainer]()
 )
 
 // HasMany holds the "child rows pointing at this row" side of a one-to-many
-// relation. It is a container rather than a bare slice so that "not loaded"
-// and "loaded, empty" are different states: rio never returns silently empty
-// data and never lazy-loads. Structs containing relation containers are not
-// comparable, and cmp.Diff panics on the containers' unexported state — pass
-// cmpopts.IgnoreUnexported(rio.HasMany[Post]{}, ...) and compare relation
-// contents through the exported accessors (Rows/Row) instead.
+// relation. "Not loaded" and "loaded, empty" are distinct states: rio never
+// lazy-loads and never returns silently empty data.
 type HasMany[T any] struct {
 	loaded bool
 	rows   []T
@@ -69,9 +59,8 @@ type HasMany[T any] struct {
 // Loaded reports whether the relation has been populated by With or Set.
 func (r HasMany[T]) Loaded() bool { return r.loaded }
 
-// Rows returns the loaded children. It panics if the relation was never
-// loaded — accessing unloaded data is a programming error, not an empty
-// result.
+// Rows returns the loaded children, panicking if the relation was never
+// loaded.
 func (r HasMany[T]) Rows() []T {
 	if !r.loaded {
 		panic(notLoadedPanic(relHasMany, reflect.TypeFor[HasMany[T]](), reflect.TypeFor[T]()))
@@ -79,8 +68,7 @@ func (r HasMany[T]) Rows() []T {
 	return r.rows
 }
 
-// Set marks the relation loaded with the given rows. Manual assembly (from a
-// custom query or fixture) is a supported use.
+// Set marks the relation loaded with the given rows.
 func (r *HasMany[T]) Set(rows []T) {
 	if rows == nil {
 		rows = []T{}
@@ -88,8 +76,7 @@ func (r *HasMany[T]) Set(rows []T) {
 	r.loaded, r.rows = true, rows
 }
 
-// MarshalJSON encodes unloaded relations as null and loaded ones as arrays,
-// so API payloads distinguish "not fetched" from "none".
+// MarshalJSON encodes unloaded relations as null and loaded ones as arrays.
 func (r HasMany[T]) MarshalJSON() ([]byte, error) {
 	if !r.loaded {
 		return []byte("null"), nil
@@ -203,8 +190,7 @@ func (r *HasOne[T]) UnmarshalJSON(b []byte) error {
 }
 
 // BelongsTo holds the parent row referenced by a foreign key on this row.
-// After preloading, a NULL foreign key yields the loaded-nil state — Row
-// returns nil instead of panicking, preserving "With makes access safe".
+// A NULL foreign key preloads as loaded-nil: Row returns nil, no panic.
 type BelongsTo[T any] struct {
 	loaded bool
 	row    *T
@@ -278,8 +264,7 @@ func notLoadedPanic(kind relKind, container, target reflect.Type) string {
 			"rio: %s[%s] accessed before loading; add With(%q) to the query or assemble it manually with Set",
 			kind, target.Name(), name)
 	}
-	// The owning model's plan was never built (or the container type appears
-	// under several field names): the exact field name is unknown here.
+	// Plan never built, or ambiguous container type: field name unknown.
 	return fmt.Sprintf(
 		"rio: %s[%s] accessed before loading; "+
 			"add With(\"<the Go field name of this %s[%s] field>\") to the query "+
@@ -297,14 +282,12 @@ func ptrOrNil[T any](v reflect.Value) *T {
 	return v.Interface().(*T)
 }
 
-// isRelContainer reports whether a struct field type is one of the relation
-// containers, checking the pointer type so the pointer-receiver setLoaded is
-// part of the method set.
+// isRelContainer reports whether t is a relation container; it checks the
+// pointer type because setLoaded has a pointer receiver.
 func isRelContainer(t reflect.Type) bool {
 	return t.Kind() == reflect.Struct && reflect.PointerTo(t).Implements(relContainerType)
 }
 
-// containerInfo extracts kind and target type from a zero container value.
 func containerInfo(t reflect.Type) (relKind, reflect.Type) {
 	c := reflect.New(t).Interface().(relContainer)
 	return c.relKind(), c.targetType()

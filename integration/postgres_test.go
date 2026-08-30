@@ -11,10 +11,8 @@ import (
 	"github.com/go-rio/rio"
 )
 
-// PostgreSQL-only rich-type coverage: a jsonb column mapped with rio's json
-// tag, and a text[] column carried by a Scanner/Valuer wrapper defined here.
-// The jsonb half holds on both postgres channels (stdlib and pgx-native); the
-// text[] half is stdlib-only (see runPostgresTextArray).
+// PostgreSQL-only rich-type coverage: jsonb via rio's json tag (both
+// channels) and text[] via a Scanner/Valuer wrapper (stdlib-only).
 
 // PgMeta is the Go shape stored in a jsonb column via rio:",json".
 type PgMeta struct {
@@ -30,11 +28,8 @@ type PgDoc struct {
 
 func (PgDoc) TableName() string { return "pg_docs" }
 
-// runPostgresJSONB round-trips a Go struct through a jsonb column and exercises
-// the jsonb ? key-exists operator, reached through rio's ?? escape: ?? renders
-// a literal ? on every dialect (here PostgreSQL's operator) and consumes no
-// argument, so the single ? that follows is what binds the key. It holds on
-// both postgres channels — the database/sql driver and the pgx-native one.
+// runPostgresJSONB round-trips a struct through jsonb and reaches the jsonb
+// ? key-exists operator through rio's ?? escape.
 func runPostgresJSONB(t *testing.T, db *rio.DB) {
 	ctx := context.Background()
 	for _, ddl := range []string{
@@ -59,7 +54,6 @@ func runPostgresJSONB(t *testing.T, db *rio.DB) {
 	}
 
 	// payload ?? ? renders to payload ? $1 — the jsonb key-exists operator.
-	// "theme" is a top-level key of the stored object, "missing" is not.
 	hit, err := rio.From[PgDoc]().Where("payload ?? ?", "theme").Count(ctx, db)
 	if err != nil || hit != 1 {
 		t.Fatalf("jsonb ? on an existing key: hit=%d err=%v", hit, err)
@@ -70,12 +64,8 @@ func runPostgresJSONB(t *testing.T, db *rio.DB) {
 	}
 }
 
-// pgTextArray is a small PostgreSQL text[] wrapper: driver.Valuer renders a Go
-// []string as an array literal on the way out, sql.Scanner parses one back on
-// the way in. It handles the unquoted common case this test uses (simple tokens
-// — no commas, quotes, or NULL elements). Because it implements driver.Valuer,
-// rio binds it through Value() and never mistakes the []string for an IN-list
-// to expand.
+// pgTextArray is a minimal text[] Valuer/Scanner (unquoted tokens only);
+// implementing driver.Valuer keeps rio from expanding it as an IN-list.
 type pgTextArray []string
 
 func (a pgTextArray) Value() (driver.Value, error) {
@@ -127,14 +117,8 @@ type PgTagged struct {
 
 func (PgTagged) TableName() string { return "pg_tagged" }
 
-// runPostgresTextArray round-trips a text[] column through the pgTextArray
-// Scanner/Valuer wrapper. It is stdlib-only: the pgx database/sql driver hands
-// a bare sql.Scanner the array's text form ({go,sql,olap}) — exactly what the
-// small wrapper parses — whereas the pgx-native channel delivers the binary
-// array wire format to a fallback Scanner, and decoding that would mean
-// reimplementing pgtype, well past a "small wrapper". What this proves is rio's
-// contract (bind through Value, scan through Scan), which is identical on both
-// channels; only the driver's canonical representation differs.
+// runPostgresTextArray round-trips text[] through the wrapper. Stdlib-only:
+// the pgx-native channel hands Scanners the binary array format.
 func runPostgresTextArray(t *testing.T, db *rio.DB) {
 	ctx := context.Background()
 	for _, ddl := range []string{

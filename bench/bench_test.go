@@ -17,9 +17,8 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-// The benchmarks compare rio, hand-written database/sql, and GORM on the
-// same in-memory SQLite database (pure Go on both sides), measuring the ORM
-// overhead itself. See README.md for methodology and benchstat commands.
+// rio vs hand-written database/sql vs GORM on the same in-memory SQLite
+// database. See README.md for methodology.
 
 type BenchUser struct {
 	ID        int64
@@ -72,8 +71,8 @@ func TestBatchInsertSQLShapes(t *testing.T) {
 	}
 }
 
-// benchRawDB opens a pinned shared-memory SQLite database (cache=shared plus
-// one pinned conn keeps it alive) and applies ddl — benchDDL when none given.
+// benchRawDB opens a shared-memory SQLite DB (one pinned conn keeps it
+// alive) and applies ddl — benchDDL when none given.
 func benchRawDB(b *testing.B, name string, ddl ...string) *sql.DB {
 	b.Helper()
 	raw, err := sql.Open("sqlite", "file:"+name+"?mode=memory&cache=shared")
@@ -219,8 +218,8 @@ func BenchmarkReadHundred_Stdlib(b *testing.B) {
 	}
 }
 
-// readHundredStdlib intentionally uses the idiomatic Rows.Scan API on every
-// row; its variadic destination boxing is part of the end-to-end baseline.
+// readHundredStdlib uses idiomatic Rows.Scan on purpose: its variadic boxing
+// is part of the baseline.
 func readHundredStdlib(ctx context.Context, db *sql.DB, query string, args ...any) (out []BenchUser, err error) {
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
