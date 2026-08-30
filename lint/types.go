@@ -145,7 +145,7 @@ func sqliteVerdict(declared string, class goClass) verdict {
 			return verdictOK
 		}
 	case classFloat:
-		if has("real", "floa", "doub", "numeric", "decimal") {
+		if has("real", "float", "double", "numeric", "decimal") {
 			return verdictOK
 		}
 	case classString:
