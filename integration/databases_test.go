@@ -383,9 +383,10 @@ func TestSQLiteSchemaDriftLint(t *testing.T) {
 	type CleanItem struct {
 		ID   int64
 		Name string
+		Note sql.NullString // Scanner columns are undecidable and stay silent
 	}
 	if _, err := rio.Exec(ctx, db,
-		"CREATE TABLE clean_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)"); err != nil {
+		"CREATE TABLE clean_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, note TEXT)"); err != nil {
 		t.Fatal(err)
 	}
 	clean, err := lint.Check(ctx, db, CleanItem{})

@@ -21,33 +21,34 @@ func TestVerdictFor(t *testing.T) {
 	js := col(reflect.TypeFor[map[string]int](), true)
 
 	cases := []struct {
-		dialect, dataType string
-		c                 rio.ColumnSchema
-		want              verdict
+		dialect  rio.Dialect
+		dataType string
+		c        rio.ColumnSchema
+		want     verdict
 	}{
-		{"postgres", "bigint", i64, verdictOK},
-		{"postgres", "text", i64, verdictMismatch},
-		{"postgres", "tsvector", i64, verdictUnknown}, // outside every class
-		{"postgres", "jsonb", js, verdictOK},
-		{"postgres", "timestamp with time zone", tm, verdictOK},
-		{"mysql", "bigint", i64, verdictOK},
-		{"mysql", "varchar", str, verdictOK},
-		{"mysql", "datetime", str, verdictMismatch},
-		{"mysql", "geometry", str, verdictUnknown},
+		{rio.Postgres, "bigint", i64, verdictOK},
+		{rio.Postgres, "text", i64, verdictMismatch},
+		{rio.Postgres, "tsvector", i64, verdictUnknown}, // outside every class
+		{rio.Postgres, "jsonb", js, verdictOK},
+		{rio.Postgres, "timestamp with time zone", tm, verdictOK},
+		{rio.MySQL, "bigint", i64, verdictOK},
+		{rio.MySQL, "varchar", str, verdictOK},
+		{rio.MySQL, "datetime", str, verdictMismatch},
+		{rio.MySQL, "geometry", str, verdictUnknown},
 
 		// SQLite affinity confirms but never refutes.
-		{"sqlite", "integer", i64, verdictOK},
-		{"sqlite", "text", i64, verdictUnknown},
-		{"sqlite", "datetime", tm, verdictOK},
+		{rio.SQLite, "integer", i64, verdictOK},
+		{rio.SQLite, "text", i64, verdictUnknown},
+		{rio.SQLite, "datetime", tm, verdictOK},
 	}
 	for _, tt := range cases {
 		if got := verdictFor(tt.dialect, tt.dataType, tt.c); got != tt.want {
-			t.Errorf("verdictFor(%s, %q, %s) = %d, want %d", tt.dialect, tt.dataType, tt.c.GoType, got, tt.want)
+			t.Errorf("verdictFor(%v, %q, %s) = %d, want %d", tt.dialect, tt.dataType, tt.c.GoType, got, tt.want)
 		}
 	}
 
 	// A pointer field classes by its element; a Scanner stays undecidable.
-	if got := verdictFor("postgres", "bigint", col(reflect.TypeFor[*int64](), false)); got != verdictOK {
+	if got := verdictFor(rio.Postgres, "bigint", col(reflect.TypeFor[*int64](), false)); got != verdictOK {
 		t.Errorf("pointer element class: %d", got)
 	}
 	if got := classOf(col(reflect.TypeFor[struct{ X int }](), false)); got != classOther {

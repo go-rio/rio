@@ -4216,3 +4216,46 @@ func TestOrderKeysValidation(t *testing.T) {
 		t.Fatalf("set-op with OrderKeys: %v", err)
 	}
 }
+
+// Pluck pages with the same keyset machinery as entity queries: the shared
+// ORDER BY tail renders alongside the predicate, so the two halves can
+// never drift apart (they once did — the predicate landed in shared
+// renderWhere while ORDER BY was per-renderer).
+func TestCursorPaginationOnPluck(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+
+	q := From[pagedItem]().OrderKeys(SortKey{Column: "score", Desc: true})
+	cur, err := q.CursorAfter(&pagedItem{ID: 7, Score: 90})
+	if err != nil {
+		t.Fatalf("CursorAfter: %v", err)
+	}
+	f.queueRows([]string{"name"})
+	if _, err := q.After(cur).Pluck[string](ctx, db, "name"); err != nil {
+		t.Fatalf("Pluck: %v", err)
+	}
+	got := f.logged()[0]
+	if !strings.Contains(got, `"paged_items"."score" < $1`) {
+		t.Fatalf("Pluck must carry the keyset predicate: %s", got)
+	}
+	if !strings.HasSuffix(got, `ORDER BY "paged_items"."score" DESC, "paged_items"."id" DESC`) {
+		t.Fatalf("Pluck must carry the keyset ORDER BY: %s", got)
+	}
+}
+
+// The cursor checks are connection-independent, so Validate owns them.
+func TestValidateCatchesCursorMisuse(t *testing.T) {
+	if err := From[pagedItem]().OrderKeys(SortKey{Column: "score"}).After(Cursor{}).Validate(); err == nil ||
+		!strings.Contains(err.Error(), "zero Cursor") {
+		t.Fatalf("Validate must catch the zero cursor: %v", err)
+	}
+	other, err := From[pagedItem]().OrderKeys(SortKey{Column: "name"}).CursorAfter(&pagedItem{ID: 1, Name: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := From[pagedItem]().OrderKeys(SortKey{Column: "score"}).After(other).Validate(); err == nil ||
+		!strings.Contains(err.Error(), "different ordering") {
+		t.Fatalf("Validate must catch the ordering mismatch: %v", err)
+	}
+}

@@ -72,15 +72,22 @@ func TestBatchInsertSQLShapes(t *testing.T) {
 	}
 }
 
-func benchRawDB(b *testing.B, name string) *sql.DB {
+// benchRawDB opens a pinned shared-memory SQLite database (cache=shared plus
+// one pinned conn keeps it alive) and applies ddl — benchDDL when none given.
+func benchRawDB(b *testing.B, name string, ddl ...string) *sql.DB {
 	b.Helper()
 	raw, err := sql.Open("sqlite", "file:"+name+"?mode=memory&cache=shared")
 	if err != nil {
 		b.Fatal(err)
 	}
 	raw.SetMaxOpenConns(1)
-	if _, err := raw.Exec(benchDDL); err != nil {
-		b.Fatal(err)
+	if len(ddl) == 0 {
+		ddl = []string{benchDDL}
+	}
+	for _, stmt := range ddl {
+		if _, err := raw.Exec(stmt); err != nil {
+			b.Fatal(err)
+		}
 	}
 	b.Cleanup(func() { _ = raw.Close() })
 	return raw

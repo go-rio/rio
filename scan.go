@@ -780,6 +780,13 @@ func negativeUintErr(f *field, v int64) error {
 	return fmt.Errorf("rio: column %q value %d is negative but field %s is unsigned", f.column, v, f.name)
 }
 
+// nullable reports whether the field can hold a database NULL: a pointer
+// target, or the softdelete column's NULL↔zero-time exception. Scanner
+// fields decide for themselves and are judged separately where it matters.
+func (f *field) nullable() bool {
+	return f.typ.Kind() == reflect.Pointer || f.isSoftDelete
+}
+
 func convErr(f *field, src any) error {
 	return fmt.Errorf("rio: column %q: cannot convert %T into field %s (%s)", f.column, src, f.name, f.typ)
 }
@@ -1058,6 +1065,54 @@ func namedFields(rows rows, p *plan) ([]*field, error) {
 func mergeClose(rows rows, err *error) {
 	if cerr := rows.Close(); cerr != nil && *err == nil {
 		*err = cerr
+	}
+}
+
+// drainRows is the shared tail of the entity and Raw Rows iterators: it owns
+// the finished/finish bookkeeping, per-row scanning, early-break close, and
+// the yielded-row count hooks receive — the part that must never drift
+// between the two channels. resolve builds the scan plan under the same
+// close guarantee (its panic still closes the rows).
+func drainRows[T any](rows rows, finish func(error, int64), resolve func() ([]*field, error), yield func(T, error) bool) {
+	var zero T
+	finished := false
+	var yielded int64
+	defer func() {
+		if !finished {
+			_ = finishRows(rows, finish, nil, yielded)
+		}
+	}()
+
+	fields, err := resolve()
+	if err != nil {
+		finished = true
+		err = finishRows(rows, finish, err, 0)
+		yield(zero, err)
+		return
+	}
+	rs := newRowScanner(fields, nil)
+	defer rs.release()
+	var row T
+	for rows.Next() {
+		row = zero
+		if err := rs.scan(rows, unsafe.Pointer(&row)); err != nil {
+			finished = true
+			err = finishRows(rows, finish, err, yielded)
+			yield(zero, err)
+			return
+		}
+		yielded++
+		if !yield(row, nil) {
+			finished = true
+			_ = finishRows(rows, finish, nil, yielded)
+			return
+		}
+	}
+	err = rows.Err()
+	finished = true
+	err = finishRows(rows, finish, err, yielded)
+	if err != nil {
+		yield(zero, err)
 	}
 }
 

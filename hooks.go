@@ -7,8 +7,8 @@ import (
 )
 
 // QueryEvent describes one statement execution. Hooks receive the same event
-// pointer in Before and After; After sees Err, Duration, and RowsAffected
-// filled in.
+// pointer in Before and After; After sees Err, Duration, RowsAffected, and
+// RowsReturned filled in.
 type QueryEvent struct {
 	// Op is a stable label usable as a metrics dimension without parsing
 	// SQL: "select", "insert", "update", "delete", "upsert", "raw", "exec",
@@ -38,10 +38,10 @@ type QueryEvent struct {
 	// control). Count and Exists report their result-set rows (one), not
 	// the value they carry. After only.
 	RowsReturned int64
-	// Phase distinguishes the statements one logical operation issues: ""
-	// for the operation's main statement, "preload" and "count" for the
-	// relation queries With and WithCount add, "probe" for the internal
-	// zero-affected write probes.
+	// Phase labels the secondary statements rio itself derives: "preload"
+	// and "count" for the relation queries With and WithCount add, "probe"
+	// for the internal zero-affected write probes. Every other statement —
+	// including the helper reads inside relation writes — carries "".
 	Phase string
 }
 

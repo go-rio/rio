@@ -150,8 +150,9 @@ type NativeConfig struct {
 	DB NativeDB
 
 	// Handle is the driver-native pool handle (a *pgxpool.Pool under
-	// go-rio/postgres), returned verbatim by (*DB).Native so the driver
-	// module's typed accessors (postgres.PoolOf) can reach it.
+	// go-rio/postgres). (*DB).DriverHandle carries it — that is what the
+	// driver module's typed accessors (postgres.PoolOf) read — and
+	// (*DB).Native returns it as the native-channel marker.
 	Handle any
 
 	// SQLView is an optional database/sql view over the same pool, returned
@@ -192,13 +193,19 @@ func NewNative(nc NativeConfig, dialect Dialect, opts ...Option) *DB {
 				"(cache_statement is already its default)",
 		)
 	}
+	handle := nc.Handle
+	if cfg.driverHandle != nil {
+		// WithDriverHandle wins like any later option; NativeConfig.Handle
+		// is the default the driver module supplies.
+		handle = cfg.driverHandle
+	}
 	return &DB{
 		db:     nc.SQLView,
 		e:      &nativeEngine{nd: nc.DB, view: nc.SQLView},
 		g:      newGrammar(dialect, cfg),
 		cfg:    cfg,
 		native: nc.Handle,
-		handle: nc.Handle,
+		handle: handle,
 	}
 }
 

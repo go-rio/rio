@@ -38,8 +38,14 @@ func validateQueryState(p *plan, s *queryState) error {
 		return err
 	}
 	if len(s.orderKeys) > 0 || s.after != nil {
-		if _, err := resolveSortKeys(p, s); err != nil {
+		keys, err := resolveSortKeys(p, s)
+		if err != nil {
 			return err
+		}
+		if s.after != nil {
+			if err := s.after.check(keys); err != nil {
+				return err
+			}
 		}
 	}
 	if err := validatePaths(p, s.withs); err != nil {

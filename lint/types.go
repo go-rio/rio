@@ -2,6 +2,7 @@ package lint
 
 import (
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -36,6 +37,12 @@ const (
 var timeType = reflect.TypeFor[time.Time]()
 
 func classOf(c rio.ColumnSchema) goClass {
+	if c.Scanner {
+		// The type's own Scan/Value decide its representation; judging the
+		// underlying kind would second-guess them (a custom ID with a Scan
+		// method is not a plain integer to the database).
+		return classOther
+	}
 	if c.JSON {
 		return classJSON
 	}
@@ -66,8 +73,8 @@ func classOf(c rio.ColumnSchema) goClass {
 
 // acceptable maps, per dialect and Go class, the database types that scan
 // and bind cleanly. A type in no class at all stays unknown.
-var acceptable = map[string]map[goClass][]string{
-	"postgres": {
+var acceptable = map[rio.Dialect]map[goClass][]string{
+	rio.Postgres: {
 		classInt:    {"smallint", "integer", "bigint"},
 		classFloat:  {"real", "double precision", "numeric"},
 		classString: {"text", "character varying", "character", "uuid"},
@@ -76,7 +83,7 @@ var acceptable = map[string]map[goClass][]string{
 		classBytes:  {"bytea"},
 		classJSON:   {"json", "jsonb", "text", "character varying"},
 	},
-	"mysql": {
+	rio.MySQL: {
 		classInt:    {"tinyint", "smallint", "mediumint", "int", "bigint"},
 		classFloat:  {"float", "double", "decimal"},
 		classString: {"char", "varchar", "text", "tinytext", "mediumtext", "longtext", "enum"},
@@ -87,28 +94,12 @@ var acceptable = map[string]map[goClass][]string{
 	},
 }
 
-// knownTypes is the union per dialect: a database type outside it is
-// unknown, inside it but outside the column's class is a mismatch.
-var knownTypes = func() map[string]map[string]bool {
-	out := make(map[string]map[string]bool, len(acceptable))
-	for dialect, classes := range acceptable {
-		set := make(map[string]bool)
-		for _, types := range classes {
-			for _, t := range types {
-				set[t] = true
-			}
-		}
-		out[dialect] = set
-	}
-	return out
-}()
-
-func verdictFor(dialect, dataType string, c rio.ColumnSchema) verdict {
+func verdictFor(dialect rio.Dialect, dataType string, c rio.ColumnSchema) verdict {
 	class := classOf(c)
 	if class == classOther {
 		return verdictUnknown
 	}
-	if dialect == "sqlite" {
+	if dialect == rio.SQLite {
 		// SQLite's type affinity stores anything in any column; a declared
 		// type is advisory. Matching declarations confirm, nothing refutes.
 		return sqliteVerdict(dataType, class)
@@ -117,13 +108,14 @@ func verdictFor(dialect, dataType string, c rio.ColumnSchema) verdict {
 	if !ok {
 		return verdictUnknown
 	}
-	for _, t := range classes[class] {
-		if dataType == t {
-			return verdictOK
-		}
+	if slices.Contains(classes[class], dataType) {
+		return verdictOK
 	}
-	if knownTypes[dialect][dataType] {
-		return verdictMismatch
+	// A known type in the wrong class refutes; an unknown one stays silent.
+	for _, types := range classes {
+		if slices.Contains(types, dataType) {
+			return verdictMismatch
+		}
 	}
 	return verdictUnknown
 }

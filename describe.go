@@ -22,6 +22,10 @@ type ColumnSchema struct {
 	PrimaryKey bool
 	// JSON marks columns stored as serialized JSON text.
 	JSON bool
+	// Scanner marks columns rio delegates to the type's own sql.Scanner —
+	// their database representation is the type's business, so schema
+	// tooling treats them as undecidable rather than guessing.
+	Scanner bool
 }
 
 // TableSchema is a model's mapping under one handle: the table name this
@@ -33,10 +37,9 @@ type TableSchema struct {
 	Struct string
 	// Table is the table name under this handle's naming.
 	Table string
-	// Columns are the mapped columns in plan order.
+	// Columns are the mapped columns in plan order; the primary key is the
+	// PrimaryKey subset in order.
 	Columns []ColumnSchema
-	// PKs are the primary-key column names in declaration order.
-	PKs []string
 }
 
 // DescribeModel reports how this handle maps model: its resolved table name
@@ -58,24 +61,23 @@ func (d *DB) DescribeModel(model any) (*TableSchema, error) {
 		Struct:  p.structName,
 		Table:   d.g.table(p),
 		Columns: make([]ColumnSchema, 0, len(p.fields)),
-		PKs:     make([]string, 0, len(p.pks)),
-	}
-	for _, pk := range p.pks {
-		ts.PKs = append(ts.PKs, pk.column)
 	}
 	for _, f := range p.fields {
 		ts.Columns = append(ts.Columns, ColumnSchema{
 			Name:       f.column,
 			Field:      f.name,
 			GoType:     f.typ,
-			Nullable:   f.typ.Kind() == reflect.Pointer || f.isSoftDelete || f.code.kind == scanScanner,
+			Nullable:   f.nullable() || f.code.kind == scanScanner,
 			PrimaryKey: f.isPK,
 			JSON:       f.code.kind == scanJSON,
+			Scanner:    f.code.kind == scanScanner,
 		})
 	}
 	return ts, nil
 }
 
-// DialectName identifies this handle's dialect: "postgres", "mysql",
-// "sqlite", or "clickhouse".
-func (d *DB) DialectName() string { return d.g.d.name() }
+// Dialect returns this handle's dialect identity — one of rio.Postgres,
+// rio.MySQL, rio.SQLite, or rio.ClickHouse. The interface stays opaque;
+// the value is a comparable identity for dispatch, exactly as New consumed
+// it.
+func (d *DB) Dialect() Dialect { return d.g.d }

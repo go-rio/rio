@@ -18,6 +18,13 @@ type loopDB struct {
 	cols       []string
 	rows       [][]driver.Value
 	columnScan bool
+
+	// sets, when non-empty, serves queries round-robin by call order — one
+	// logical operation issues the same statements in the same order every
+	// iteration (main query, then each preload), so position identifies the
+	// shape. The single benchmark goroutine owns pos.
+	sets []fakeRows
+	pos  int
 }
 
 func (l *loopDB) open(d Dialect, opts ...Option) *DB {
@@ -44,7 +51,12 @@ func (loopConn) Close() error                        { return nil }
 func (loopConn) Begin() (driver.Tx, error)           { return nil, errors.New("loopdb: no tx") }
 
 func (c loopConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
-	rows := &fakeRowsIter{data: fakeRows{cols: c.l.cols, rows: c.l.rows}}
+	data := fakeRows{cols: c.l.cols, rows: c.l.rows}
+	if len(c.l.sets) > 0 {
+		data = c.l.sets[c.l.pos%len(c.l.sets)]
+		c.l.pos++
+	}
+	rows := &fakeRowsIter{data: data}
 	if c.l.columnScan {
 		return &fakeRowsColumnIter{fakeRowsIter: rows}, nil
 	}
@@ -883,48 +895,6 @@ func allocMeasurements(ctx context.Context) map[string]allocPair {
 	return pairs
 }
 
-// multiLoopDB cycles through a fixed sequence of result sets. One logical
-// operation issues the same statements in the same order every iteration —
-// main query, then each preload — so position identifies the shape. Like
-// loopDB it never logs or locks, keeping allocation counts honest; the
-// single benchmark goroutine owns pos.
-type multiLoopDB struct {
-	sets []fakeRows
-	pos  int
-}
-
-func (l *multiLoopDB) open(d Dialect, opts ...Option) *DB {
-	db := sql.OpenDB(multiLoopConnector{l})
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	return New(db, d, append([]Option{WithClock(fixedClock)}, opts...)...)
-}
-
-type multiLoopConnector struct{ l *multiLoopDB }
-
-func (c multiLoopConnector) Connect(context.Context) (driver.Conn, error) {
-	return multiLoopConn(c), nil
-}
-func (c multiLoopConnector) Driver() driver.Driver { return fakeDriver{} }
-
-type multiLoopConn struct{ l *multiLoopDB }
-
-func (multiLoopConn) Prepare(string) (driver.Stmt, error) {
-	return nil, errors.New("multiloopdb: no prepare")
-}
-func (multiLoopConn) Close() error              { return nil }
-func (multiLoopConn) Begin() (driver.Tx, error) { return nil, errors.New("multiloopdb: no tx") }
-
-func (c multiLoopConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
-	set := c.l.sets[c.l.pos%len(c.l.sets)]
-	c.l.pos++
-	return &fakeRowsIter{data: set}, nil
-}
-
-func (c multiLoopConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
-	return fakeExecResult{fakeResult{lastID: 1, affected: 1}}, nil
-}
-
 // The relation-path benchmark models: an owner with children, grandchildren,
 // a count target, and a many-to-many side.
 type benchOwner struct {
@@ -961,28 +931,18 @@ func benchOwnerRows(n int) fakeRows {
 	return fakeRows{cols: []string{"id", "name"}, rows: rows}
 }
 
-func benchPostRows(owners, per int) fakeRows {
-	rows := make([][]driver.Value, 0, owners*per)
+// benchChildRows builds (id, fk, text) rows: per children under each of
+// parents parents, ids sequential. Posts and comments share the shape.
+func benchChildRows(fkCol, text string, parents, per int) fakeRows {
+	rows := make([][]driver.Value, 0, parents*per)
 	id := int64(0)
-	for o := 1; o <= owners; o++ {
+	for p := 1; p <= parents; p++ {
 		for range per {
 			id++
-			rows = append(rows, []driver.Value{id, int64(o), "title"})
+			rows = append(rows, []driver.Value{id, int64(p), text})
 		}
 	}
-	return fakeRows{cols: []string{"id", "bench_owner_id", "title"}, rows: rows}
-}
-
-func benchCommentRows(posts, per int) fakeRows {
-	rows := make([][]driver.Value, 0, posts*per)
-	id := int64(0)
-	for p := 1; p <= posts; p++ {
-		for range per {
-			id++
-			rows = append(rows, []driver.Value{id, int64(p), "body"})
-		}
-	}
-	return fakeRows{cols: []string{"id", "bench_post_id", "body"}, rows: rows}
+	return fakeRows{cols: []string{"id", fkCol, text}, rows: rows}
 }
 
 func benchCountRows(owners, count int) fakeRows {
@@ -1004,7 +964,7 @@ func benchTagJoinRows(owners, per int) fakeRows {
 }
 
 func BenchmarkPreloadHasMany(b *testing.B) {
-	db := (&multiLoopDB{sets: []fakeRows{benchOwnerRows(100), benchPostRows(100, 5)}}).open(SQLite)
+	db := (&loopDB{sets: []fakeRows{benchOwnerRows(100), benchChildRows("bench_owner_id", "title", 100, 5)}}).open(SQLite)
 	q := From[benchOwner]().With("Posts")
 	ctx := context.Background()
 	b.ReportAllocs()
@@ -1017,10 +977,10 @@ func BenchmarkPreloadHasMany(b *testing.B) {
 }
 
 func BenchmarkPreloadNested(b *testing.B) {
-	db := (&multiLoopDB{sets: []fakeRows{
+	db := (&loopDB{sets: []fakeRows{
 		benchOwnerRows(100),
-		benchPostRows(100, 5),
-		benchCommentRows(500, 2),
+		benchChildRows("bench_owner_id", "title", 100, 5),
+		benchChildRows("bench_post_id", "body", 500, 2),
 	}}).open(SQLite)
 	q := From[benchOwner]().With("Posts.Comments")
 	ctx := context.Background()
@@ -1034,7 +994,7 @@ func BenchmarkPreloadNested(b *testing.B) {
 }
 
 func BenchmarkPreloadWithCount(b *testing.B) {
-	db := (&multiLoopDB{sets: []fakeRows{benchOwnerRows(100), benchCountRows(100, 5)}}).open(SQLite)
+	db := (&loopDB{sets: []fakeRows{benchOwnerRows(100), benchCountRows(100, 5)}}).open(SQLite)
 	q := From[benchOwner]().WithCount("Posts")
 	ctx := context.Background()
 	b.ReportAllocs()
@@ -1047,7 +1007,7 @@ func BenchmarkPreloadWithCount(b *testing.B) {
 }
 
 func BenchmarkPreloadManyToMany(b *testing.B) {
-	db := (&multiLoopDB{sets: []fakeRows{benchOwnerRows(100), benchTagJoinRows(100, 3)}}).open(SQLite)
+	db := (&loopDB{sets: []fakeRows{benchOwnerRows(100), benchTagJoinRows(100, 3)}}).open(SQLite)
 	q := From[benchOwner]().With("Tags")
 	ctx := context.Background()
 	b.ReportAllocs()
@@ -1060,7 +1020,7 @@ func BenchmarkPreloadManyToMany(b *testing.B) {
 }
 
 func BenchmarkPreloadRelLimit(b *testing.B) {
-	db := (&multiLoopDB{sets: []fakeRows{benchOwnerRows(100), benchPostRows(100, 5)}}).open(SQLite)
+	db := (&loopDB{sets: []fakeRows{benchOwnerRows(100), benchChildRows("bench_owner_id", "title", 100, 5)}}).open(SQLite)
 	q := From[benchOwner]().With("Posts", RelLimit(5), RelOrder("id"))
 	ctx := context.Background()
 	b.ReportAllocs()

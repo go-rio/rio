@@ -86,12 +86,12 @@ func New(db *sql.DB, dialect Dialect, opts ...Option) *DB {
 // pooling on a native view — the pool belongs to the driver's configuration.
 func (d *DB) Unwrap() *sql.DB { return d.db }
 
-// Native returns the driver-native pool handle behind the native channel —
-// NativeConfig.Handle, a *pgxpool.Pool under go-rio/postgres — and nil on
-// the database/sql channel. Application code goes through the driver
-// module's typed accessor (postgres.PoolOf); this is the raw door those
-// accessors are built on. Its transaction-scoped sibling is Tx.NativeTx, which
-// returns the SPI transaction adapter instead of a pool handle.
+// Native identifies the execution channel: it returns NativeConfig.Handle —
+// a *pgxpool.Pool under go-rio/postgres — on the native channel and nil on
+// the database/sql channel. Driver accessors (postgres.PoolOf) are built on
+// DriverHandle, which carries the handle on either channel; Native answers
+// only "is this the native channel". Its transaction-scoped sibling is
+// Tx.NativeTx, which returns the SPI transaction adapter.
 func (d *DB) Native() any { return d.native }
 
 // DriverHandle returns the driver-owned handle attached to this DB — the

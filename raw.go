@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"iter"
 	"reflect"
-	"unsafe"
 )
 
 // RawQuery is the escape hatch: hand-written SQL through the same rebind
@@ -104,56 +103,19 @@ func (r RawQuery[T]) Rows(ctx context.Context, db Queryer) iter.Seq2[T, error] {
 			yield(zero, err)
 			return
 		}
-		finished := false
-		var yielded int64
-		defer func() {
-			if !finished {
-				_ = finishRows(rows, finish, nil, yielded)
-			}
-		}()
-
-		// fields is the per-column scan plan: a synthetic single column for
-		// scalars, else the entity's columns matched by name with full coverage
+		// The per-column scan plan: a synthetic single column for scalars,
+		// else the entity's columns matched by name with full coverage
 		// enforced (namedFields) — the same shapes All scans.
-		var fields []*field
-		if scalar {
-			var f *field
-			if f, err = scalarField(tt); err == nil {
-				fields = []*field{f}
+		drainRows(rows, finish, func() ([]*field, error) {
+			if scalar {
+				f, err := scalarField(tt)
+				if err != nil {
+					return nil, err
+				}
+				return []*field{f}, nil
 			}
-		} else {
-			fields, err = namedFields(rows, p)
-		}
-		if err != nil {
-			finished = true
-			err = finishRows(rows, finish, err, 0)
-			yield(zero, err)
-			return
-		}
-		rs := newRowScanner(fields, nil)
-		defer rs.release()
-		var row T
-		for rows.Next() {
-			row = zero
-			if err := rs.scan(rows, unsafe.Pointer(&row)); err != nil {
-				finished = true
-				err = finishRows(rows, finish, err, yielded)
-				yield(zero, err)
-				return
-			}
-			yielded++
-			if !yield(row, nil) {
-				finished = true
-				_ = finishRows(rows, finish, nil, yielded)
-				return
-			}
-		}
-		err = rows.Err()
-		finished = true
-		err = finishRows(rows, finish, err, yielded)
-		if err != nil {
-			yield(zero, err)
-		}
+			return namedFields(rows, p)
+		}, yield)
 	}
 }
 

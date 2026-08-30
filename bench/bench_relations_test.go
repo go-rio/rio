@@ -31,13 +31,7 @@ func (BenchArticle) TableName() string { return "bench_articles" }
 
 func benchRelationDB(b *testing.B, name string) *sql.DB {
 	b.Helper()
-	raw, err := sql.Open("sqlite", "file:"+name+"?mode=memory&cache=shared")
-	if err != nil {
-		b.Fatal(err)
-	}
-	raw.SetMaxOpenConns(1)
-	b.Cleanup(func() { _ = raw.Close() })
-	ddl := []string{
+	raw := benchRawDB(b, name,
 		`CREATE TABLE bench_authors (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)`,
 		`CREATE TABLE bench_articles (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,12 +39,7 @@ func benchRelationDB(b *testing.B, name string) *sql.DB {
 			title TEXT NOT NULL
 		)`,
 		`CREATE INDEX idx_bench_articles_author ON bench_articles (bench_author_id)`,
-	}
-	for _, stmt := range ddl {
-		if _, err := raw.Exec(stmt); err != nil {
-			b.Fatal(err)
-		}
-	}
+	)
 	for a := 1; a <= 100; a++ {
 		if _, err := raw.Exec("INSERT INTO bench_authors (name) VALUES ('author')"); err != nil {
 			b.Fatal(err)

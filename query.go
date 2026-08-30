@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unsafe"
 )
 
 type cond struct {
@@ -438,45 +437,9 @@ func (q Query[T]) Rows(ctx context.Context, db Queryer, args ...any) iter.Seq2[T
 			yield(zero, err)
 			return
 		}
-		finished := false
-		var yielded int64
-		defer func() {
-			if !finished {
-				_ = finishRows(rows, finish, nil, yielded)
-			}
-		}()
-
-		fields, err := entityFields(rows, p, 0)
-		if err != nil {
-			finished = true
-			err = finishRows(rows, finish, err, 0)
-			yield(zero, err)
-			return
-		}
-		rs := newRowScanner(fields, nil)
-		defer rs.release()
-		var row T
-		for rows.Next() {
-			row = zero
-			if err := rs.scan(rows, unsafe.Pointer(&row)); err != nil {
-				finished = true
-				err = finishRows(rows, finish, err, yielded)
-				yield(zero, err)
-				return
-			}
-			yielded++
-			if !yield(row, nil) {
-				finished = true
-				_ = finishRows(rows, finish, nil, yielded)
-				return
-			}
-		}
-		err = rows.Err()
-		finished = true
-		err = finishRows(rows, finish, err, yielded)
-		if err != nil {
-			yield(zero, err)
-		}
+		drainRows(rows, finish, func() ([]*field, error) {
+			return entityFields(rows, p, 0)
+		}, yield)
 	}
 }
 
@@ -726,6 +689,15 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 		return "", nil, err
 	}
 	table := g.table(p)
+	// One resolution serves the keyset predicate and the ORDER BY: the two
+	// halves can never drift apart.
+	var sortKeys []resolvedKey
+	if len(s.orderKeys) > 0 || s.after != nil {
+		var err error
+		if sortKeys, err = resolveSortKeys(p, s); err != nil {
+			return "", nil, err
+		}
+	}
 	b := make([]byte, 0, 192)
 	var args []any
 
@@ -766,7 +738,7 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 		b = append(b, j...)
 	}
 
-	b, args, err := renderWhere(b, args, g, table, p, s)
+	b, args, err := renderWhere(b, args, g, table, p, s, sortKeys)
 	if err != nil {
 		return "", nil, err
 	}
@@ -800,23 +772,8 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 			b = append(b, o...)
 		}
 	}
-	if shape == selectRows && len(s.orderKeys) > 0 {
-		keys, err := resolveSortKeys(p, s)
-		if err != nil {
-			return "", nil, err
-		}
-		b = append(b, " ORDER BY "...)
-		for i, k := range keys {
-			if i > 0 {
-				b = append(b, ", "...)
-			}
-			b = d.quote(b, table)
-			b = append(b, '.')
-			b = d.quote(b, k.f.column)
-			if k.desc {
-				b = append(b, " DESC"...)
-			}
-		}
+	if shape == selectRows {
+		b = appendOrderKeys(b, d, table, sortKeys)
 	}
 	switch shape {
 	case selectRows:
@@ -910,6 +867,7 @@ func renderWhere(
 	table string,
 	p *plan,
 	s *queryState,
+	sortKeys []resolvedKey,
 ) ([]byte, []any, error) {
 	if s.err != nil {
 		return nil, nil, s.err
@@ -935,15 +893,8 @@ func renderWhere(
 		if p == nil {
 			return nil, nil, fmt.Errorf("rio: After needs an entity query")
 		}
-		keys, err := resolveSortKeys(p, s)
-		if err != nil {
-			return nil, nil, err
-		}
 		and()
-		b, args, err = renderAfter(b, args, d, table, keys, s.after)
-		if err != nil {
-			return nil, nil, err
-		}
+		b, args = renderAfter(b, args, d, table, sortKeys, s.after)
 	}
 	for _, hc := range s.hasConds {
 		if p == nil {
@@ -1197,6 +1148,13 @@ func renderPluck(g *grammar, p *plan, f *field, s *queryState) (string, []any, e
 		return "", nil, err
 	}
 	table := g.table(p)
+	var sortKeys []resolvedKey
+	if len(s.orderKeys) > 0 || s.after != nil {
+		var kerr error
+		if sortKeys, kerr = resolveSortKeys(p, s); kerr != nil {
+			return "", nil, kerr
+		}
+	}
 	b := make([]byte, 0, 128)
 	b = append(b, "SELECT "...)
 	b = d.quote(b, table)
@@ -1213,7 +1171,7 @@ func renderPluck(g *grammar, p *plan, f *field, s *queryState) (string, []any, e
 	}
 	var args []any
 	var err error
-	b, args, err = renderWhere(b, args, g, table, p, s)
+	b, args, err = renderWhere(b, args, g, table, p, s, sortKeys)
 	if err != nil {
 		return "", nil, err
 	}
@@ -1226,6 +1184,7 @@ func renderPluck(g *grammar, p *plan, f *field, s *queryState) (string, []any, e
 			b = append(b, order...)
 		}
 	}
+	b = appendOrderKeys(b, d, table, sortKeys)
 	b, err = appendLimitOffset(b, d, s)
 	if err != nil {
 		return "", nil, err

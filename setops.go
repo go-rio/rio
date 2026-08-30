@@ -183,7 +183,7 @@ func (q Query[T]) updateAll(
 		bindArgs = append(bindArgs, v)
 	}
 
-	b, bindArgs, err = renderWhere(b, bindArgs, g, table, p, &state)
+	b, bindArgs, err = renderWhere(b, bindArgs, g, table, p, &state, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -205,7 +205,7 @@ func (q Query[T]) forceDeleteAll(ctx context.Context, db Queryer, p *plan, state
 	b = append(b, "DELETE FROM "...)
 	b = d.quote(b, table)
 	var args []any
-	b, args, err := renderWhere(b, args, g, table, p, state)
+	b, args, err := renderWhere(b, args, g, table, p, state, nil)
 	if err != nil {
 		return 0, err
 	}

@@ -2,6 +2,7 @@ package lint
 
 import (
 	"context"
+	"strings"
 
 	"github.com/go-rio/rio"
 )
@@ -19,10 +20,10 @@ type dbColumn struct {
 // placeholder rebinds per dialect like everything else.
 type introspector func(ctx context.Context, db *rio.DB, table string) (cols []dbColumn, found bool, err error)
 
-var introspectors = map[string]introspector{
-	"postgres": introspectPostgres,
-	"mysql":    introspectMySQL,
-	"sqlite":   introspectSQLite,
+var introspectors = map[rio.Dialect]introspector{
+	rio.Postgres: introspectPostgres,
+	rio.MySQL:    introspectMySQL,
+	rio.SQLite:   introspectSQLite,
 }
 
 func introspectPostgres(ctx context.Context, db *rio.DB, table string) ([]dbColumn, bool, error) {
@@ -58,7 +59,7 @@ func introspectPostgres(ctx context.Context, db *rio.DB, table string) ([]dbColu
 	for _, r := range rows {
 		out = append(out, dbColumn{
 			name:     r.Name,
-			dataType: lower(r.DataType),
+			dataType: strings.ToLower(r.DataType),
 			nullable: r.Nullable == "YES",
 			pk:       isPK[r.Name],
 		})
@@ -85,7 +86,7 @@ func introspectMySQL(ctx context.Context, db *rio.DB, table string) ([]dbColumn,
 	for _, r := range rows {
 		out = append(out, dbColumn{
 			name:     r.Name,
-			dataType: lower(r.DataType),
+			dataType: strings.ToLower(r.DataType),
 			nullable: r.Nullable == "YES",
 			pk:       r.Key == "PRI",
 		})
@@ -109,7 +110,7 @@ func introspectSQLite(ctx context.Context, db *rio.DB, table string) ([]dbColumn
 	for _, r := range rows {
 		out = append(out, dbColumn{
 			name:     r.Name,
-			dataType: lower(r.Type),
+			dataType: strings.ToLower(r.Type),
 			// An INTEGER PRIMARY KEY is the rowid: NOT NULL in effect even
 			// though pragma reports notnull=0.
 			nullable: r.Notnull == 0 && r.Pk == 0,
@@ -117,14 +118,4 @@ func introspectSQLite(ctx context.Context, db *rio.DB, table string) ([]dbColumn
 		})
 	}
 	return out, true, nil
-}
-
-func lower(s string) string {
-	b := []byte(s)
-	for i, c := range b {
-		if c >= 'A' && c <= 'Z' {
-			b[i] = c + 'a' - 'A'
-		}
-	}
-	return string(b)
 }

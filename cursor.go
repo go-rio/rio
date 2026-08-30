@@ -44,33 +44,30 @@ func (c Cursor) String() string {
 	b := []byte{cursorVersion}
 	b = binary.BigEndian.AppendUint64(b, c.fp)
 	for _, v := range c.values {
+		var tag byte
+		var body string
 		switch t := v.(type) {
 		case int64:
-			b = append(b, 'i')
-			b = appendCursorString(b, strconv.FormatInt(t, 10))
+			tag, body = 'i', strconv.FormatInt(t, 10)
 		case uint64:
-			b = append(b, 'u')
-			b = appendCursorString(b, strconv.FormatUint(t, 10))
+			tag, body = 'u', strconv.FormatUint(t, 10)
 		case float64:
 			// Bit-exact: formatting would round-trip imprecisely.
-			b = append(b, 'f')
-			b = appendCursorString(b, strconv.FormatUint(math.Float64bits(t), 16))
+			tag, body = 'f', strconv.FormatUint(math.Float64bits(t), 16)
 		case bool:
-			b = append(b, 'b')
-			b = appendCursorString(b, strconv.FormatBool(t))
+			tag, body = 'b', strconv.FormatBool(t)
 		case string:
-			b = append(b, 's')
-			b = appendCursorString(b, t)
+			tag, body = 's', t
 		case time.Time:
-			b = append(b, 't')
-			b = appendCursorString(b, t.UTC().Format(time.RFC3339Nano))
+			tag, body = 't', t.UTC().Format(time.RFC3339Nano)
 		default:
 			// CursorAfter only produces the cases above; a hand-built Cursor
 			// with another type still encodes deterministically as its print
 			// form and binds as a string.
-			b = append(b, 's')
-			b = appendCursorString(b, fmt.Sprint(t))
+			tag, body = 's', fmt.Sprint(t)
 		}
+		b = append(b, tag)
+		b = appendCursorString(b, body)
 	}
 	return base64.RawURLEncoding.EncodeToString(b)
 }
@@ -197,7 +194,7 @@ func resolveSortKeys(p *plan, s *queryState) ([]resolvedKey, error) {
 // default rio would have to guess), and Scanner/JSON/byte columns have no
 // canonical comparable form to put in a token.
 func checkSortable(p *plan, f *field) error {
-	if f.typ.Kind() == reflect.Pointer || f.isSoftDelete {
+	if f.nullable() {
 		return fmt.Errorf(
 			"rio: OrderKeys: column %q of %s is nullable; keyset comparison over NULL has no portable order — sort a NOT NULL column, or coalesce in Raw",
 			f.column, p.structName,
@@ -251,6 +248,22 @@ func cursorValue(f *field, rv reflect.Value) (any, error) {
 	return nil, fmt.Errorf("rio: cursor: column %q is not a cursor scalar", f.column)
 }
 
+// check verifies the cursor against the query's resolved ordering. It is
+// connection-independent, so Validate owns it; execution reaches rendering
+// only through the same validation.
+func (c *Cursor) check(keys []resolvedKey) error {
+	if c.IsZero() {
+		return fmt.Errorf("rio: After: the zero Cursor marks no position; omit After for the first page")
+	}
+	if c.fp != sortKeyFingerprint(keys) {
+		return fmt.Errorf("rio: After: the cursor was issued for a different ordering than this query's OrderKeys")
+	}
+	if len(c.values) != len(keys) {
+		return fmt.Errorf("rio: After: the cursor carries %d value(s) for %d sort key(s)", len(c.values), len(keys))
+	}
+	return nil
+}
+
 // renderAfter appends the keyset predicate for resuming past the cursor:
 //
 //	AND ((k0 > ?) OR (k0 = ? AND k1 > ?) OR ...)
@@ -258,16 +271,7 @@ func cursorValue(f *field, rv reflect.Value) (any, error) {
 // The expanded form works identically on every dialect — row-value
 // comparison syntax does not — and cannot express a mixed-direction
 // ordering any other way. Each comparison flips per key direction.
-func renderAfter(b []byte, args []any, d Dialect, table string, keys []resolvedKey, c *Cursor) ([]byte, []any, error) {
-	if c.IsZero() {
-		return nil, nil, fmt.Errorf("rio: After: the zero Cursor marks no position; omit After for the first page")
-	}
-	if c.fp != sortKeyFingerprint(keys) {
-		return nil, nil, fmt.Errorf("rio: After: the cursor was issued for a different ordering than this query's OrderKeys")
-	}
-	if len(c.values) != len(keys) {
-		return nil, nil, fmt.Errorf("rio: After: the cursor carries %d value(s) for %d sort key(s)", len(c.values), len(keys))
-	}
+func renderAfter(b []byte, args []any, d Dialect, table string, keys []resolvedKey, c *Cursor) ([]byte, []any) {
 	b = append(b, '(')
 	for i, k := range keys {
 		if i > 0 {
@@ -293,7 +297,29 @@ func renderAfter(b []byte, args []any, d Dialect, table string, keys []resolvedK
 		b = append(b, ')')
 	}
 	b = append(b, ')')
-	return b, args, nil
+	return b, args
+}
+
+// appendOrderKeys renders the resolved structured ordering. Every
+// row-returning renderer shares it, so the ORDER BY can never drift from
+// the keyset predicate built over the same keys.
+func appendOrderKeys(b []byte, d Dialect, table string, keys []resolvedKey) []byte {
+	if len(keys) == 0 {
+		return b
+	}
+	b = append(b, " ORDER BY "...)
+	for i, k := range keys {
+		if i > 0 {
+			b = append(b, ", "...)
+		}
+		b = d.quote(b, table)
+		b = append(b, '.')
+		b = d.quote(b, k.f.column)
+		if k.desc {
+			b = append(b, " DESC"...)
+		}
+	}
+	return b
 }
 
 // OrderKeys sets a structured ordering over mapped columns — the form cursor
