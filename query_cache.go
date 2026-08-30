@@ -150,6 +150,10 @@ func newCachedQuery(
 	sqlText string,
 	args []any,
 ) (*cachedQuery, bool) {
+	if s.after != nil {
+		// The cursor's values change every page; the shape is not stable.
+		return nil, false
+	}
 	positions := make([]int, len(execArgs))
 	var missing []cachedDeferred
 	execIndex := 0

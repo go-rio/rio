@@ -8,13 +8,14 @@ import (
 
 // config carries the per-DB settings frozen at New time.
 type config struct {
-	hooks      []QueryHook
-	clock      func() time.Time
-	translator func(error) error
-	tableNamer func(structName string) string
-	logArgs    bool
-	stmtCache  bool
-	stmtCap    int
+	hooks        []QueryHook
+	clock        func() time.Time
+	translator   func(error) error
+	tableNamer   func(structName string) string
+	logArgs      bool
+	stmtCache    bool
+	stmtCap      int
+	driverHandle any
 }
 
 // Option configures a DB handle at construction time.
@@ -58,6 +59,15 @@ func WithErrorTranslator(f func(error) error) Option {
 // pick at the call site, exactly as with read/write splitting.
 func WithTableNamer(f func(structName string) string) Option {
 	return func(c *config) { c.tableNamer = f }
+}
+
+// WithDriverHandle attaches a driver-owned handle (a connection pool the
+// driver module built the *sql.DB over) to the DB, retrievable through
+// DB.DriverHandle. It exists for driver modules: their typed accessors
+// (postgres.PoolOf) read it back, and the handle's lifecycle rides on the DB
+// instead of a package-level registry. rio itself never touches the value.
+func WithDriverHandle(h any) Option {
+	return func(c *config) { c.driverHandle = h }
 }
 
 // WithoutArgs redacts bind arguments from QueryEvent before hooks see them.

@@ -198,6 +198,7 @@ func NewNative(nc NativeConfig, dialect Dialect, opts ...Option) *DB {
 		g:      newGrammar(dialect, cfg),
 		cfg:    cfg,
 		native: nc.Handle,
+		handle: nc.Handle,
 	}
 }
 

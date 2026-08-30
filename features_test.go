@@ -4103,3 +4103,116 @@ func TestWriteColumnsNilModelErrors(t *testing.T) {
 		t.Fatalf("nil in any position must error: %v", err)
 	}
 }
+
+// --- cursor pagination ---
+
+type pagedItem struct {
+	ID    int64
+	Score int64
+	Name  string
+}
+
+// The keyset predicate expands per direction — row-value syntax cannot mix
+// ASC and DESC and differs by dialect — and the primary key is appended as
+// the tie-breaker, following the last declared direction.
+func TestCursorAfterRendersExpandedKeysetPredicate(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+
+	q := From[pagedItem]().OrderKeys(
+		SortKey{Column: "score", Desc: true},
+		SortKey{Column: "name"},
+	)
+	last := pagedItem{ID: 7, Score: 90, Name: "m"}
+	cur, err := q.CursorAfter(&last)
+	if err != nil {
+		t.Fatalf("CursorAfter: %v", err)
+	}
+
+	f.queueRows([]string{"id", "score", "name"})
+	if _, err := q.After(cur).Limit(2).All(ctx, db); err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	got := f.loggedContaining("SELECT")[0]
+	wantPred := `(("paged_items"."score" < $1) OR ("paged_items"."score" = $2 AND "paged_items"."name" > $3) OR ("paged_items"."score" = $4 AND "paged_items"."name" = $5 AND "paged_items"."id" > $6))`
+	if !strings.Contains(got.sql, wantPred) {
+		t.Fatalf("keyset predicate:\n got: %s\nwant: %s", got.sql, wantPred)
+	}
+	wantOrder := `ORDER BY "paged_items"."score" DESC, "paged_items"."name", "paged_items"."id" LIMIT 2`
+	if !strings.HasSuffix(got.sql, wantOrder) {
+		t.Fatalf("order tail:\n got: %s\nwant suffix: %s", got.sql, wantOrder)
+	}
+	wantArgs := []any{int64(90), int64(90), "m", int64(90), "m", int64(7)}
+	if len(got.args) != len(wantArgs) {
+		t.Fatalf("args: %#v", got.args)
+	}
+	for i, w := range wantArgs {
+		if got.args[i] != w {
+			t.Fatalf("arg %d = %#v, want %#v", i, got.args[i], w)
+		}
+	}
+}
+
+// The token round-trips values exactly and pins the ordering: a cursor
+// issued under different OrderKeys fails loudly instead of paging nonsense.
+func TestCursorTokenRoundTripAndFingerprint(t *testing.T) {
+	q := From[pagedItem]().OrderKeys(SortKey{Column: "score", Desc: true})
+	cur, err := q.CursorAfter(&pagedItem{ID: 3, Score: -12, Name: "x"})
+	if err != nil {
+		t.Fatalf("CursorAfter: %v", err)
+	}
+	parsed, err := ParseCursor(cur.String())
+	if err != nil {
+		t.Fatalf("ParseCursor: %v", err)
+	}
+	if parsed.String() != cur.String() {
+		t.Fatal("token must round-trip byte-identically")
+	}
+
+	other := From[pagedItem]().OrderKeys(SortKey{Column: "name"})
+	f := newFakeDB()
+	db := f.open()
+	_, err = other.After(parsed).All(context.Background(), db)
+	if err == nil || !strings.Contains(err.Error(), "different ordering") {
+		t.Fatalf("a cursor from another ordering must refuse: %v", err)
+	}
+
+	if _, err := ParseCursor("not-a-token!"); err == nil {
+		t.Fatal("garbage tokens must refuse")
+	}
+	_, err = From[pagedItem]().OrderKeys(SortKey{Column: "score"}).After(Cursor{}).All(context.Background(), db)
+	if err == nil || !strings.Contains(err.Error(), "zero Cursor") {
+		t.Fatalf("the zero cursor must refuse: %v", err)
+	}
+}
+
+// OrderKeys validates like every other structured input: mapped columns
+// only, no nullable keys, no verbatim OrderBy alongside, and a primary key
+// to break ties with.
+func TestOrderKeysValidation(t *testing.T) {
+	if err := From[pagedItem]().OrderKeys(SortKey{Column: "nope"}).After(Cursor{}).Validate(); err == nil ||
+		!strings.Contains(err.Error(), "no column") {
+		t.Fatalf("unknown column: %v", err)
+	}
+	if err := From[User]().OrderKeys(SortKey{Column: "bio"}).Validate(); err == nil ||
+		!strings.Contains(err.Error(), "nullable") {
+		t.Fatalf("nullable key: %v", err)
+	}
+	if err := From[pagedItem]().OrderKeys(SortKey{Column: "score"}).OrderBy("name").Validate(); err == nil ||
+		!strings.Contains(err.Error(), "cannot mix") {
+		t.Fatalf("OrderBy mix: %v", err)
+	}
+	if err := From[pagedItem]().OrderKeys(SortKey{Column: "score"}, SortKey{Column: "score"}).Validate(); err == nil ||
+		!strings.Contains(err.Error(), "declared twice") {
+		t.Fatalf("duplicate key: %v", err)
+	}
+	_, err := From[pagedItem]().CursorAfter(&pagedItem{})
+	if err == nil || !strings.Contains(err.Error(), "needs OrderKeys") {
+		t.Fatalf("cursor without OrderKeys: %v", err)
+	}
+	_, err = From[pagedItem]().Where("score > ?", 1).OrderKeys(SortKey{Column: "score"}).UpdateAll(context.Background(), newFakeDB().open(), Set{"name": "x"})
+	if err == nil || !strings.Contains(err.Error(), "cannot honor OrderKeys") {
+		t.Fatalf("set-op with OrderKeys: %v", err)
+	}
+}

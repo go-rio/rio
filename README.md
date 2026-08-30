@@ -143,6 +143,45 @@ bound. `Rows` streams without materializing the result and rejects `With` or
 transaction. It is off by default and is unsuitable for poolers in transaction
 or statement mode.
 
+### Cursor pagination
+
+`OrderKeys` declares a structured ordering over mapped NOT NULL columns —
+unlike verbatim `OrderBy`, rio can read the keys' values back out of a row to
+issue a cursor. Any primary-key column missing from the keys is appended as
+the tie-breaker, so pages never skip or repeat rows sharing a key value:
+
+```go
+q := rio.From[Post]().OrderKeys(
+    rio.SortKey{Column: "score", Desc: true},
+    rio.SortKey{Column: "created_at"},
+) // + "id" appended automatically
+
+page, err := q.Limit(20).All(ctx, db)
+cur, err := q.CursorAfter(&page[len(page)-1])
+next, err := q.After(cur).Limit(20).All(ctx, db)
+```
+
+`Cursor.String` and `rio.ParseCursor` round-trip a URL-safe token. It encodes
+only values, which bind as parameters — a forged token moves the page window,
+never the query — and carries a fingerprint of its ordering, so a cursor
+issued under different `OrderKeys` fails loudly. Backward paging is explicit:
+flip every key's direction and resume `After` the first row of the page.
+
+### Schema-drift lint
+
+The read-only `lint` subpackage compares model expectations against the live
+schema on PostgreSQL, MySQL, and SQLite — missing tables and columns,
+nullability and primary-key disagreements, and type mismatches within known
+equivalence classes. Unknown database types stay silent rather than guessed
+at; run it in CI or a startup probe:
+
+```go
+report, err := lint.Check(ctx, db, User{}, Post{})
+for _, f := range report.Findings {
+    log.Printf("%s: %s", f.Severity, f.Message)
+}
+```
+
 ## Databases and transactions
 
 `*DB` and `*Tx` both implement `rio.Queryer`, so repository code can accept one

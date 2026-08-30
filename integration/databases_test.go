@@ -4,12 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"math/rand"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/go-rio/postgres"
 	"github.com/go-rio/rio"
+	"github.com/go-rio/rio/lint"
 	"github.com/go-sql-driver/mysql"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -254,5 +257,257 @@ func TestModerncTimeProbe(t *testing.T) {
 	}
 	if *raw == nil || **raw == "" {
 		t.Fatal("SQLite date functions must parse the stored value; datetime() returned NULL")
+	}
+}
+
+// Cursor pagination walks the whole set without gaps or repeats — heavy
+// ties on the leading key make the PK tie-breaker do real work, and every
+// page resumes through the string token round-trip.
+func TestSQLiteCursorPaginationWalk(t *testing.T) {
+	db := sqliteDB(t)
+	ctx := context.Background()
+	if _, err := rio.Exec(ctx, db, `CREATE TABLE walk_items (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		score INTEGER NOT NULL,
+		name TEXT NOT NULL
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	type walkItem struct {
+		ID    int64
+		Score int64
+		Name  string
+	}
+	for i := range 100 {
+		if _, err := rio.Exec(ctx, db,
+			"INSERT INTO walk_items (score, name) VALUES (?, ?)",
+			i%7, fmt.Sprintf("n%02d", i%13),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	q := rio.From[walkItem]().OrderKeys(
+		rio.SortKey{Column: "score", Desc: true},
+		rio.SortKey{Column: "name"},
+	)
+	full, err := q.All(ctx, db)
+	if err != nil || len(full) != 100 {
+		t.Fatalf("full walk: len=%d err=%v", len(full), err)
+	}
+
+	var walked []int64
+	page := q.Limit(9)
+	var token string
+	for {
+		p := page
+		if token != "" {
+			cur, err := rio.ParseCursor(token)
+			if err != nil {
+				t.Fatalf("ParseCursor: %v", err)
+			}
+			p = page.After(cur)
+		}
+		rows, err := p.All(ctx, db)
+		if err != nil {
+			t.Fatalf("page: %v", err)
+		}
+		if len(rows) == 0 {
+			break
+		}
+		for _, r := range rows {
+			walked = append(walked, r.ID)
+		}
+		cur, err := page.CursorAfter(&rows[len(rows)-1])
+		if err != nil {
+			t.Fatalf("CursorAfter: %v", err)
+		}
+		token = cur.String()
+		if len(rows) < 9 {
+			break
+		}
+	}
+
+	if len(walked) != 100 {
+		t.Fatalf("walked %d rows, want 100", len(walked))
+	}
+	seen := make(map[int64]bool, 100)
+	for i, id := range walked {
+		if seen[id] {
+			t.Fatalf("row %d repeated at position %d", id, i)
+		}
+		seen[id] = true
+		if id != full[i].ID {
+			t.Fatalf("position %d: walked %d, full scan %d — the orders drifted", i, id, full[i].ID)
+		}
+	}
+}
+
+// The drift lint reads the live schema and reports exactly the decidable
+// disagreements: every finding kind fires once against a deliberately
+// skewed table, and a clean table reports nothing.
+func TestSQLiteSchemaDriftLint(t *testing.T) {
+	db := sqliteDB(t)
+	ctx := context.Background()
+
+	type DriftItem struct {
+		ID      int64
+		Name    string
+		Missing string // not in the table
+		Wrong   int64  // nullable in the table, non-pointer here
+	}
+	if _, err := rio.Exec(ctx, db, `CREATE TABLE drift_items (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		wrong INTEGER,
+		legacy TEXT
+	)`); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := lint.Check(ctx, db, DriftItem{})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	kinds := map[string]int{}
+	for _, f := range report.Findings {
+		kinds[f.Kind]++
+	}
+	if kinds["missing-column"] != 1 || kinds["nullability"] != 1 || kinds["extra-column"] != 1 {
+		t.Fatalf("finding kinds drifted: %+v\n%+v", kinds, report.Findings)
+	}
+	if n := len(report.Errors()); n != 1 { // the missing column
+		t.Fatalf("errors = %d, want 1: %+v", n, report.Errors())
+	}
+
+	type CleanItem struct {
+		ID   int64
+		Name string
+	}
+	if _, err := rio.Exec(ctx, db,
+		"CREATE TABLE clean_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	clean, err := lint.Check(ctx, db, CleanItem{})
+	if err != nil {
+		t.Fatalf("Check clean: %v", err)
+	}
+	if len(clean.Findings) != 0 {
+		t.Fatalf("a matching schema must report nothing: %+v", clean.Findings)
+	}
+
+	missing, err := lint.Check(ctx, db, struct {
+		ID int64
+	}{})
+	if err != nil {
+		t.Fatalf("Check missing: %v", err)
+	}
+	if len(missing.Findings) != 1 || missing.Findings[0].Kind != "missing-table" {
+		t.Fatalf("a missing table is one loud error: %+v", missing.Findings)
+	}
+}
+
+// The soft-delete state machine holds under arbitrary Delete/Restore
+// interleavings, stale versions included: a deterministic random walk
+// compares every step's error, write-back, and stored row against a pure
+// in-memory model of the documented semantics.
+func TestSQLiteSoftDeleteStateMachine(t *testing.T) {
+	db := sqliteDB(t)
+	ctx := context.Background()
+	if _, err := rio.Exec(ctx, db, `CREATE TABLE prop_items (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		version INTEGER NOT NULL,
+		deleted_at DATETIME,
+		updated_at DATETIME NOT NULL
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	type propItem struct {
+		ID        int64
+		Version   int64      `rio:",version"`
+		DeletedAt *time.Time `rio:",softdelete"`
+		UpdatedAt time.Time
+	}
+
+	for seed := int64(1); seed <= 3; seed++ {
+		rng := rand.New(rand.NewSource(seed))
+		row := &propItem{}
+		if err := rio.Insert(ctx, db, row); err != nil {
+			t.Fatal(err)
+		}
+		// The model mirrors the documented semantics.
+		model := struct {
+			trashed bool
+			version int64
+			stamp   time.Time
+		}{version: row.Version}
+
+		for step := range 200 {
+			// Half the time act on a stale snapshot: the stored version
+			// minus one, which never matches a live row.
+			attempt := &propItem{ID: row.ID, Version: model.version}
+			stale := rng.Intn(2) == 0
+			if stale {
+				attempt.Version = model.version - 1
+			}
+			del := rng.Intn(2) == 0
+
+			var err error
+			if del {
+				err = rio.Delete(ctx, db, attempt)
+			} else {
+				err = rio.Restore(ctx, db, attempt)
+			}
+
+			// What the documented semantics demand of this step:
+			// already in the target state → idempotent success adopting the
+			// stored stamp and version, stale or not; otherwise a stale
+			// version is a conflict, and a fresh one performs the write.
+			switch {
+			case del && model.trashed:
+				if err != nil {
+					t.Fatalf("seed %d step %d: repeat Delete: %v", seed, step, err)
+				}
+				if attempt.Version != model.version || attempt.DeletedAt == nil || !attempt.DeletedAt.Equal(model.stamp) {
+					t.Fatalf("seed %d step %d: Delete must adopt stored state: %+v vs %+v", seed, step, attempt, model)
+				}
+			case !del && !model.trashed:
+				if err != nil {
+					t.Fatalf("seed %d step %d: repeat Restore: %v", seed, step, err)
+				}
+				if attempt.Version != model.version || attempt.DeletedAt != nil {
+					t.Fatalf("seed %d step %d: Restore must adopt live state: %+v vs %+v", seed, step, attempt, model)
+				}
+			case stale:
+				if !errors.Is(err, rio.ErrStaleObject) {
+					t.Fatalf("seed %d step %d: stale write must conflict, got %v", seed, step, err)
+				}
+			case del:
+				if err != nil {
+					t.Fatalf("seed %d step %d: Delete: %v", seed, step, err)
+				}
+				model.trashed = true
+				model.version++
+				model.stamp = *attempt.DeletedAt
+			default:
+				if err != nil {
+					t.Fatalf("seed %d step %d: Restore: %v", seed, step, err)
+				}
+				model.trashed = false
+				model.version++
+			}
+
+			// The stored row must match the model exactly.
+			stored, err := rio.From[propItem]().WithTrashed().Where("id = ?", row.ID).First(ctx, db)
+			if err != nil {
+				t.Fatalf("seed %d step %d: read back: %v", seed, step, err)
+			}
+			if stored.Version != model.version || (stored.DeletedAt != nil) != model.trashed {
+				t.Fatalf("seed %d step %d: stored %+v drifted from model %+v", seed, step, stored, model)
+			}
+			if model.trashed && !stored.DeletedAt.Equal(model.stamp) {
+				t.Fatalf("seed %d step %d: deletion stamp drifted: %v vs %v", seed, step, stored.DeletedAt, model.stamp)
+			}
+		}
 	}
 }

@@ -1,0 +1,25 @@
+name: Fuzz
+on:
+  schedule:
+    - cron: "17 3 * * *" # nightly; the seed corpus alone runs in every Test job
+  workflow_dispatch:
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          cache: true
+          go-version: "stable"
+      - name: Fuzz the placeholder rebinder
+        run: go test -fuzz FuzzRebind -fuzztime 10m -run FuzzRebind .
+      - name: Upload failing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-failures
+          path: testdata/fuzz
+          if-no-files-found: ignore

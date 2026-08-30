@@ -48,6 +48,11 @@ type queryState struct {
 	withs    []preloadSpec
 	hasConds []hasCond
 	counts   []string
+
+	// orderKeys is the structured ordering cursor pagination reads values
+	// through; after is the position to resume past.
+	orderKeys []SortKey
+	after     *Cursor
 }
 
 // hasCond describes one WhereHas or WhereHasNot EXISTS predicate.
@@ -795,6 +800,24 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 			b = append(b, o...)
 		}
 	}
+	if shape == selectRows && len(s.orderKeys) > 0 {
+		keys, err := resolveSortKeys(p, s)
+		if err != nil {
+			return "", nil, err
+		}
+		b = append(b, " ORDER BY "...)
+		for i, k := range keys {
+			if i > 0 {
+				b = append(b, ", "...)
+			}
+			b = d.quote(b, table)
+			b = append(b, '.')
+			b = d.quote(b, k.f.column)
+			if k.desc {
+				b = append(b, " DESC"...)
+			}
+		}
+	}
 	switch shape {
 	case selectRows:
 		b, err = appendLimitOffset(b, d, s)
@@ -907,6 +930,20 @@ func renderWhere(
 		b = append(b, w.expr...)
 		b = append(b, ')')
 		args = append(args, w.args...)
+	}
+	if s.after != nil {
+		if p == nil {
+			return nil, nil, fmt.Errorf("rio: After needs an entity query")
+		}
+		keys, err := resolveSortKeys(p, s)
+		if err != nil {
+			return nil, nil, err
+		}
+		and()
+		b, args, err = renderAfter(b, args, d, table, keys, s.after)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	for _, hc := range s.hasConds {
 		if p == nil {

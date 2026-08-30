@@ -314,8 +314,14 @@ Each of these is a decision, not a gap:
 The core ships mapping, immutable queries, entity and set writes, upsert and
 batch paths, four relation types, nested preloading and counts, optimistic
 locking, soft delete, timestamps, Raw/Exec, reusable validated Query templates,
-column generation, opt-in statement caching, transactions/savepoints, hooks,
-error translation, and composite keys. ClickHouse implements the read-and-append
-subset plus `Query.Final`.
-
-Not shipped yet: cursor pagination and schema-drift lint.
+cursor pagination (`OrderKeys`/`After`/`CursorAfter`: structured sort keys
+over mapped NOT NULL columns, an automatic primary-key tie-breaker, an
+expanded per-direction keyset predicate identical on every dialect, and
+value-only tokens fingerprinted against their ordering), column generation,
+opt-in statement caching, transactions/savepoints, hooks, error translation,
+and composite keys. ClickHouse implements the read-and-append subset plus
+`Query.Final`. The `lint` subpackage compares model expectations against the
+live schema (PostgreSQL, MySQL, SQLite) read-only, reporting only decidable
+drift — missing tables/columns, nullability and primary-key disagreements,
+and type mismatches within known equivalence classes; unknown types stay
+silent rather than guessed at.

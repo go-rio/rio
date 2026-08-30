@@ -32,6 +32,7 @@ type DB struct {
 	g      *grammar
 	cfg    *config
 	native any // driver-native pool handle (NativeConfig.Handle); nil on database/sql
+	handle any // driver-owned handle (WithDriverHandle / NativeConfig.Handle)
 }
 
 // Tx is a transaction handle. It satisfies Queryer, so every rio entry point
@@ -75,7 +76,7 @@ func New(db *sql.DB, dialect Dialect, opts ...Option) *DB {
 	if cfg.stmtCache {
 		e.stmts = newStmtCache(db, cfg.stmtCap)
 	}
-	return &DB{db: db, e: e, g: newGrammar(dialect, cfg), cfg: cfg}
+	return &DB{db: db, e: e, g: newGrammar(dialect, cfg), cfg: cfg, handle: cfg.driverHandle}
 }
 
 // Unwrap returns the underlying *sql.DB for anything rio does not cover. On
@@ -92,6 +93,15 @@ func (d *DB) Unwrap() *sql.DB { return d.db }
 // accessors are built on. Its transaction-scoped sibling is Tx.NativeTx, which
 // returns the SPI transaction adapter instead of a pool handle.
 func (d *DB) Native() any { return d.native }
+
+// DriverHandle returns the driver-owned handle attached to this DB — the
+// value a driver module passed through WithDriverHandle (a database/sql
+// adapter over its own pool) or NativeConfig.Handle (the native channel) —
+// and nil when none was attached. Unlike Native, which identifies the
+// execution channel, this is pure ownership: driver modules build their
+// typed accessors (postgres.PoolOf) on it, so a handle's lifecycle rides on
+// the DB instead of a side registry.
+func (d *DB) DriverHandle() any { return d.handle }
 
 // Close closes the prepared-statement cache (if enabled) and the underlying
 // *sql.DB.
