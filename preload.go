@@ -294,7 +294,7 @@ func collectRelationLayer(
 			return nil, nil, fmt.Errorf("rio: %s has no relation %q", p.structName, head)
 		}
 		g := groups[head]
-		var l *relLoad
+		var l relFinisher
 		var err error
 		stmts, l, err = prepareRelationLoad(db, p, rel, rows, g.opts, g.tails, stmts)
 		if err != nil {
@@ -317,34 +317,36 @@ func splitPath(path string) (head, tail string) {
 // relLoad is one relation's two-phase load: chunk statements consume rows
 // into buf, finish assembles buf into the owners. One heap object serves the
 // whole relation; finish must run only after every statement was consumed.
-type relLoad struct {
+type relLoad[K comparable, KR keyer[K]] struct {
+	kr        KR
 	db        Queryer
 	owner     *plan
 	rel       *relField
 	res       *resolvedRel
 	owners    reflect.Value
 	tails     []preloadSpec
-	keys      []any
-	parentKey []any
+	keys      []K
+	parentKey []pkey[K]
 	keyed     bool
 	// buf must stay addressable: scanRel grows it in place.
 	buf     reflect.Value
-	bufKeys []any
+	bufKeys []pkey[K]
 }
 
-func (l *relLoad) consume(sqlRows rows) (int64, error) {
+func (l *relLoad[K, KR]) consume(sqlRows rows) (int64, error) {
 	before := l.buf.Len()
-	part, partKeys, err := scanRel(sqlRows, l.res.target, l.buf, l.keyed, l.res)
+	part, partKeys, err := scanRel(sqlRows, l.res.target, l.buf, l.keyed, l.res, l.kr, l.bufKeys)
 	if err != nil {
 		return int64(part.Len() - before), err
 	}
 	l.buf = part
-	l.bufKeys = append(l.bufKeys, partKeys...)
+	l.bufKeys = partKeys
 	return int64(part.Len() - before), nil
 }
 
 // prepareRelationLoad renders one relation's preload queries onto stmts and
-// returns the loader that consumes and finishes them.
+// returns the loader that consumes and finishes them, in the typed key space
+// both key columns fit.
 func prepareRelationLoad(
 	db Queryer,
 	owner *plan,
@@ -353,7 +355,7 @@ func prepareRelationLoad(
 	opts []RelOption,
 	tails []preloadSpec,
 	stmts []relStatement,
-) ([]relStatement, *relLoad, error) {
+) ([]relStatement, relFinisher, error) {
 	res, err := rel.resolve(owner)
 	if err != nil {
 		return nil, nil, err
@@ -365,36 +367,58 @@ func prepareRelationLoad(
 			rel.name,
 		)
 	}
+	switch relKeyFam(res.ref.typ, res.fk.typ) {
+	case kfInt:
+		return prepareRelLoadK(db, owner, rel, res, owners, opts, tails, stmts, intKeyer{})
+	case kfUint:
+		return prepareRelLoadK(db, owner, rel, res, owners, opts, tails, stmts, uintKeyer{})
+	case kfStr:
+		return prepareRelLoadK(db, owner, rel, res, owners, opts, tails, stmts, strKeyer{})
+	default:
+		return prepareRelLoadK(db, owner, rel, res, owners, opts, tails, stmts, anyKeyer{})
+	}
+}
+
+func prepareRelLoadK[K comparable, KR keyer[K]](
+	db Queryer,
+	owner *plan,
+	rel *relField,
+	res *resolvedRel,
+	owners reflect.Value,
+	opts []RelOption,
+	tails []preloadSpec,
+	stmts []relStatement,
+	kr KR,
+) ([]relStatement, relFinisher, error) {
 	var rq relQuery
 	for _, opt := range opts {
 		opt(&rq)
 	}
 
-	// canonKey groups; the IN (?) binds the original value — a stringified
-	// []byte would not match a BLOB/BYTEA column.
-	seen := make(map[any]struct{}, owners.Len())
-	keys := make([]any, 0, owners.Len())
-	parentKey := make([]any, owners.Len())
+	// Typed keys group; the IN (?) binds the canonical value, whose family
+	// matches the column's.
+	seen := make(map[K]struct{}, owners.Len())
+	keys := make([]K, 0, owners.Len())
+	var binds []any // non-nil only when bind values differ from keys
+	parentKey := make([]pkey[K], owners.Len())
 	for i := 0; i < owners.Len(); i++ {
 		kv := owners.Index(i).FieldByIndex(res.ref.index)
-		if kv.Kind() == reflect.Pointer {
-			if kv.IsNil() {
-				parentKey[i] = nil
-				continue
-			}
-			kv = kv.Elem()
+		k, ok := kr.key(kv)
+		if !ok {
+			continue
 		}
-		k := canonKey(kv)
-		parentKey[i] = k
+		parentKey[i] = pkey[K]{k: k, ok: true}
 		if _, dup := seen[k]; !dup {
 			seen[k] = struct{}{}
-			keys = append(keys, kv.Interface())
+			keys = append(keys, k)
+			binds = kr.appendBind(binds, kv)
 		}
 	}
 
 	target := res.target
 	elemType := target.typ
-	l := &relLoad{
+	l := &relLoad[K, KR]{
+		kr:        kr,
 		db:        db,
 		owner:     owner,
 		rel:       rel,
@@ -433,7 +457,11 @@ func prepareRelationLoad(
 		chunk := limit - relArgs
 		for start := 0; start < len(keys); start += chunk {
 			end := min(start+chunk, len(keys))
-			sqlText, args, keyed, err := renderRelSelect(db.gram(), res, rel.kind, keys[start:end], &rq)
+			var bindChunk any = keys[start:end]
+			if binds != nil {
+				bindChunk = binds[start:end]
+			}
+			sqlText, args, keyed, err := renderRelSelect(db.gram(), res, rel.kind, bindChunk, &rq)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -451,7 +479,7 @@ func prepareRelationLoad(
 	return stmts, l, nil
 }
 
-func (l *relLoad) finish(ctx context.Context) error {
+func (l *relLoad[K, KR]) finish(ctx context.Context) error {
 	rel, res, buf := l.rel, l.res, l.buf
 	elemType := res.target.typ
 	// Nested paths load into buf first, so the copies below carry
@@ -467,28 +495,27 @@ func (l *relLoad) finish(ctx context.Context) error {
 		next  int
 		end   int
 	}
-	byKey := make(map[any]indexSpan, len(l.keys))
+	byKey := make(map[K]indexSpan, len(l.keys))
 	bufKeys := l.bufKeys
 	if rel.kind == relManyToMany {
-		for _, k := range bufKeys {
-			span := byKey[k]
+		for _, bk := range bufKeys {
+			if !bk.ok {
+				continue
+			}
+			span := byKey[bk.k]
 			span.end++
-			byKey[k] = span
+			byKey[bk.k] = span
 		}
 	} else {
 		// res.fk is the buffered rows' grouping key for every non-m2m kind.
 		keyField := res.fk
-		bufKeys = make([]any, buf.Len())
+		bufKeys = make([]pkey[K], buf.Len())
 		for i := 0; i < buf.Len(); i++ {
-			kv := buf.Index(i).FieldByIndex(keyField.index)
-			if kv.Kind() == reflect.Pointer {
-				if kv.IsNil() {
-					continue // bufKeys[i] stays nil, skipped below
-				}
-				kv = kv.Elem()
+			k, ok := l.kr.key(buf.Index(i).FieldByIndex(keyField.index))
+			if !ok {
+				continue // a NULL child-side key groups under no parent
 			}
-			k := canonKey(kv)
-			bufKeys[i] = k
+			bufKeys[i] = pkey[K]{k: k, ok: true}
 			span := byKey[k]
 			span.end++
 			byKey[k] = span
@@ -502,22 +529,22 @@ func (l *relLoad) finish(ctx context.Context) error {
 		byKey[k] = span
 		offset += count
 	}
-	for i, k := range bufKeys {
-		if k == nil {
+	for i, bk := range bufKeys {
+		if !bk.ok {
 			continue // a NULL child-side key groups under no parent
 		}
-		span := byKey[k]
+		span := byKey[bk.k]
 		grouped[span.next] = i
 		span.next++
-		byKey[k] = span
+		byKey[bk.k] = span
 	}
 
 	ptrType := reflect.PointerTo(elemType)
 	for i := 0; i < l.owners.Len(); i++ {
 		container := l.owners.Index(i).FieldByIndex(rel.index).Addr().Interface().(relContainer)
 		var matches []int
-		if l.parentKey[i] != nil {
-			span := byKey[l.parentKey[i]]
+		if pk := l.parentKey[i]; pk.ok {
+			span := byKey[pk.k]
 			matches = grouped[span.start:span.end]
 		}
 		switch rel.kind {
@@ -557,7 +584,7 @@ func renderRelSelect(
 	g *grammar,
 	res *resolvedRel,
 	kind relKind,
-	keys []any,
+	keys any,
 	rq *relQuery,
 ) (string, []any, bool, error) {
 	if rq.limitSet {
@@ -640,14 +667,16 @@ func renderRelSelect(
 }
 
 // scanRel appends scanned rows to buf, returning the grown slice and, when
-// keyed, one owner key per appended row.
-func scanRel(
+// keyed, one owner key per appended row (appended to keys).
+func scanRel[K comparable, KR keyer[K]](
 	rows rows,
 	p *plan,
 	buf reflect.Value,
 	keyed bool,
 	res *resolvedRel,
-) (out reflect.Value, keys []any, err error) {
+	kr KR,
+	keys []pkey[K],
+) (out reflect.Value, _ []pkey[K], err error) {
 	defer mergeClose(rows, &err)
 	extra := 0
 	if keyed {
@@ -655,7 +684,7 @@ func scanRel(
 	}
 	fields, err := entityFields(rows, p, extra)
 	if err != nil {
-		return buf, nil, err
+		return buf, keys, err
 	}
 
 	var keyCell colScanner
@@ -663,7 +692,7 @@ func scanRel(
 	if keyed {
 		kf, err := synthField("join key", res.joinFK, res.ref.typ)
 		if err != nil {
-			return buf, nil, err
+			return buf, keys, err
 		}
 		keyCell.f = kf
 		extras = []any{&keyCell}
@@ -686,13 +715,128 @@ func scanRel(
 			return buf, nil, err
 		}
 		if keyed {
-			keys = append(keys, canonKey(keyBuf.Elem()))
+			k, ok := kr.key(keyBuf.Elem())
+			keys = append(keys, pkey[K]{k: k, ok: ok})
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return buf, nil, err
 	}
 	return buf, keys, nil
+}
+
+// keyer canonicalizes one relation's grouping keys into a typed key space,
+// so the grouping maps and slices hold K instead of boxed any values. ok is
+// false for NULL pointers — rows and parents without a key group nowhere.
+// anyKeyer is the fallback instance with canonKey's exact semantics; the
+// typed instances exist because boxing every key costs one allocation per
+// row once values leave the runtime's small-int cache.
+type keyer[K comparable] interface {
+	key(reflect.Value) (K, bool)
+	// appendBind collects the IN () bind value when it differs from the
+	// canonical key: typed keyers bind the keys themselves and return binds
+	// unchanged; anyKeyer appends the original value.
+	appendBind(binds []any, kv reflect.Value) []any
+}
+
+type intKeyer struct{}
+
+func (intKeyer) key(v reflect.Value) (int64, bool) {
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return 0, false
+		}
+		v = v.Elem()
+	}
+	return v.Int(), true
+}
+
+func (intKeyer) appendBind(binds []any, _ reflect.Value) []any { return binds }
+
+type uintKeyer struct{}
+
+func (uintKeyer) key(v reflect.Value) (uint64, bool) {
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return 0, false
+		}
+		v = v.Elem()
+	}
+	return v.Uint(), true
+}
+
+func (uintKeyer) appendBind(binds []any, _ reflect.Value) []any { return binds }
+
+type strKeyer struct{}
+
+func (strKeyer) key(v reflect.Value) (string, bool) {
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return "", false
+		}
+		v = v.Elem()
+	}
+	return v.String(), true
+}
+
+func (strKeyer) appendBind(binds []any, _ reflect.Value) []any { return binds }
+
+type anyKeyer struct{}
+
+func (anyKeyer) key(v reflect.Value) (any, bool) {
+	k := canonKey(v)
+	return k, k != nil
+}
+
+func (anyKeyer) appendBind(binds []any, kv reflect.Value) []any {
+	if kv.Kind() == reflect.Pointer {
+		kv = kv.Elem()
+	}
+	return append(binds, kv.Interface())
+}
+
+// pkey is one owner's or buffered row's grouping key; ok is false when the
+// key column was NULL.
+type pkey[K comparable] struct {
+	k  K
+	ok bool
+}
+
+const (
+	kfInt = iota
+	kfUint
+	kfStr
+	kfAny
+)
+
+// relKeyFam picks the typed key space both key columns fit; mixed
+// signedness and exotic types keep canonKey's any semantics.
+func relKeyFam(types ...reflect.Type) int {
+	fam := -1
+	for _, t := range types {
+		if t.Kind() == reflect.Pointer {
+			t = t.Elem()
+		}
+		var f int
+		switch t.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			f = kfInt
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			f = kfUint
+		case reflect.String:
+			f = kfStr
+		default:
+			// []byte included: its grouping key (string) and bind value
+			// ([]byte) differ, which only the any pipeline carries.
+			return kfAny
+		}
+		if fam == -1 {
+			fam = f
+		} else if fam != f {
+			return kfAny
+		}
+	}
+	return fam
 }
 
 // canonKey normalizes key values into comparable, cross-type-equal map keys:
@@ -737,7 +881,7 @@ func relOptionsChangeCount(opts []RelOption) bool {
 
 // scanCounts drains (key, count) pairs into the grouping map and reports how
 // many it read.
-func scanCounts(rows rows, keyType reflect.Type, byKey map[any]int64) (scanned int64, err error) {
+func scanCounts[K comparable, KR keyer[K]](rows rows, keyType reflect.Type, byKey map[K]int64, kr KR) (scanned int64, err error) {
 	defer mergeClose(rows, &err)
 	keyBuf := reflect.New(keyType)
 	kf, err := synthField("count key", "<key>", keyType)
@@ -757,7 +901,9 @@ func scanCounts(rows rows, keyType reflect.Type, byKey map[any]int64) (scanned i
 		if err := rows.Scan(box.dest[:]...); err != nil {
 			return scanned, err
 		}
-		byKey[canonKey(keyBuf.Elem())] = box.n
+		if k, ok := kr.key(keyBuf.Elem()); ok {
+			byKey[k] = box.n
+		}
 		scanned++
 	}
 	return scanned, rows.Err()
@@ -769,7 +915,7 @@ func renderRelSelectLimited(
 	g *grammar,
 	res *resolvedRel,
 	kind relKind,
-	keys []any,
+	keys any,
 	rq *relQuery,
 ) (string, []any, bool, error) {
 	if rq.limit < 0 {
@@ -951,7 +1097,7 @@ func prepareCountLoads(
 	}
 	// counts arrives deduplicated by splitCounts.
 	for _, name := range counts {
-		var l *countLoad
+		var l relFinisher
 		var err error
 		stmts, l, err = prepareCountLoad(db, p, name, rows, stmts)
 		if err != nil {
@@ -964,21 +1110,26 @@ func prepareCountLoads(
 
 // countLoad is one WithCount relation's two-phase load: statements consume
 // GROUP BY rows into byKey, finish writes the counts back to the owners.
-type countLoad struct {
+type countLoad[K comparable, KR keyer[K]] struct {
+	kr        KR
 	owners    reflect.Value
 	refType   reflect.Type
 	target    []int // count field index on the owner
-	parentKey []any
-	byKey     map[any]int64
+	parentKey []pkey[K]
+	byKey     map[K]int64
 }
 
-func (l *countLoad) consume(sqlRows rows) (int64, error) {
-	return scanCounts(sqlRows, l.refType, l.byKey)
+func (l *countLoad[K, KR]) consume(sqlRows rows) (int64, error) {
+	return scanCounts(sqlRows, l.refType, l.byKey, l.kr)
 }
 
-func (l *countLoad) finish(context.Context) error {
+func (l *countLoad[K, KR]) finish(context.Context) error {
 	for i := 0; i < l.owners.Len(); i++ {
-		l.owners.Index(i).FieldByIndex(l.target).SetInt(l.byKey[l.parentKey[i]])
+		var n int64
+		if pk := l.parentKey[i]; pk.ok {
+			n = l.byKey[pk.k]
+		}
+		l.owners.Index(i).FieldByIndex(l.target).SetInt(n)
 	}
 	return nil
 }
@@ -992,7 +1143,7 @@ func prepareCountLoad(
 	name string,
 	owners reflect.Value,
 	stmts []relStatement,
-) ([]relStatement, *countLoad, error) {
+) ([]relStatement, relFinisher, error) {
 	rel, ok := owner.rels[name]
 	if !ok {
 		return nil, nil, fmt.Errorf("rio: %s has no relation %q", owner.structName, name)
@@ -1017,36 +1168,54 @@ func prepareCountLoad(
 	if err != nil {
 		return nil, nil, err
 	}
+	switch relKeyFam(res.ref.typ) {
+	case kfInt:
+		return prepareCountLoadK(db, res, rel.kind, target, owners, stmts, intKeyer{})
+	case kfUint:
+		return prepareCountLoadK(db, res, rel.kind, target, owners, stmts, uintKeyer{})
+	case kfStr:
+		return prepareCountLoadK(db, res, rel.kind, target, owners, stmts, strKeyer{})
+	default:
+		return prepareCountLoadK(db, res, rel.kind, target, owners, stmts, anyKeyer{})
+	}
+}
 
-	// canonKey groups; the IN (?) binds the original value (see prepareRelationLoad).
-	seen := make(map[any]struct{}, owners.Len())
-	keys := make([]any, 0, owners.Len())
-	parentKey := make([]any, owners.Len())
+func prepareCountLoadK[K comparable, KR keyer[K]](
+	db Queryer,
+	res *resolvedRel,
+	kind relKind,
+	target []int,
+	owners reflect.Value,
+	stmts []relStatement,
+	kr KR,
+) ([]relStatement, relFinisher, error) {
+	seen := make(map[K]struct{}, owners.Len())
+	keys := make([]K, 0, owners.Len())
+	var binds []any
+	parentKey := make([]pkey[K], owners.Len())
 	for i := 0; i < owners.Len(); i++ {
 		kv := owners.Index(i).FieldByIndex(res.ref.index)
-		if kv.Kind() == reflect.Pointer {
-			if kv.IsNil() {
-				parentKey[i] = nil
-				continue
-			}
-			kv = kv.Elem()
+		k, ok := kr.key(kv)
+		if !ok {
+			continue
 		}
-		k := canonKey(kv)
-		parentKey[i] = k
+		parentKey[i] = pkey[K]{k: k, ok: true}
 		if _, dup := seen[k]; !dup {
 			seen[k] = struct{}{}
-			keys = append(keys, kv.Interface())
+			keys = append(keys, k)
+			binds = kr.appendBind(binds, kv)
 		}
 	}
 
 	g := db.gram()
 	d := g.d
-	l := &countLoad{
+	l := &countLoad[K, KR]{
+		kr:        kr,
 		owners:    owners,
 		refType:   res.ref.typ,
 		target:    target,
 		parentKey: parentKey,
-		byKey:     make(map[any]int64, len(keys)),
+		byKey:     make(map[K]int64, len(keys)),
 	}
 	chunk := d.caps().maxBindParams
 	for start := 0; start < len(keys); start += chunk {
@@ -1054,7 +1223,7 @@ func prepareCountLoad(
 		b := make([]byte, 0, 160)
 		var keyCol string
 		b = append(b, "SELECT "...)
-		if rel.kind == relManyToMany {
+		if kind == relManyToMany {
 			keyCol = res.joinFK
 			b = d.quote(b, res.joinTable)
 			b = append(b, '.')
@@ -1098,8 +1267,12 @@ func prepareCountLoad(
 			b = d.quote(b, keyCol)
 		}
 		b = append(b, " IN (?)"...)
-		args := []any{keys[start:end]}
-		if rel.kind != relManyToMany && res.target.softDel != nil {
+		var bindChunk any = keys[start:end]
+		if binds != nil {
+			bindChunk = binds[start:end]
+		}
+		args := []any{bindChunk}
+		if kind != relManyToMany && res.target.softDel != nil {
 			b = append(b, " AND "...)
 			b = d.quote(b, g.table(res.target))
 			b = append(b, '.')
@@ -1107,7 +1280,7 @@ func prepareCountLoad(
 			b = append(b, " IS NULL"...)
 		}
 		b = append(b, " GROUP BY "...)
-		if rel.kind == relManyToMany {
+		if kind == relManyToMany {
 			b = d.quote(b, res.joinTable)
 		} else {
 			b = d.quote(b, g.table(res.target))

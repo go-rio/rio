@@ -435,3 +435,53 @@ func TestManyToManyCompositePKError(t *testing.T) {
 		t.Fatalf("ref: cannot fix an m2m composite PK, the hint must be gone: %v", err)
 	}
 }
+
+type XSignParent struct {
+	ID   uint64
+	Kids HasMany[XSignChild] `rio:",fk:parent_id"`
+}
+
+type XSignChild struct {
+	ID       int64
+	ParentID int64 `rio:"parent_id"`
+}
+
+// Mixed signedness keeps canonKey's folding through the any key space.
+func TestPreloadMixedSignednessKeys(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id"}, []driver.Value{int64(7)})
+	f.queueRows([]string{"id", "parent_id"}, []driver.Value{int64(70), int64(7)})
+
+	parents, err := From[XSignParent]().With("Kids").All(ctx, db)
+	if err != nil {
+		t.Fatalf("uint64 PK against int64 FK must load: %v", err)
+	}
+	if kids := parents[0].Kids.Rows(); len(kids) != 1 || kids[0].ID != 70 {
+		t.Fatalf("kids: %+v", kids)
+	}
+}
+
+// Grouping is value-size independent: keys beyond the runtime's small-int
+// cache group identically through the typed key space.
+func TestPreloadLargeKeys(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	const base = int64(1) << 40
+	f.queueRows([]string{"id"}, []driver.Value{base + 1}, []driver.Value{base + 2})
+	f.queueRows([]string{"id", "holder_id", "deleted_at"},
+		[]driver.Value{base + 10, base + 2, nil},
+		[]driver.Value{base + 11, base + 1, nil},
+		[]driver.Value{base + 12, base + 2, nil},
+	)
+
+	holders, err := From[Holder]().With("Subs").All(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n1, n2 := len(holders[0].Subs.Rows()), len(holders[1].Subs.Rows()); n1 != 1 || n2 != 2 {
+		t.Fatalf("grouping drifted: %d/%d", n1, n2)
+	}
+}
