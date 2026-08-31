@@ -216,26 +216,6 @@ func resolveRel(owner *plan, r *relField) (*resolvedRel, error) {
 	return res, nil
 }
 
-// keyFamily buckets a key type by the canonical form canonKey folds it
-// into; keys from different families can never compare equal.
-func keyFamily(t reflect.Type) any {
-	if t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-	switch t.Kind() {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return "integer"
-	case reflect.String:
-		return "string"
-	case reflect.Slice:
-		if t.Elem().Kind() == reflect.Uint8 {
-			return "string"
-		}
-	}
-	return t
-}
-
 // preloadValues loads relation paths into one nested layer's rows, an
 // addressable []T value.
 func preloadValues(ctx context.Context, db Queryer, p *plan, rows reflect.Value, specs []preloadSpec) error {
@@ -314,17 +294,201 @@ func splitPath(path string) (head, tail string) {
 	return path, ""
 }
 
-// relLoad is one relation's two-phase load: chunk statements consume rows
-// into buf, finish assembles buf into the owners. One heap object serves the
-// whole relation; finish must run only after every statement was consumed.
+// keyer canonicalizes one relation's grouping keys into a typed key space,
+// so the grouping maps and slices hold K instead of boxed any values. ok is
+// false for NULL pointers — rows and parents without a key group nowhere.
+// anyKeyer is the fallback instance with canonKey's exact semantics; the
+// typed instances exist because boxing every key costs one allocation per
+// row once values leave the runtime's small-int cache.
+type keyer[K comparable] interface {
+	key(reflect.Value) (K, bool)
+	// newBinds and appendBind collect the IN () bind values where they
+	// differ from the canonical keys: typed keyers bind the keys themselves
+	// (nil binds, no-op appends); anyKeyer preserves original values.
+	newBinds(n int) []any
+	appendBind(binds []any, kv reflect.Value) []any
+}
+
+type intKeyer struct{}
+
+func (intKeyer) key(v reflect.Value) (int64, bool) {
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return 0, false
+		}
+		v = v.Elem()
+	}
+	return v.Int(), true
+}
+
+func (intKeyer) newBinds(int) []any                            { return nil }
+func (intKeyer) appendBind(binds []any, _ reflect.Value) []any { return binds }
+
+type uintKeyer struct{}
+
+func (uintKeyer) key(v reflect.Value) (uint64, bool) {
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return 0, false
+		}
+		v = v.Elem()
+	}
+	return v.Uint(), true
+}
+
+func (uintKeyer) newBinds(int) []any                            { return nil }
+func (uintKeyer) appendBind(binds []any, _ reflect.Value) []any { return binds }
+
+type strKeyer struct{}
+
+func (strKeyer) key(v reflect.Value) (string, bool) {
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return "", false
+		}
+		v = v.Elem()
+	}
+	return v.String(), true
+}
+
+func (strKeyer) newBinds(int) []any                            { return nil }
+func (strKeyer) appendBind(binds []any, _ reflect.Value) []any { return binds }
+
+type anyKeyer struct{}
+
+func (anyKeyer) key(v reflect.Value) (any, bool) {
+	k := canonKey(v)
+	return k, k != nil
+}
+
+func (anyKeyer) newBinds(n int) []any { return make([]any, 0, n) }
+
+func (anyKeyer) appendBind(binds []any, kv reflect.Value) []any {
+	if kv.Kind() == reflect.Pointer {
+		kv = kv.Elem()
+	}
+	return append(binds, kv.Interface())
+}
+
+// pkey is one owner's or buffered row's grouping key; ok is false when the
+// key column was NULL.
+type pkey[K comparable] struct {
+	k  K
+	ok bool
+}
+
+const (
+	kfInt = iota
+	kfUint
+	kfStr
+	kfAny
+)
+
+// relKeyFam picks the typed key space both key columns fit; mixed
+// signedness and exotic types keep canonKey's any semantics.
+func relKeyFam(types ...reflect.Type) int {
+	fam := -1
+	for _, t := range types {
+		if t.Kind() == reflect.Pointer {
+			t = t.Elem()
+		}
+		if t.Implements(valuerType) {
+			// A Valuer key must bind its original value so the driver calls
+			// Value(); the canonical widened key would bypass it and match
+			// nothing against the stored form.
+			return kfAny
+		}
+		var f int
+		switch t.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			f = kfInt
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			f = kfUint
+		case reflect.String:
+			f = kfStr
+		default:
+			// []byte included: its grouping key (string) and bind value
+			// ([]byte) differ, which only the any pipeline carries.
+			return kfAny
+		}
+		if fam == -1 {
+			fam = f
+		} else if fam != f {
+			return kfAny
+		}
+	}
+	return fam
+}
+
+// canonKey normalizes key values into comparable, cross-type-equal map keys:
+// integers widen, []byte becomes string, pointers dereference (nil to nil).
+func canonKey(v reflect.Value) any {
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return nil
+		}
+		v = v.Elem()
+	}
+	switch v.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		// Sign-normalize so signed and unsigned keys group together; values
+		// above MaxInt64 keep their own key space.
+		n := v.Uint()
+		if n <= math.MaxInt64 {
+			return int64(n)
+		}
+		return n
+	case reflect.String:
+		return v.String()
+	case reflect.Slice:
+		if v.Type().Elem().Kind() == reflect.Uint8 {
+			return string(v.Bytes())
+		}
+		return v.Interface()
+	default:
+		return v.Interface()
+	}
+}
+
+// keyFamily buckets a key type by the canonical form canonKey folds it
+// into; keys from different families can never compare equal.
+func keyFamily(t reflect.Type) any {
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return "integer"
+	case reflect.String:
+		return "string"
+	case reflect.Slice:
+		if t.Elem().Kind() == reflect.Uint8 {
+			return "string"
+		}
+	}
+	return t
+}
+
+// relLoadBase carries one relation load's key-space-independent inputs.
+type relLoadBase struct {
+	db     Queryer
+	owner  *plan
+	rel    *relField
+	res    *resolvedRel
+	owners reflect.Value
+	tails  []preloadSpec
+}
+
+// relLoad is one relation's two-phase load: prepare renders the chunk
+// statements, each consumes rows into buf, finish assembles buf into the
+// owners. One heap object serves the whole relation; finish must run only
+// after every statement was consumed.
 type relLoad[K comparable, KR keyer[K]] struct {
+	relLoadBase
 	kr        KR
-	db        Queryer
-	owner     *plan
-	rel       *relField
-	res       *resolvedRel
-	owners    reflect.Value
-	tails     []preloadSpec
 	keys      []K
 	parentKey []pkey[K]
 	keyed     bool
@@ -367,29 +531,28 @@ func prepareRelationLoad(
 			rel.name,
 		)
 	}
+	base := relLoadBase{db: db, owner: owner, rel: rel, res: res, owners: owners, tails: tails}
 	switch relKeyFam(res.ref.typ, res.fk.typ) {
 	case kfInt:
-		return prepareRelLoadK(db, owner, rel, res, owners, opts, tails, stmts, intKeyer{})
+		return prepareRel[int64, intKeyer](base, opts, stmts)
 	case kfUint:
-		return prepareRelLoadK(db, owner, rel, res, owners, opts, tails, stmts, uintKeyer{})
+		return prepareRel[uint64, uintKeyer](base, opts, stmts)
 	case kfStr:
-		return prepareRelLoadK(db, owner, rel, res, owners, opts, tails, stmts, strKeyer{})
+		return prepareRel[string, strKeyer](base, opts, stmts)
 	default:
-		return prepareRelLoadK(db, owner, rel, res, owners, opts, tails, stmts, anyKeyer{})
+		return prepareRel[any, anyKeyer](base, opts, stmts)
 	}
 }
 
-func prepareRelLoadK[K comparable, KR keyer[K]](
-	db Queryer,
-	owner *plan,
-	rel *relField,
-	res *resolvedRel,
-	owners reflect.Value,
-	opts []RelOption,
-	tails []preloadSpec,
-	stmts []relStatement,
-	kr KR,
-) ([]relStatement, relFinisher, error) {
+// prepareRel instantiates the load in its key space.
+func prepareRel[K comparable, KR keyer[K]](base relLoadBase, opts []RelOption, stmts []relStatement) ([]relStatement, relFinisher, error) {
+	l := &relLoad[K, KR]{relLoadBase: base}
+	stmts, err := l.prepare(opts, stmts)
+	return stmts, l, err
+}
+
+// prepare renders the relation's chunked preload statements onto stmts.
+func (l *relLoad[K, KR]) prepare(opts []RelOption, stmts []relStatement) ([]relStatement, error) {
 	var rq relQuery
 	for _, opt := range opts {
 		opt(&rq)
@@ -397,40 +560,30 @@ func prepareRelLoadK[K comparable, KR keyer[K]](
 
 	// Typed keys group; the IN (?) binds the canonical value, whose family
 	// matches the column's.
+	owners := l.owners
 	seen := make(map[K]struct{}, owners.Len())
 	keys := make([]K, 0, owners.Len())
-	var binds []any // non-nil only when bind values differ from keys
-	parentKey := make([]pkey[K], owners.Len())
+	binds := l.kr.newBinds(owners.Len()) // non-nil only when binds differ from keys
+	l.parentKey = make([]pkey[K], owners.Len())
 	for i := 0; i < owners.Len(); i++ {
-		kv := owners.Index(i).FieldByIndex(res.ref.index)
-		k, ok := kr.key(kv)
+		kv := owners.Index(i).FieldByIndex(l.res.ref.index)
+		k, ok := l.kr.key(kv)
 		if !ok {
 			continue
 		}
-		parentKey[i] = pkey[K]{k: k, ok: true}
+		l.parentKey[i] = pkey[K]{k: k, ok: true}
 		if _, dup := seen[k]; !dup {
 			seen[k] = struct{}{}
 			keys = append(keys, k)
-			binds = kr.appendBind(binds, kv)
+			binds = l.kr.appendBind(binds, kv)
 		}
 	}
 
-	target := res.target
-	elemType := target.typ
-	l := &relLoad[K, KR]{
-		kr:        kr,
-		db:        db,
-		owner:     owner,
-		rel:       rel,
-		res:       res,
-		owners:    owners,
-		tails:     tails,
-		keys:      keys,
-		parentKey: parentKey,
-		keyed:     rel.kind == relManyToMany,
-		buf:       reflect.New(reflect.SliceOf(elemType)).Elem(),
-	}
-	l.buf.Set(reflect.MakeSlice(reflect.SliceOf(elemType), 0, len(keys)))
+	target := l.res.target
+	l.keys = keys
+	l.keyed = l.rel.kind == relManyToMany
+	l.buf = reflect.New(reflect.SliceOf(target.typ)).Elem()
+	l.buf.Set(reflect.MakeSlice(reflect.SliceOf(target.typ), 0, len(keys)))
 
 	if len(keys) > 0 {
 		relArgs := 0
@@ -443,13 +596,13 @@ func prepareRelLoadK[K comparable, KR keyer[K]](
 				}
 			}
 		}
-		limit := db.gram().d.caps().maxBindParams
+		limit := l.db.gram().d.caps().maxBindParams
 		if relArgs >= limit {
-			return nil, nil, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"rio: preload relation %s.%s uses %d bind parameter(s) in RelWhere, "+
 					"leaving none for parent keys (dialect limit %d)",
-				owner.structName,
-				rel.name,
+				l.owner.structName,
+				l.rel.name,
 				relArgs,
 				limit,
 			)
@@ -461,9 +614,9 @@ func prepareRelLoadK[K comparable, KR keyer[K]](
 			if binds != nil {
 				bindChunk = binds[start:end]
 			}
-			sqlText, args, keyed, err := renderRelSelect(db.gram(), res, rel.kind, bindChunk, &rq)
+			sqlText, args, keyed, err := renderRelSelect(l.db.gram(), l.res, l.rel.kind, bindChunk, &rq)
 			if err != nil {
-				return nil, nil, err
+				return nil, err
 			}
 			l.keyed = keyed
 			stmts = append(stmts, relStatement{
@@ -476,7 +629,7 @@ func prepareRelLoadK[K comparable, KR keyer[K]](
 		}
 	}
 
-	return stmts, l, nil
+	return stmts, nil
 }
 
 func (l *relLoad[K, KR]) finish(ctx context.Context) error {
@@ -725,196 +878,6 @@ func scanRel[K comparable, KR keyer[K]](
 	return buf, keys, nil
 }
 
-// keyer canonicalizes one relation's grouping keys into a typed key space,
-// so the grouping maps and slices hold K instead of boxed any values. ok is
-// false for NULL pointers — rows and parents without a key group nowhere.
-// anyKeyer is the fallback instance with canonKey's exact semantics; the
-// typed instances exist because boxing every key costs one allocation per
-// row once values leave the runtime's small-int cache.
-type keyer[K comparable] interface {
-	key(reflect.Value) (K, bool)
-	// appendBind collects the IN () bind value when it differs from the
-	// canonical key: typed keyers bind the keys themselves and return binds
-	// unchanged; anyKeyer appends the original value.
-	appendBind(binds []any, kv reflect.Value) []any
-}
-
-type intKeyer struct{}
-
-func (intKeyer) key(v reflect.Value) (int64, bool) {
-	if v.Kind() == reflect.Pointer {
-		if v.IsNil() {
-			return 0, false
-		}
-		v = v.Elem()
-	}
-	return v.Int(), true
-}
-
-func (intKeyer) appendBind(binds []any, _ reflect.Value) []any { return binds }
-
-type uintKeyer struct{}
-
-func (uintKeyer) key(v reflect.Value) (uint64, bool) {
-	if v.Kind() == reflect.Pointer {
-		if v.IsNil() {
-			return 0, false
-		}
-		v = v.Elem()
-	}
-	return v.Uint(), true
-}
-
-func (uintKeyer) appendBind(binds []any, _ reflect.Value) []any { return binds }
-
-type strKeyer struct{}
-
-func (strKeyer) key(v reflect.Value) (string, bool) {
-	if v.Kind() == reflect.Pointer {
-		if v.IsNil() {
-			return "", false
-		}
-		v = v.Elem()
-	}
-	return v.String(), true
-}
-
-func (strKeyer) appendBind(binds []any, _ reflect.Value) []any { return binds }
-
-type anyKeyer struct{}
-
-func (anyKeyer) key(v reflect.Value) (any, bool) {
-	k := canonKey(v)
-	return k, k != nil
-}
-
-func (anyKeyer) appendBind(binds []any, kv reflect.Value) []any {
-	if kv.Kind() == reflect.Pointer {
-		kv = kv.Elem()
-	}
-	return append(binds, kv.Interface())
-}
-
-// pkey is one owner's or buffered row's grouping key; ok is false when the
-// key column was NULL.
-type pkey[K comparable] struct {
-	k  K
-	ok bool
-}
-
-const (
-	kfInt = iota
-	kfUint
-	kfStr
-	kfAny
-)
-
-// relKeyFam picks the typed key space both key columns fit; mixed
-// signedness and exotic types keep canonKey's any semantics.
-func relKeyFam(types ...reflect.Type) int {
-	fam := -1
-	for _, t := range types {
-		if t.Kind() == reflect.Pointer {
-			t = t.Elem()
-		}
-		if t.Implements(valuerType) {
-			// A Valuer key must bind its original value so the driver calls
-			// Value(); the canonical widened key would bypass it and match
-			// nothing against the stored form.
-			return kfAny
-		}
-		var f int
-		switch t.Kind() {
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			f = kfInt
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			f = kfUint
-		case reflect.String:
-			f = kfStr
-		default:
-			// []byte included: its grouping key (string) and bind value
-			// ([]byte) differ, which only the any pipeline carries.
-			return kfAny
-		}
-		if fam == -1 {
-			fam = f
-		} else if fam != f {
-			return kfAny
-		}
-	}
-	return fam
-}
-
-// canonKey normalizes key values into comparable, cross-type-equal map keys:
-// integers widen, []byte becomes string, pointers dereference (nil to nil).
-func canonKey(v reflect.Value) any {
-	if v.Kind() == reflect.Pointer {
-		if v.IsNil() {
-			return nil
-		}
-		v = v.Elem()
-	}
-	switch v.Kind() {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return v.Int()
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		// Sign-normalize so signed and unsigned keys group together; values
-		// above MaxInt64 keep their own key space.
-		n := v.Uint()
-		if n <= math.MaxInt64 {
-			return int64(n)
-		}
-		return n
-	case reflect.String:
-		return v.String()
-	case reflect.Slice:
-		if v.Type().Elem().Kind() == reflect.Uint8 {
-			return string(v.Bytes())
-		}
-		return v.Interface()
-	default:
-		return v.Interface()
-	}
-}
-
-func relOptionsChangeCount(opts []RelOption) bool {
-	var rq relQuery
-	for _, opt := range opts {
-		opt(&rq)
-	}
-	return rq.changesCount
-}
-
-// scanCounts drains (key, count) pairs into the grouping map and reports how
-// many it read.
-func scanCounts[K comparable, KR keyer[K]](rows rows, keyType reflect.Type, byKey map[K]int64, kr KR) (scanned int64, err error) {
-	defer mergeClose(rows, &err)
-	keyBuf := reflect.New(keyType)
-	kf, err := synthField("count key", "<key>", keyType)
-	if err != nil {
-		return 0, err
-	}
-	// One escaping box carries cell, count, and dest: a fresh variadic slice
-	// would heap-allocate per row (see scanScalars).
-	var box struct {
-		cell colScanner
-		n    int64
-		dest [2]any
-	}
-	box.cell = colScanner{f: kf, base: keyBuf.UnsafePointer()}
-	box.dest[0], box.dest[1] = &box.cell, &box.n
-	for rows.Next() {
-		if err := rows.Scan(box.dest[:]...); err != nil {
-			return scanned, err
-		}
-		if k, ok := kr.key(keyBuf.Elem()); ok {
-			byKey[k] = box.n
-		}
-		scanned++
-	}
-	return scanned, rows.Err()
-}
-
 // renderRelSelectLimited wraps the preload in a window subquery so the limit
 // applies per parent; the row number never leaves the subquery.
 func renderRelSelectLimited(
@@ -1056,6 +1019,14 @@ func renderRelSelectLimited(
 	return sqlText, outArgs, keyed, err
 }
 
+func relOptionsChangeCount(opts []RelOption) bool {
+	var rq relQuery
+	for _, opt := range opts {
+		opt(&rq)
+	}
+	return rq.changesCount
+}
+
 // splitCounts partitions WithCount targets: a relation the same query fully
 // preloads reads its count off the loaded containers; the rest query.
 func splitCounts(p *plan, specs []preloadSpec, counts []string) (queried, reusable []string) {
@@ -1116,17 +1087,27 @@ func prepareCountLoads(
 
 // countLoad is one WithCount relation's two-phase load: statements consume
 // GROUP BY rows into byKey, finish writes the counts back to the owners.
+// countLoadBase carries one count load's key-space-independent inputs.
+type countLoadBase struct {
+	db     Queryer
+	res    *resolvedRel
+	kind   relKind
+	target []int // count field index on the owner
+	owners reflect.Value
+}
+
+// countLoad is one WithCount relation's two-phase load: prepare renders the
+// GROUP BY statements, each consumes into byKey, finish writes the counts
+// back to the owners.
 type countLoad[K comparable, KR keyer[K]] struct {
+	countLoadBase
 	kr        KR
-	owners    reflect.Value
-	refType   reflect.Type
-	target    []int // count field index on the owner
 	parentKey []pkey[K]
 	byKey     map[K]int64
 }
 
 func (l *countLoad[K, KR]) consume(sqlRows rows) (int64, error) {
-	return scanCounts(sqlRows, l.refType, l.byKey, l.kr)
+	return scanCounts(sqlRows, l.res.ref.typ, l.byKey, l.kr)
 }
 
 func (l *countLoad[K, KR]) finish(context.Context) error {
@@ -1174,55 +1155,51 @@ func prepareCountLoad(
 	if err != nil {
 		return nil, nil, err
 	}
+	base := countLoadBase{db: db, res: res, kind: rel.kind, target: target, owners: owners}
 	switch relKeyFam(res.ref.typ) {
 	case kfInt:
-		return prepareCountLoadK(db, res, rel.kind, target, owners, stmts, intKeyer{})
+		return prepareCount[int64, intKeyer](base, stmts)
 	case kfUint:
-		return prepareCountLoadK(db, res, rel.kind, target, owners, stmts, uintKeyer{})
+		return prepareCount[uint64, uintKeyer](base, stmts)
 	case kfStr:
-		return prepareCountLoadK(db, res, rel.kind, target, owners, stmts, strKeyer{})
+		return prepareCount[string, strKeyer](base, stmts)
 	default:
-		return prepareCountLoadK(db, res, rel.kind, target, owners, stmts, anyKeyer{})
+		return prepareCount[any, anyKeyer](base, stmts)
 	}
 }
 
-func prepareCountLoadK[K comparable, KR keyer[K]](
-	db Queryer,
-	res *resolvedRel,
-	kind relKind,
-	target []int,
-	owners reflect.Value,
-	stmts []relStatement,
-	kr KR,
-) ([]relStatement, relFinisher, error) {
+// prepareCount instantiates the load in its key space.
+func prepareCount[K comparable, KR keyer[K]](base countLoadBase, stmts []relStatement) ([]relStatement, relFinisher, error) {
+	l := &countLoad[K, KR]{countLoadBase: base}
+	stmts, err := l.prepare(stmts)
+	return stmts, l, err
+}
+
+// prepare renders the relation's chunked GROUP BY statements onto stmts.
+func (l *countLoad[K, KR]) prepare(stmts []relStatement) ([]relStatement, error) {
+	owners := l.owners
 	seen := make(map[K]struct{}, owners.Len())
 	keys := make([]K, 0, owners.Len())
-	var binds []any
-	parentKey := make([]pkey[K], owners.Len())
+	binds := l.kr.newBinds(owners.Len())
+	l.parentKey = make([]pkey[K], owners.Len())
 	for i := 0; i < owners.Len(); i++ {
-		kv := owners.Index(i).FieldByIndex(res.ref.index)
-		k, ok := kr.key(kv)
+		kv := owners.Index(i).FieldByIndex(l.res.ref.index)
+		k, ok := l.kr.key(kv)
 		if !ok {
 			continue
 		}
-		parentKey[i] = pkey[K]{k: k, ok: true}
+		l.parentKey[i] = pkey[K]{k: k, ok: true}
 		if _, dup := seen[k]; !dup {
 			seen[k] = struct{}{}
 			keys = append(keys, k)
-			binds = kr.appendBind(binds, kv)
+			binds = l.kr.appendBind(binds, kv)
 		}
 	}
 
-	g := db.gram()
+	g := l.db.gram()
 	d := g.d
-	l := &countLoad[K, KR]{
-		kr:        kr,
-		owners:    owners,
-		refType:   res.ref.typ,
-		target:    target,
-		parentKey: parentKey,
-		byKey:     make(map[K]int64, len(keys)),
-	}
+	res, kind := l.res, l.kind
+	l.byKey = make(map[K]int64, len(keys))
 	chunk := d.caps().maxBindParams
 	for start := 0; start < len(keys); start += chunk {
 		end := min(start+chunk, len(keys))
@@ -1296,7 +1273,7 @@ func prepareCountLoadK[K comparable, KR keyer[K]](
 
 		sqlText, outArgs, err := finishSQL(d, b, args)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		stmts = append(stmts, relStatement{
 			phase:   "count",
@@ -1306,7 +1283,37 @@ func prepareCountLoadK[K comparable, KR keyer[K]](
 			load:    l,
 		})
 	}
-	return stmts, l, nil
+	return stmts, nil
+}
+
+// scanCounts drains (key, count) pairs into the grouping map and reports how
+// many it read.
+func scanCounts[K comparable, KR keyer[K]](rows rows, keyType reflect.Type, byKey map[K]int64, kr KR) (scanned int64, err error) {
+	defer mergeClose(rows, &err)
+	keyBuf := reflect.New(keyType)
+	kf, err := synthField("count key", "<key>", keyType)
+	if err != nil {
+		return 0, err
+	}
+	// One escaping box carries cell, count, and dest: a fresh variadic slice
+	// would heap-allocate per row (see scanScalars).
+	var box struct {
+		cell colScanner
+		n    int64
+		dest [2]any
+	}
+	box.cell = colScanner{f: kf, base: keyBuf.UnsafePointer()}
+	box.dest[0], box.dest[1] = &box.cell, &box.n
+	for rows.Next() {
+		if err := rows.Scan(box.dest[:]...); err != nil {
+			return scanned, err
+		}
+		if k, ok := kr.key(keyBuf.Elem()); ok {
+			byKey[k] = box.n
+		}
+		scanned++
+	}
+	return scanned, rows.Err()
 }
 
 // reuseCounts fills count targets from containers the preload just loaded.
