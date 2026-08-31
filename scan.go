@@ -958,7 +958,10 @@ func namedFields(rows rows, p *plan) ([]*field, error) {
 	for i, c := range cols {
 		f, ok := p.byColumn[c]
 		if !ok {
-			return nil, fmt.Errorf("rio: no field of %s maps to result column %q", p.structName, c)
+			return nil, fmt.Errorf(
+				"rio: no field of %s maps to result column %q; map a field to it with a rio:%q tag, or alias the column in the SQL to a mapped name",
+				p.structName, c, c,
+			)
 		}
 		if seen[c] {
 			return nil, fmt.Errorf("rio: result column %q appears more than once for %s; use distinct aliases", c, p.structName)

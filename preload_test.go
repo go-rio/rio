@@ -485,3 +485,141 @@ func TestPreloadLargeKeys(t *testing.T) {
 		t.Fatalf("grouping drifted: %d/%d", n1, n2)
 	}
 }
+
+type XUintParent struct {
+	ID   uint64
+	Kids HasMany[XUintChild] `rio:",fk:parent_id"`
+}
+
+type XUintChild struct {
+	ID       uint64
+	ParentID uint64 `rio:"parent_id"`
+}
+
+// The unsigned key space groups and binds like the signed one.
+func TestPreloadUnsignedKeys(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id"}, []driver.Value{int64(3)}, []driver.Value{int64(4)})
+	f.queueRows([]string{"id", "parent_id"},
+		[]driver.Value{int64(30), int64(3)},
+		[]driver.Value{int64(40), int64(4)},
+		[]driver.Value{int64(41), int64(4)},
+	)
+	parents, err := From[XUintParent]().With("Kids").All(ctx, db)
+	if err != nil {
+		t.Fatalf("uint64 keys must load: %v", err)
+	}
+	if n3, n4 := len(parents[0].Kids.Rows()), len(parents[1].Kids.Rows()); n3 != 1 || n4 != 2 {
+		t.Fatalf("grouping drifted: %d/%d", n3, n4)
+	}
+}
+
+type XStrParent struct {
+	Code string             `rio:",pk"`
+	Kids HasMany[XStrChild] `rio:",fk:parent_code,ref:code"`
+}
+
+type XStrChild struct {
+	ID         int64
+	ParentCode string `rio:"parent_code"`
+}
+
+// The string key space groups and binds string keys.
+func TestPreloadStringKeys(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"code"}, []driver.Value{"a"}, []driver.Value{"b"})
+	f.queueRows([]string{"id", "parent_code"},
+		[]driver.Value{int64(1), "b"},
+		[]driver.Value{int64(2), "a"},
+		[]driver.Value{int64(3), "b"},
+	)
+	parents, err := From[XStrParent]().With("Kids").All(ctx, db)
+	if err != nil {
+		t.Fatalf("string keys must load: %v", err)
+	}
+	if na, nb := len(parents[0].Kids.Rows()), len(parents[1].Kids.Rows()); na != 1 || nb != 2 {
+		t.Fatalf("grouping drifted: %d/%d", na, nb)
+	}
+	if got := f.log[1].args[0]; got != "a" {
+		t.Fatalf("string keys must bind as strings, got %T(%v)", got, got)
+	}
+}
+
+type XByteParent struct {
+	ID   []byte              `rio:",pk,noautoincr"`
+	Kids HasMany[XByteChild] `rio:",fk:parent_id"`
+}
+
+type XByteChild struct {
+	ID       int64
+	ParentID []byte `rio:"parent_id"`
+}
+
+// []byte keys group by canonical string but must bind their original bytes —
+// a stringified key would not match a BLOB/BYTEA column.
+func TestPreloadByteKeysBindOriginals(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id"}, []driver.Value{[]byte{0x01}}, []driver.Value{[]byte{0x02}})
+	f.queueRows([]string{"id", "parent_id"},
+		[]driver.Value{int64(1), []byte{0x02}},
+		[]driver.Value{int64(2), []byte{0x01}},
+		[]driver.Value{int64(3), []byte{0x02}},
+	)
+	parents, err := From[XByteParent]().With("Kids").All(ctx, db)
+	if err != nil {
+		t.Fatalf("[]byte keys must load: %v", err)
+	}
+	if n1, n2 := len(parents[0].Kids.Rows()), len(parents[1].Kids.Rows()); n1 != 1 || n2 != 2 {
+		t.Fatalf("grouping drifted: %d/%d", n1, n2)
+	}
+	if got, ok := f.log[1].args[0].([]byte); !ok || got[0] != 0x01 {
+		t.Fatalf("[]byte keys must bind their original bytes, got %T(%v)", f.log[1].args[0], f.log[1].args[0])
+	}
+}
+
+type vpCode string
+
+func (c vpCode) Value() (driver.Value, error) { return "V:" + string(c), nil }
+func (c *vpCode) Scan(src any) error {
+	s, _ := src.(string)
+	*c = vpCode(strings.TrimPrefix(s, "V:"))
+	return nil
+}
+
+type XValParent struct {
+	ID   int64
+	Code vpCode
+	Kids HasMany[XValKid] `rio:",fk:parent_code,ref:code"`
+}
+
+type XValKid struct {
+	ID         int64
+	ParentCode vpCode `rio:"parent_code"`
+}
+
+// A Valuer key binds its original value — the driver must see Value()'s
+// transformed form, not the canonical widened key.
+func TestPreloadValuerKeysBindOriginals(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id", "code"}, []driver.Value{int64(1), "V:a"})
+	f.queueRows([]string{"id", "parent_code"}, []driver.Value{int64(10), "V:a"})
+
+	parents, err := From[XValParent]().With("Kids").All(ctx, db)
+	if err != nil {
+		t.Fatalf("Valuer keys must load: %v", err)
+	}
+	if kids := parents[0].Kids.Rows(); len(kids) != 1 || kids[0].ID != 10 {
+		t.Fatalf("kids: %+v", kids)
+	}
+	if got := f.log[1].args[0]; got != "V:a" {
+		t.Fatalf("Valuer keys must bind through Value(), driver saw %T(%v)", got, got)
+	}
+}

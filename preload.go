@@ -817,6 +817,12 @@ func relKeyFam(types ...reflect.Type) int {
 		if t.Kind() == reflect.Pointer {
 			t = t.Elem()
 		}
+		if t.Implements(valuerType) {
+			// A Valuer key must bind its original value so the driver calls
+			// Value(); the canonical widened key would bypass it and match
+			// nothing against the stored form.
+			return kfAny
+		}
 		var f int
 		switch t.Kind() {
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
