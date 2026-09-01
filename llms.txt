@@ -1,0 +1,187 @@
+# rio
+
+> A generic ORM for Go with zero third-party dependencies in the core: immutable connection-free queries, explicit writes, typed relations.
+
+## Overview
+
+rio maps ordinary Go structs to tables and renders SQL for PostgreSQL, MySQL, SQLite, and ClickHouse from one `?`-placeholder pipeline. A `Query[T]` is an immutable value that touches the database only when a terminal method receives a context and a `Queryer` (`*rio.DB` or `*rio.Tx`). There is no lazy loading, dirty tracking, callback, or hidden transaction. Driver modules (`github.com/go-rio/postgres|mysql|sqlite|clickhouse`) carry the real drivers; the core module `github.com/go-rio/rio` requires Go 1.27.
+
+## Quick Start
+
+```bash
+go get github.com/go-rio/rio
+go get github.com/go-rio/sqlite # or postgres, mysql, clickhouse
+```
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+
+    "github.com/go-rio/rio"
+    "github.com/go-rio/sqlite"
+)
+
+type User struct {
+    ID    int64
+    Email string
+    Age   int
+}
+
+func main() {
+    ctx := context.Background()
+    db, err := sqlite.Open("file:app.db")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+
+    user := User{Email: "alice@example.com", Age: 30}
+    if err := rio.Insert(ctx, db, &user); err != nil {
+        log.Fatal(err)
+    }
+    adults, err := rio.From[User]().Where("age >= ?", 18).OrderBy("id").All(ctx, db)
+    if err != nil {
+        log.Fatal(err)
+    }
+    log.Println(len(adults))
+}
+```
+
+## Key Concepts
+
+- **Query values**: `rio.From[T]()` starts an immutable builder; every builder method returns a derived value, so a query can be a package variable reused concurrently. `Validate` checks it without a database; `Must` panics on error and enables a per-handle render cache.
+- **Queryer**: `*rio.DB` (from `rio.New` or a driver module's `Open`) and `*rio.Tx` (from `db.Tx`) both satisfy it; the same code runs inside or outside a transaction. `Tx` on a `*Tx` opens a savepoint.
+- **Placeholders**: always `?`, rebound per dialect. A slice argument expands inside `IN (?)`; `Query.Sub(column)` splices a one-column subquery as an argument; `??` is a literal `?` where the rendered SQL can carry one. `Where`/`Having` fragments are either fully inline (`Where("age >= ?", 18)`) or fully deferred (`Where("age >= ?")`, filled by terminal arguments in SQL order).
+- **SQL text is verbatim**: `Where`, `Having`, `Join`, `OrderBy`, `GroupBy`, `RelWhere`, `RelOrderBy`, `Expr`, `Raw`, `Exec` render what they are given. Never build them from untrusted input; mapped column names (`Pluck`, aggregates, `Set` keys, `OrderKeys`, `Update` columns) are validated against the model.
+- **Models**: structs with a `rio` tag. `ID int64` is the conventional auto-increment key; `CreatedAt`/`UpdatedAt` are maintained. Tags: `rio:"column"`, `,pk`, `,noautoincr`, `,version` (optimistic locking), `,softdelete`, `,json`, `,omitzero`, `,readonly`, `,countof:Rel`, `,nostamp`, `-`. `TableName() string` overrides the pluralized snake_case table name.
+- **Relations**: typed containers `HasMany[T]`, `HasOne[T]`, `BelongsTo[T]`, `ManyToMany[T]` (tags `fk:`, `ref:`, `join:`). They load only through `With`, as separate key-set queries; `Rows()`/`Row()` on an unloaded container panics. `WithCount` fills an `int64` field tagged `countof:`.
+- **Cursor pagination**: `OrderKeys` (mapped NOT NULL scalar columns, primary key appended as tie-breaker), `CursorAt(&row)`, `After(cursor)`, `Before(cursor)`, `Chunk(ctx, db, size)`; `Cursor.String`/`ParseCursor` round-trip URL-safe tokens.
+- **Dialects**: opaque values `rio.Postgres`, `rio.MySQL`, `rio.SQLite`, `rio.ClickHouse`. Capabilities differ: MySQL has no `RETURNING`; SQLite elides row locks; ClickHouse rejects row locks, transactions, statement caching, synchronous update/delete, and upserts (an error matching `errors.ErrUnsupported`).
+
+## API Reference
+
+### Core Functions
+
+- `From[T]() Query[T]` - start a query for T's table.
+- `Find[T](ctx, db, key...) (*T, error)` - primary-key lookup; composite key parts in field order.
+- `Insert(ctx, db, &row)`, `Update(ctx, db, &row, cols...)`, `Delete`, `ForceDelete`, `Restore` - entity writes by primary key; `Update` writes every eligible field (zero values included) unless given a whitelist.
+- `Upsert(ctx, db, &row, opts...)` with `OnConflict`, `DoUpdate`, `DoUpdateSet`, `DoNothing`, `KeepTrashed` - one-statement insert-or-update.
+- `InsertAll`, `UpsertAll` - chunked batch writes; `omitzero` does not apply, and only `InsertAll` backfills keys (PostgreSQL, SQLite).
+- `Raw[T](sql, args...)` with `All`/`First`/`Sole`/`Rows`, `Exec(ctx, db, sql, args...)` - hand-written SQL through the same pipeline (placeholder rebinding, slice expansion, hooks, error translation).
+- `Attach`, `Detach`, `SyncRelation`, `ClearRelation` - join-table writes for `ManyToMany`.
+- `New(*sql.DB, dialect, opts...)`, `NewNative(NativeConfig, dialect, opts...)` - handle construction; driver modules wrap these.
+- `WriteColumns(w, pkg, models...)` - generate table and column constants.
+- `TableName(structName)` - the convention-derived table name.
+- `ParseCursor(token)` - decode a cursor token.
+
+### Query[T] methods
+
+- Builders: `Where`, `Having`, `Join`, `OrderBy`, `GroupBy`, `Distinct`, `Limit`, `Offset`, `Scope`, `ForUpdate(opts...)`, `ForShare(opts...)` (with `rio.NoWait`/`rio.SkipLocked`), `Final`, `WithTrashed`, `OnlyTrashed`, `AllRows`, `With(path, RelOption...)`, `WithCount(rel, RelOption...)`, `WhereHas`, `WhereHasNot`, `OrderKeys`, `After`, `Before`.
+- Terminals: `All`, `First`, `Sole`, `Find`, `Rows` (`iter.Seq2[T, error]`), `Chunk` (`iter.Seq2[[]T, error]`), `Count`, `Exists`, `Pluck[V]`, `Sum[V]`, `Min[V]`, `Max[V]`, `Avg[V]`, `FirstOrCreate`, `CreateOrFirst`.
+- Set-based writes (require a condition or `AllRows`): `UpdateAll(ctx, db, Set, args...)`, `UpdateAllReturning`, `DeleteAll`, `DeleteAllReturning`, `ForceDeleteAll`, `RestoreAll`.
+- Reuse: `Validate`, `Must`, `SQL(db, args...)`, `Sub(column)`, `CursorAt(&row)`.
+
+### Core Types
+
+- `Query[T]` - immutable, connection-free query description.
+- `DB`, `Tx`, `Queryer` - execution handles; `DB.Tx`, `DB.TxWith(ctx, *sql.TxOptions, fn)`, `Tx.Tx` (savepoint), `DB.Unwrap`, `DB.Dialect`, `DB.DescribeModel`, `DB.Close`.
+- `HasMany[T]`, `HasOne[T]`, `BelongsTo[T]`, `ManyToMany[T]` - relation containers with `Loaded`, `Rows`/`Row`, `Set`, JSON `null` when unloaded.
+- `RelOption` - `RelWhere`, `RelOrderBy`, `RelLimit` (per parent), `RelWithTrashed`.
+- `Set`, `Expr` - `UpdateAll`/`DoUpdateSet` assignments; `Expr` is verbatim SQL.
+- `SortKey`, `Cursor`, `Subquery`, `LockOption`, `UpsertOption`, `Option`.
+- `QueryHook`, `QueryEvent` - observation of every statement (`Op`, `Model`, `Query`, `Args`, `Err`, `Duration`, `RowsAffected`, `RowsReturned`, `Phase`).
+- `Dialect` - opaque; `Postgres`, `MySQL`, `SQLite`, `ClickHouse`.
+- `NativeDB`, `NativeTx`, `NativeRows`, `NativeCell`, `NativeBatcher`, `NativeCopier`, `NativeConfig` - driver-module SPI for native execution channels.
+- `TableSchema`, `ColumnSchema` - model mapping as `DescribeModel` reports it; consumed by the `lint` subpackage (`lint.Check(ctx, db, models...)`).
+
+### Options
+
+`WithQueryHook`, `WithoutArgs`, `WithClock`, `WithErrorTranslator`, `WithTableNamer`, `WithDriverHandle`, `WithStmtCache(capacity...)`, `WithoutStmtCache`.
+
+## Common Patterns
+
+### Reusable validated template with deferred arguments
+
+```go
+var adults = rio.From[User]().
+    Where("age >= ?").
+    OrderBy("created_at DESC").
+    Limit(10).
+    Must()
+
+users, err := adults.All(ctx, db, 18)
+emails, err := adults.Pluck[string](ctx, db, "email", 18)
+```
+
+### Preload with filters and a filtered count
+
+```go
+users, err := rio.From[User]().
+    With("Posts", rio.RelWhere("published = ?", true), rio.RelOrderBy("created_at DESC"), rio.RelLimit(3)).
+    WithCount("Posts", rio.RelWhere("published = ?", true)).
+    All(ctx, db)
+```
+
+### Transaction with row locks
+
+```go
+err := db.Tx(ctx, func(tx *rio.Tx) error {
+    job, err := rio.From[Job]().Where("state = ?", "queued").ForUpdate(rio.SkipLocked).First(ctx, tx)
+    if err != nil {
+        return err // rolls back
+    }
+    job.State = "running"
+    return rio.Update(ctx, tx, job, "state") // nil commits
+})
+```
+
+### Keyset pagination
+
+```go
+q := rio.From[Post]().OrderKeys(rio.SortKey{Column: "score", Desc: true}, rio.SortKey{Column: "created_at"})
+page, err := q.Limit(20).All(ctx, db)
+cur, err := q.CursorAt(&page[len(page)-1])
+next, err := q.After(cur).Limit(20).All(ctx, db)
+```
+
+### Upsert with an expression
+
+```go
+err := rio.Upsert(ctx, db, &counter,
+    rio.OnConflict("key"),
+    rio.DoUpdateSet(rio.Set{"hits": rio.Expr("counters.hits + excluded.hits")}),
+)
+```
+
+### Subquery argument
+
+```go
+authors := rio.From[Post]().Where("published = ?", true).Sub("user_id")
+users, err := rio.From[User]().Where("id IN (?)", authors).All(ctx, db)
+```
+
+## Error Handling
+
+- `ErrNotFound` - `First`/`Find`/`Sole` matched nothing; wraps `sql.ErrNoRows`, so both `errors.Is` checks work. `All` returns an empty slice and `nil`.
+- `ErrMultipleRows` - `Sole` matched more than one row.
+- `ErrStaleObject` - a `version` column did not match (optimistic-lock conflict) or the row was deleted.
+- `ErrMissingWhere` - `UpdateAll`/`DeleteAll` without a condition; call `AllRows()` to affect the whole table.
+- `ErrDuplicateKey`, `ErrForeignKeyViolated` - translated constraint violations; the driver error stays in the chain.
+- `ErrNoPrimaryKey` - a keyed operation on a model without a primary key.
+- `errors.ErrUnsupported` - an operation the dialect cannot honor (row locks or transactions on ClickHouse, `UpdateAllReturning` on MySQL); the error message names the alternative.
+- NULL scanned into a non-nullable field fails with an error naming the column; use a pointer field.
+
+## References
+
+- README: https://github.com/go-rio/rio/blob/main/README.md
+- Architecture and design decisions: https://github.com/go-rio/rio/blob/main/DESIGN.md
+- Changelog: https://github.com/go-rio/rio/blob/main/CHANGELOG.md
+- Contributing: https://github.com/go-rio/rio/blob/main/CONTRIBUTING.md
+- Go Reference: https://pkg.go.dev/github.com/go-rio/rio
+- Repository: https://github.com/go-rio/rio
+- Issues: https://github.com/go-rio/rio/issues
+- Driver modules: https://github.com/go-rio/postgres, https://github.com/go-rio/mysql, https://github.com/go-rio/sqlite, https://github.com/go-rio/clickhouse
+- Migrations: https://github.com/go-rio/migrate
