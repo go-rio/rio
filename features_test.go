@@ -920,6 +920,79 @@ func TestQueryFind(t *testing.T) {
 	}
 }
 
+func TestSubqueryArguments(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	sub := From[Post]().Where("title <> ?", "draft").Sub("user_id")
+
+	f.queueRows(userCols)
+	if _, err := From[User]().Where("age > ?", 1).Where("id IN (?)", sub).All(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	got := f.loggedContaining("SELECT")[0]
+	want := `WHERE (age > $1) AND (id IN (SELECT "posts"."user_id" FROM "posts" WHERE (title <> $2))) AND "users"."deleted_at" IS NULL`
+	if !strings.Contains(got.sql, want) || len(got.args) != 2 || got.args[1] != "draft" {
+		t.Fatalf("subquery splice: %s %v", got.sql, got.args)
+	}
+
+	// A slice inside the subquery expands under the outer numbering.
+	inner := From[Post]().Where("id IN (?)", []int64{7, 8}).Sub("user_id")
+	f.queueRows(userCols)
+	if _, err := From[User]().Where("age > ?", 1).Where("id IN (?)", inner).All(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	got = f.loggedContaining("SELECT")[1]
+	if !strings.Contains(got.sql, `WHERE (id IN ($2, $3))`) || len(got.args) != 3 || got.args[2] != int64(8) {
+		t.Fatalf("nested expansion: %s %v", got.sql, got.args)
+	}
+
+	fm := newFakeDB()
+	my := fm.open(MySQL)
+	fm.queueRows([]string{"n"}, []driver.Value{int64(1)})
+	if _, err := Raw[int64]("SELECT count(*) FROM users WHERE id IN (?)", sub).All(ctx, my); err != nil {
+		t.Fatal(err)
+	}
+	wantMy := "SELECT count(*) FROM users WHERE id IN (SELECT `posts`.`user_id` FROM `posts` WHERE (title <> ?))"
+	if got := fm.loggedContaining("SELECT")[0]; got.sql != wantMy || got.args[0] != "draft" {
+		t.Fatalf("raw mysql splice: %s %v", got.sql, got.args)
+	}
+
+	q := From[User]().Where("id IN (?)", sub).Must()
+	f.queueRows(userCols)
+	if _, err := q.All(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	entries := 0
+	q.cache.entries.Range(func(_, _ any) bool { entries++; return true })
+	if entries != 0 {
+		t.Fatalf("subquery shapes must not cache, got %d entries", entries)
+	}
+
+	if _, err := From[User]().Where("id IN (?)", From[Post]().Sub("nope")).All(ctx, db); err == nil || !strings.Contains(err.Error(), "no column") {
+		t.Fatalf("unknown column: %v", err)
+	}
+}
+
+// SQL renders exactly what All runs.
+func TestQuerySQL(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	q := From[User]().Where("age > ?").OrderBy("id")
+	sqlText, args, err := q.SQL(db, 18)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.queueRows(userCols)
+	if _, err := q.All(ctx, db, 18); err != nil {
+		t.Fatal(err)
+	}
+	if ran := f.loggedContaining("SELECT")[0]; ran.sql != sqlText || len(args) != 1 || args[0] != 18 {
+		t.Fatalf("SQL() = %s %v, ran %s", sqlText, args, ran.sql)
+	}
+}
+
 type Grant struct {
 	UserID int64  `rio:",pk"`
 	Scope  string `rio:",pk"`

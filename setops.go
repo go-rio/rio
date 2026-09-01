@@ -192,7 +192,7 @@ func (q Query[T]) updateAll(
 	if returning {
 		b = appendReturning(b, d, table, p)
 	}
-	sqlText, outArgs, err := finishSQL(d, b, bindArgs)
+	sqlText, outArgs, err := finishSQL(g, b, bindArgs)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -282,7 +282,7 @@ func (q Query[T]) forceDeleteAll(ctx context.Context, db Queryer, p *plan, state
 	if returning {
 		b = appendReturning(b, d, table, p)
 	}
-	sqlText, outArgs, err := finishSQL(d, b, args)
+	sqlText, outArgs, err := finishSQL(g, b, args)
 	if err != nil {
 		return nil, 0, err
 	}

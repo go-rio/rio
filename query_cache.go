@@ -135,7 +135,7 @@ func (c *cachedQuery) bind(d Dialect, execArgs []any) ([]any, error) {
 
 func hasExpandableExecArg(args []any) bool {
 	for _, arg := range args {
-		if _, ok := sliceValue(arg); ok {
+		if dynamicArg(arg) {
 			return true
 		}
 	}
@@ -170,8 +170,8 @@ func newCachedQuery(
 
 	staticArgs := func(values []any) bool {
 		for _, value := range values {
-			if _, ok := sliceValue(value); ok {
-				// Inline slices may change between executions.
+			if dynamicArg(value) {
+				// Inline slices and subqueries may change between executions.
 				return false
 			}
 			if _, ok := value.(*time.Time); ok {

@@ -73,7 +73,7 @@ func SyncRelation[T any, K any](ctx context.Context, db Queryer, row *T, relatio
 			lb = append(lb, " WHERE "...)
 			lb = d.quote(lb, res.ref.column)
 			lb = append(lb, " = ? FOR UPDATE"...)
-			lockSQL, lockArgs, err := finishSQL(d, lb, []any{ownerKey})
+			lockSQL, lockArgs, err := finishSQL(g, lb, []any{ownerKey})
 			if err != nil {
 				return err
 			}
@@ -94,7 +94,7 @@ func SyncRelation[T any, K any](ctx context.Context, db Queryer, row *T, relatio
 			b = append(b, " WHERE "...)
 			b = d.quote(b, res.joinFK)
 			b = append(b, " = ?"...)
-			sqlText, outArgs, err := finishSQL(d, b, []any{ownerKey})
+			sqlText, outArgs, err := finishSQL(tx.gram(), b, []any{ownerKey})
 			if err != nil {
 				return err
 			}
@@ -169,7 +169,7 @@ func insertJoinRows(ctx context.Context, db Queryer, p *plan, res *resolvedRel, 
 			b = append(b, " = "...)
 			b = d.quote(b, res.joinFK)
 		}
-		sqlText, outArgs, err := finishSQL(d, b, args)
+		sqlText, outArgs, err := finishSQL(g, b, args)
 		if err != nil {
 			return err
 		}
@@ -182,7 +182,8 @@ func insertJoinRows(ctx context.Context, db Queryer, p *plan, res *resolvedRel, 
 
 // deleteJoinRows removes join rows in dialect-sized chunks.
 func deleteJoinRows(ctx context.Context, db Queryer, p *plan, res *resolvedRel, ownerKey any, ids []any) error {
-	d := db.gram().d
+	g := db.gram()
+	d := g.d
 	chunk := max(d.caps().maxBindParams-1, 1)
 	for start := 0; start < len(ids); start += chunk {
 		end := min(start+chunk, len(ids))
@@ -197,7 +198,7 @@ func deleteJoinRows(ctx context.Context, db Queryer, p *plan, res *resolvedRel, 
 		b = append(b, " IN (?)"...)
 		args := []any{ownerKey, ids[start:end]}
 
-		sqlText, outArgs, err := finishSQL(d, b, args)
+		sqlText, outArgs, err := finishSQL(g, b, args)
 		if err != nil {
 			return err
 		}
@@ -226,7 +227,8 @@ func selectJoinRefs(
 	res *resolvedRel,
 	ownerKey any,
 ) (keys []any, vals []any, set map[any]struct{}, err error) {
-	d := tx.gram().d
+	g := tx.gram()
+	d := g.d
 	b := make([]byte, 0, 96)
 	b = append(b, "SELECT "...)
 	b = d.quote(b, res.joinRef)
@@ -238,7 +240,7 @@ func selectJoinRefs(
 	if d.caps().forUpdate == forUpdateRender {
 		b = append(b, " FOR UPDATE"...)
 	}
-	sqlText, outArgs, err := finishSQL(d, b, []any{ownerKey})
+	sqlText, outArgs, err := finishSQL(g, b, []any{ownerKey})
 	if err != nil {
 		return nil, nil, nil, err
 	}

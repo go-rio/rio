@@ -127,5 +127,5 @@ func renderAggregate(g *grammar, p *plan, fn string, f *field, s *queryState) (s
 	if err != nil {
 		return "", nil, err
 	}
-	return finishSQL(d, b, args)
+	return finishSQL(g, b, args)
 }

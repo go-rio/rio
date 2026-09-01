@@ -45,6 +45,23 @@ var (
 // it and unwraps it into the bound arguments.
 type arrayParam struct{ v any }
 
+// Subquery is a query embedded as a ? argument: it renders in place of the
+// placeholder, its own arguments spliced into the statement's, with the
+// caller's parentheses around it. Query.Sub builds one.
+type Subquery struct {
+	render func(g *grammar) ([]byte, []any, error)
+}
+
+// dynamicArg reports arguments that change the rendered statement: slices
+// expand, subqueries splice.
+func dynamicArg(arg any) bool {
+	if _, ok := arg.(Subquery); ok {
+		return true
+	}
+	_, ok := sliceValue(arg)
+	return ok
+}
+
 // bindStyle selects the output placeholder form.
 type bindStyle int
 
@@ -71,12 +88,18 @@ const (
 //
 // The unchanged path returns the input and arguments without allocation.
 func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []any, error) {
+	return rebindFrom(p, style, query, args, nil, 0)
+}
+
+// rebindFrom is rebind numbering placeholders after start, with g rendering
+// Subquery arguments (nil rejects them).
+func rebindFrom(p lexProfile, style bindStyle, query string, args []any, g *grammar, start int) (string, []any, error) {
 	var out []byte // nil until the first rewrite; query[:copied] already appended
 	copied := 0
 	outArgs := args // reused verbatim unless a slice expands
 	expanded := false
 	argIdx := 0
-	n := 0 // emitted placeholder count
+	n := start // emitted placeholder count
 
 	rewriteTo := func(i int) {
 		if out == nil {
@@ -132,6 +155,28 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 		if j > 0 {
 			out = append(out, ", "...)
 		}
+	}
+	// spliceSubquery replaces the ? at i with the rendered subquery, its
+	// placeholders numbered after the ones emitted so far.
+	spliceSubquery := func(i int, sq Subquery) error {
+		if g == nil {
+			return fmt.Errorf("rio: a Subquery cannot bind at placeholder %d (byte %d)", argIdx, i)
+		}
+		text, subArgs, err := sq.render(g)
+		if err != nil {
+			return err
+		}
+		bound, boundArgs, err := rebindFrom(p, style, byteString(text), subArgs, g, n)
+		if err != nil {
+			return err
+		}
+		startExpanding()
+		rewriteTo(i)
+		copied = i + 1
+		out = append(out, bound...)
+		outArgs = append(outArgs, boundArgs...)
+		n += len(boundArgs)
+		return nil
 	}
 
 	i := 0
@@ -240,6 +285,8 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 			case arrayParam:
 				startExpanding()
 				bindScalar(i, xs.v)
+			case Subquery:
+				expandErr = spliceSubquery(i, xs)
 			case []any:
 				if expandErr = beginExpand(i, len(xs)); expandErr == nil {
 					emitAll(xs, sep, emit)

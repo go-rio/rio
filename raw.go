@@ -26,8 +26,7 @@ func Raw[T any](sqlText string, args ...any) RawQuery[T] {
 // Exec runs a hand-written statement through the shared pipeline and returns
 // the driver result.
 func Exec(ctx context.Context, db Queryer, sqlText string, args ...any) (sql.Result, error) {
-	d := db.gram().d
-	rebound, outArgs, err := finishSQLText(d, sqlText, copyArgs(args))
+	rebound, outArgs, err := finishSQLText(db.gram(), sqlText, copyArgs(args))
 	if err != nil {
 		return nil, err
 	}
@@ -85,8 +84,7 @@ func (r RawQuery[T]) Rows(ctx context.Context, db Queryer) iter.Seq2[T, error] {
 				return
 			}
 		}
-		d := db.gram().d
-		sqlText, args, err := finishSQLText(d, r.sql, r.args)
+		sqlText, args, err := finishSQLText(db.gram(), r.sql, r.args)
 		if err != nil {
 			yield(zero, err)
 			return
@@ -120,8 +118,7 @@ func (r RawQuery[T]) scan(ctx context.Context, db Queryer, maxRows int) ([]T, er
 			return nil, err
 		}
 	}
-	d := db.gram().d
-	sqlText, args, err := finishSQLText(d, r.sql, r.args)
+	sqlText, args, err := finishSQLText(db.gram(), r.sql, r.args)
 	if err != nil {
 		return nil, err
 	}

@@ -941,7 +941,7 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 		}
 	}
 
-	return finishSQL(d, b, args)
+	return finishSQL(g, b, args)
 }
 
 // appendLock renders, elides, or rejects the row lock by dialect capability.
@@ -1177,15 +1177,16 @@ func renderExists(
 	return append(b, ')'), args, nil
 }
 
-// finishSQL expands slices, rebinds placeholders, checks the bind budget, and
-// normalizes arguments. It takes ownership of b.
-func finishSQL(d Dialect, b []byte, args []any) (string, []any, error) {
-	return finishSQLText(d, byteString(b), args)
+// finishSQL expands slices, splices subqueries, rebinds placeholders, checks
+// the bind budget, and normalizes arguments. It takes ownership of b.
+func finishSQL(g *grammar, b []byte, args []any) (string, []any, error) {
+	return finishSQLText(g, byteString(b), args)
 }
 
 // finishSQLText is finishSQL for caller-owned SQL strings (Raw, Exec).
-func finishSQLText(d Dialect, sqlText string, args []any) (string, []any, error) {
-	out, outArgs, err := rebind(d.lexer(), d.style(), sqlText, args)
+func finishSQLText(g *grammar, sqlText string, args []any) (string, []any, error) {
+	d := g.d
+	out, outArgs, err := rebindFrom(d.lexer(), d.style(), sqlText, args, g, 0)
 	if err != nil {
 		return "", nil, err
 	}
@@ -1297,16 +1298,25 @@ func normalizeArgs(d Dialect, args []any) ([]any, error) {
 }
 
 func renderPluck(g *grammar, p *plan, f *field, s *queryState) (string, []any, error) {
+	b, args, err := renderPluckRaw(g, p, f, s)
+	if err != nil {
+		return "", nil, err
+	}
+	return finishSQL(g, b, args)
+}
+
+// renderPluckRaw renders a one-column select in ? form; Sub splices it.
+func renderPluckRaw(g *grammar, p *plan, f *field, s *queryState) ([]byte, []any, error) {
 	d := g.d
 	if err := checkFinal(d, s); err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	table := g.table(p)
 	var sortKeys []resolvedKey
 	if len(s.orderKeys) > 0 || s.after != nil || s.before != nil {
 		var kerr error
 		if sortKeys, kerr = resolveSortKeys(p, s); kerr != nil {
-			return "", nil, kerr
+			return nil, nil, kerr
 		}
 	}
 	b := make([]byte, 0, 128)
@@ -1330,7 +1340,7 @@ func renderPluck(g *grammar, p *plan, f *field, s *queryState) (string, []any, e
 	var err error
 	b, args, err = renderWhere(b, args, g, table, p, s, sortKeys)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	if len(s.orders) > 0 {
 		b = append(b, " ORDER BY "...)
@@ -1344,13 +1354,41 @@ func renderPluck(g *grammar, p *plan, f *field, s *queryState) (string, []any, e
 	b = appendOrderKeys(b, d, table, sortKeys, s.before != nil)
 	b, err = appendLimitOffset(b, d, s)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	if s.lock != lockNone {
 		b, err = appendLock(b, d, s)
 		if err != nil {
-			return "", nil, err
+			return nil, nil, err
 		}
 	}
-	return finishSQL(d, b, args)
+	return b, args, nil
+}
+
+// Sub embeds the query as a ? argument projecting one mapped column, for
+// IN (?), EXISTS (?), and scalar comparisons; the caller writes the
+// parentheses. The query's own Where arguments must be inline.
+func (q Query[T]) Sub(column string) Subquery {
+	return Subquery{render: func(g *grammar) ([]byte, []any, error) {
+		p, state, err := prepareQueryState[T](g.d, &q.s, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		f, ok := p.byColumn[column]
+		if !ok {
+			return nil, nil, fmt.Errorf("rio: Sub: %s has no column %q (expressions go through Raw)", p.structName, column)
+		}
+		return renderPluckRaw(g, p, f, &state)
+	}}
+}
+
+// SQL renders the statement All would run on db, with its bound arguments,
+// without executing it.
+func (q Query[T]) SQL(db Queryer, args ...any) (string, []any, error) {
+	g := db.gram()
+	p, state, err := prepareQueryState[T](g.d, &q.s, args)
+	if err != nil {
+		return "", nil, err
+	}
+	return renderSelect(g, p, &state, selectRows)
 }

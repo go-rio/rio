@@ -830,7 +830,7 @@ func renderRelSelect(
 		b = append(b, o...)
 	}
 
-	sqlText, outArgs, err := finishSQL(d, b, args)
+	sqlText, outArgs, err := finishSQL(g, b, args)
 	return sqlText, outArgs, keyed, err
 }
 
@@ -1039,7 +1039,7 @@ func renderRelSelectLimited(
 	b = append(b, '.')
 	b = d.quote(b, "__rio_rn")
 
-	sqlText, outArgs, err := finishSQL(d, b, args)
+	sqlText, outArgs, err := finishSQL(g, b, args)
 	return sqlText, outArgs, keyed, err
 }
 
@@ -1307,7 +1307,7 @@ func (l *countLoad[K, KR]) prepare(stmts []relStatement) ([]relStatement, error)
 		b = append(b, '.')
 		b = d.quote(b, keyCol)
 
-		sqlText, outArgs, err := finishSQL(d, b, args)
+		sqlText, outArgs, err := finishSQL(g, b, args)
 		if err != nil {
 			return nil, err
 		}

@@ -17,8 +17,8 @@ func (clickhouseDialect) name() string      { return "clickhouse" }
 func (clickhouseDialect) lexer() lexProfile { return chLex }
 func (clickhouseDialect) style() bindStyle  { return bindQuestionEsc }
 
-// Times pass through; the driver renders the epoch-microsecond form the
-// primary-key range analyzer accepts.
+// Times pass through; the driver renders toDateTime64 literals, which every
+// time column accepts and the primary-key range analyzer folds.
 func (clickhouseDialect) bindTime(t time.Time) any { return t }
 
 func (clickhouseDialect) caps() dialectCaps {
