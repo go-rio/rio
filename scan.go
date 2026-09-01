@@ -1419,10 +1419,13 @@ func chByteArg(a any) (any, bool) {
 	return string(v.Bytes()), true
 }
 
-// bindOverflowUint binds a uint64 with the high bit set as a decimal string
-// (database/sql refuses it). SQLite would silently coerce that to REAL and
-// lose precision, so it errors there instead.
+// bindOverflowUint binds a uint64 with the high bit set: as-is where the
+// channel takes it, else as decimal text (database/sql refuses it). SQLite
+// would silently coerce that to REAL and lose precision, so it errors there.
 func bindOverflowUint(d Dialect, n uint64) (any, error) {
+	if d.caps().bindUint64 {
+		return n, nil
+	}
 	if d.name() == "sqlite" {
 		return nil, fmt.Errorf(
 			"rio: value %d exceeds SQLite's signed 64-bit integer range and cannot be stored losslessly; "+

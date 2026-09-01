@@ -1259,7 +1259,7 @@ func TestWithCount(t *testing.T) {
 		t.Fatalf("All: %v", err)
 	}
 	rel := f.logged()[1]
-	want := `SELECT "board_posts"."board_id", count(*) FROM "board_posts" WHERE "board_posts"."board_id" IN ($1, $2) GROUP BY "board_posts"."board_id"`
+	want := `SELECT "board_posts"."board_id", count(*) FROM "board_posts" WHERE "board_posts"."board_id" = ANY($1) GROUP BY "board_posts"."board_id"`
 	if rel != want {
 		t.Fatalf("count sql:\n got: %s\nwant: %s", rel, want)
 	}
@@ -1418,7 +1418,7 @@ func TestRelLimitWindowQuery(t *testing.T) {
 	}
 	rel := f.logged()[1]
 	for _, frag := range []string{
-		`SELECT "id", "user_id", "title" FROM (SELECT "posts"."id", "posts"."user_id", "posts"."title", ROW_NUMBER() OVER (PARTITION BY "posts"."user_id" ORDER BY id DESC) AS "__rio_rn" FROM "posts" WHERE "posts"."user_id" IN ($1)`,
+		`SELECT "id", "user_id", "title" FROM (SELECT "posts"."id", "posts"."user_id", "posts"."title", ROW_NUMBER() OVER (PARTITION BY "posts"."user_id" ORDER BY id DESC) AS "__rio_rn" FROM "posts" WHERE "posts"."user_id" = ANY($1)`,
 		`) AS "rio_w" WHERE "rio_w"."__rio_rn" <= 2`,
 	} {
 		if !strings.Contains(rel, frag) {
@@ -2393,7 +2393,7 @@ func TestManyToManyJoinColumnOverrides(t *testing.T) {
 		t.Fatalf("All: %v", err)
 	}
 	rel := f.logged()[1]
-	for _, frag := range []string{`"enrollments"."course_ref" = "course_xes"."id"`, `"enrollments"."learner_id" IN ($1)`} {
+	for _, frag := range []string{`"enrollments"."course_ref" = "course_xes"."id"`, `"enrollments"."learner_id" = ANY($1)`} {
 		if !strings.Contains(rel, frag) {
 			t.Fatalf("fk:/ref: overrides missing, got:\n%s", rel)
 		}
@@ -2413,7 +2413,7 @@ func TestManyToManyJoinColumnOverrides(t *testing.T) {
 		t.Fatalf("self-ref with tags: %v", err)
 	}
 	rel = f.logged()[len(f.logged())-1]
-	for _, frag := range []string{`"node_links"."dst_id" = "node_oks"."id"`, `"node_links"."src_id" IN ($1)`} {
+	for _, frag := range []string{`"node_links"."dst_id" = "node_oks"."id"`, `"node_links"."src_id" = ANY($1)`} {
 		if !strings.Contains(rel, frag) {
 			t.Fatalf("self-ref join columns wrong, got:\n%s", rel)
 		}

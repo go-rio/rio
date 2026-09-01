@@ -126,6 +126,19 @@ func TestRebind(t *testing.T) {
 			"SELECT * FROM t WHERE a = ? AND id IN (?, ?) AND b = ?", []any{1, 2, 3, 4}, ""},
 		{"array expands", pgLex, bindDollar, "SELECT * FROM t WHERE id IN (?)", []any{[2]int{7, 8}},
 			"SELECT * FROM t WHERE id IN ($1, $2)", []any{7, 8}, ""},
+		{"typed slices expand without reflect", pgLex, bindDollar,
+			"SELECT * FROM t WHERE a IN (?) AND b IN (?) AND c IN (?) AND d IN (?)",
+			[]any{[]int64{1, 300}, []uint64{2}, []any{"x", 3}, []string{"y"}},
+			"SELECT * FROM t WHERE a IN ($1, $2) AND b IN ($3) AND c IN ($4, $5) AND d IN ($6)",
+			[]any{int64(1), int64(300), uint64(2), "x", 3, "y"}, ""},
+
+		// An arrayParam binds whole, unwrapped, between expansions.
+		{"array param pg", pgLex, bindDollar, "SELECT * FROM t WHERE a = ? AND id = ANY(?) AND b IN (?)",
+			[]any{1, arrayParam{[]int64{2, 3}}, []int{4, 5}},
+			"SELECT * FROM t WHERE a = $1 AND id = ANY($2) AND b IN ($3, $4)", []any{1, []int64{2, 3}, 4, 5}, ""},
+		{"array param question style", sqliteLex, bindQuestion, "SELECT * FROM t WHERE id = ANY(?)",
+			[]any{arrayParam{[]string{"a"}}},
+			"SELECT * FROM t WHERE id = ANY(?)", []any{[]string{"a"}}, ""},
 
 		// ?N is rejected everywhere: a digit after ? would glue onto an emitted $N ($1+"0" reads as $10).
 		{"digit after placeholder", pgLex, bindDollar, "SELECT ?0", []any{1}, "", nil, "followed by a digit"},

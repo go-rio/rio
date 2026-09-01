@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"unsafe"
 )
 
 type relKind int
@@ -36,10 +37,13 @@ type relContainer interface {
 	relKind() relKind
 	targetType() reflect.Type
 	loadedLen() (int, bool)
-	// setLoaded stores the preloaded value: a []T for HasMany/ManyToMany,
-	// a possibly-nil *T for HasOne/BelongsTo.
-	setLoaded(v reflect.Value)
+	// regroup stores every owner's preloaded rows: buf is the loaded []T,
+	// order its row indexes grouped by owner, spans[i] owner i's range.
+	regroup(owners unsafe.Pointer, stride, offset uintptr, spans []span, buf any, order []int)
 }
+
+// span is one owner's [start, end) range in a regrouped buffer.
+type span struct{ start, end int }
 
 // relFieldNames records each container type's declared field name so
 // notLoadedPanic can name the exact With argument.
@@ -232,25 +236,85 @@ func (r *BelongsTo[T]) UnmarshalJSON(b []byte) error {
 	r.Set(row)
 	return nil
 }
-func (HasMany[T]) relKind() relKind             { return relHasMany }
-func (HasMany[T]) targetType() reflect.Type     { return reflect.TypeFor[T]() }
-func (r HasMany[T]) loadedLen() (int, bool)     { return len(r.rows), r.loaded }
-func (r *HasMany[T]) setLoaded(v reflect.Value) { r.Set(v.Interface().([]T)) }
+func (HasMany[T]) relKind() relKind         { return relHasMany }
+func (HasMany[T]) targetType() reflect.Type { return reflect.TypeFor[T]() }
+func (r HasMany[T]) loadedLen() (int, bool) { return len(r.rows), r.loaded }
+func (*HasMany[T]) regroup(owners unsafe.Pointer, stride, offset uintptr, spans []span, buf any, order []int) {
+	slab := regroupSlab(buf.([]T), order)
+	for i, s := range spans {
+		(*HasMany[T])(unsafe.Add(owners, uintptr(i)*stride+offset)).Set(slab[s.start:s.end:s.end])
+	}
+}
 
-func (ManyToMany[T]) relKind() relKind             { return relManyToMany }
-func (ManyToMany[T]) targetType() reflect.Type     { return reflect.TypeFor[T]() }
-func (r ManyToMany[T]) loadedLen() (int, bool)     { return len(r.rows), r.loaded }
-func (r *ManyToMany[T]) setLoaded(v reflect.Value) { r.Set(v.Interface().([]T)) }
+func (ManyToMany[T]) relKind() relKind         { return relManyToMany }
+func (ManyToMany[T]) targetType() reflect.Type { return reflect.TypeFor[T]() }
+func (r ManyToMany[T]) loadedLen() (int, bool) { return len(r.rows), r.loaded }
+func (*ManyToMany[T]) regroup(owners unsafe.Pointer, stride, offset uintptr, spans []span, buf any, order []int) {
+	slab := regroupSlab(buf.([]T), order)
+	for i, s := range spans {
+		(*ManyToMany[T])(unsafe.Add(owners, uintptr(i)*stride+offset)).Set(slab[s.start:s.end:s.end])
+	}
+}
 
-func (HasOne[T]) relKind() relKind             { return relHasOne }
-func (HasOne[T]) targetType() reflect.Type     { return reflect.TypeFor[T]() }
-func (r HasOne[T]) loadedLen() (int, bool)     { return 0, r.loaded }
-func (r *HasOne[T]) setLoaded(v reflect.Value) { r.Set(ptrOrNil[T](v)) }
+func (HasOne[T]) relKind() relKind         { return relHasOne }
+func (HasOne[T]) targetType() reflect.Type { return reflect.TypeFor[T]() }
+func (r HasOne[T]) loadedLen() (int, bool) { return 0, r.loaded }
+func (*HasOne[T]) regroup(owners unsafe.Pointer, stride, offset uintptr, spans []span, buf any, order []int) {
+	copies := regroupCopies(buf.([]T), spans, order)
+	for i, s := range spans {
+		c := (*HasOne[T])(unsafe.Add(owners, uintptr(i)*stride+offset))
+		if s.end == s.start {
+			c.Set(nil)
+			continue
+		}
+		c.Set(&copies[0])
+		copies = copies[1:]
+	}
+}
 
-func (BelongsTo[T]) relKind() relKind             { return relBelongsTo }
-func (BelongsTo[T]) targetType() reflect.Type     { return reflect.TypeFor[T]() }
-func (r BelongsTo[T]) loadedLen() (int, bool)     { return 0, r.loaded }
-func (r *BelongsTo[T]) setLoaded(v reflect.Value) { r.Set(ptrOrNil[T](v)) }
+func (BelongsTo[T]) relKind() relKind         { return relBelongsTo }
+func (BelongsTo[T]) targetType() reflect.Type { return reflect.TypeFor[T]() }
+func (r BelongsTo[T]) loadedLen() (int, bool) { return 0, r.loaded }
+func (*BelongsTo[T]) regroup(owners unsafe.Pointer, stride, offset uintptr, spans []span, buf any, order []int) {
+	copies := regroupCopies(buf.([]T), spans, order)
+	for i, s := range spans {
+		c := (*BelongsTo[T])(unsafe.Add(owners, uintptr(i)*stride+offset))
+		if s.end == s.start {
+			c.Set(nil)
+			continue
+		}
+		c.Set(&copies[0])
+		copies = copies[1:]
+	}
+}
+
+// regroupSlab copies the rows in order into one backing array; owners take
+// capped sub-slices of it.
+func regroupSlab[T any](src []T, order []int) []T {
+	slab := make([]T, len(order))
+	for k, i := range order {
+		slab[k] = src[i]
+	}
+	return slab
+}
+
+// regroupCopies copies each matched owner's first row in owner order, so
+// owners sharing a key never alias one value.
+func regroupCopies[T any](src []T, spans []span, order []int) []T {
+	n := 0
+	for _, s := range spans {
+		if s.end > s.start {
+			n++
+		}
+	}
+	copies := make([]T, 0, n)
+	for _, s := range spans {
+		if s.end > s.start {
+			copies = append(copies, src[order[s.start]])
+		}
+	}
+	return copies
+}
 
 func registerRelFieldName(container reflect.Type, name string) {
 	if prev, loaded := relFieldNames.LoadOrStore(container, name); loaded && prev.(string) != name {
@@ -275,20 +339,9 @@ func notLoadedPanic(kind relKind, container, target reflect.Type) string {
 		target.Name(),
 	)
 }
-func ptrOrNil[T any](v reflect.Value) *T {
-	if !v.IsValid() || v.IsNil() {
-		return nil
-	}
-	return v.Interface().(*T)
-}
 
 // isRelContainer reports whether t is a relation container; it checks the
-// pointer type because setLoaded has a pointer receiver.
+// pointer type because regroup has a pointer receiver.
 func isRelContainer(t reflect.Type) bool {
 	return t.Kind() == reflect.Struct && reflect.PointerTo(t).Implements(relContainerType)
-}
-
-func containerInfo(t reflect.Type) (relKind, reflect.Type) {
-	c := reflect.New(t).Interface().(relContainer)
-	return c.relKind(), c.targetType()
 }

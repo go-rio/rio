@@ -1098,13 +1098,13 @@ func normalizeArgs(d Dialect, args []any) ([]any, error) {
 				v = d.bindTime(nt)
 			}
 		case uint64:
-			if t <= math.MaxInt64 {
+			if t <= math.MaxInt64 || d.caps().bindUint64 {
 				continue
 			}
 			// database/sql rejects uint64 values above MaxInt64.
 			v = strconv.FormatUint(t, 10)
 		case uint:
-			if uint64(t) <= math.MaxInt64 {
+			if uint64(t) <= math.MaxInt64 || d.caps().bindUint64 {
 				continue
 			}
 			v = strconv.FormatUint(uint64(t), 10)

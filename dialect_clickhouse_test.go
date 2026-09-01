@@ -872,17 +872,16 @@ func TestClickHouseHugeUint64Binds(t *testing.T) {
 		t.Fatalf("Insert: %v", err)
 	}
 	args := f.loggedContaining("INSERT")[0].args
-	if s, ok := args[1].(string); !ok || s != "9223372036854775808" {
-		t.Fatalf("huge uint64 must bind as decimal string: %#v", args[1])
+	if args[1] != huge {
+		t.Fatalf("huge uint64 must bind as-is on the native channel: %#v", args[1])
 	}
 
 	f.queueRows([]string{"v"}, []driver.Value{int64(1)})
 	if _, err := Raw[int64]("SELECT 1 FROM t WHERE n = ?", huge).All(ctx, db); err != nil {
 		t.Fatalf("raw huge arg: %v", err)
 	}
-	stmt := f.loggedContaining("WHERE n")[0]
-	if s, ok := stmt.args[0].(string); !ok || s != "9223372036854775808" {
-		t.Fatalf("huge uint64 argument must bind as decimal string: %#v", stmt.args[0])
+	if stmt := f.loggedContaining("WHERE n")[0]; stmt.args[0] != huge {
+		t.Fatalf("huge uint64 argument must bind as-is: %#v", stmt.args[0])
 	}
 }
 
@@ -910,5 +909,22 @@ func TestClickHouseRawAndExecFullPass(t *testing.T) {
 	}
 	if logs[1] != "ALTER TABLE t UPDATE x = ? WHERE id = ?" {
 		t.Fatalf("exec must pass through: %s", logs[1])
+	}
+}
+
+// The native channel takes uint64 values above MaxInt64 as-is; database/sql
+// channels get decimal text.
+func TestClickHouseBindsUint64AsIs(t *testing.T) {
+	big := uint64(1) << 63
+	out, err := normalizeArgs(ClickHouse, []any{big})
+	if err != nil || out[0] != big {
+		t.Fatalf("clickhouse: %v %#v", err, out)
+	}
+	if v, err := bindOverflowUint(ClickHouse, big); err != nil || v != big {
+		t.Fatalf("bindOverflowUint clickhouse: %v %#v", err, v)
+	}
+	out, err = normalizeArgs(Postgres, []any{big})
+	if err != nil || out[0] != "9223372036854775808" {
+		t.Fatalf("postgres: %v %#v", err, out)
 	}
 }

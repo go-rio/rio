@@ -41,6 +41,10 @@ var (
 	}
 )
 
+// arrayParam binds a whole slice as one array parameter: rebind never expands
+// it and unwraps it into the bound arguments.
+type arrayParam struct{ v any }
+
 // bindStyle selects the output placeholder form.
 type bindStyle int
 
@@ -98,6 +102,35 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 		if !expanded {
 			expanded = true
 			outArgs = append(make([]any, 0, len(args)+8), args[:argIdx-1]...)
+		}
+	}
+	// bindScalar emits the placeholder at i for one argument.
+	bindScalar := func(i int, arg any) {
+		if style == bindDollar {
+			rewriteTo(i)
+			copied = i + 1 // the ? becomes $N
+			emit(arg)
+			return
+		}
+		// Question style keeps the ? in place.
+		n++
+		if expanded {
+			outArgs = append(outArgs, arg)
+		}
+	}
+	// beginExpand replaces the ? at i with count placeholders.
+	beginExpand := func(i, count int) error {
+		if count == 0 {
+			return fmt.Errorf("rio: empty slice for IN placeholder %d (byte %d)", argIdx, i)
+		}
+		startExpanding()
+		rewriteTo(i)
+		copied = i + 1 // the single ? is replaced by the expansion
+		return nil
+	}
+	sep := func(j int) {
+		if j > 0 {
+			out = append(out, ", "...)
 		}
 	}
 
@@ -200,33 +233,48 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 			}
 			arg := args[argIdx]
 			argIdx++
-			if elems, ok := sliceValue(arg); ok {
-				if elems.Len() == 0 {
-					return "", nil, fmt.Errorf("rio: empty slice for IN placeholder %d (byte %d)", argIdx, i)
-				}
-				// Expansion is flat; callers provide the surrounding parentheses.
+			// Expansion is flat; callers provide the surrounding parentheses.
+			// Common slice types skip reflect, whose element boxing allocates.
+			var expandErr error
+			switch xs := arg.(type) {
+			case arrayParam:
 				startExpanding()
-				rewriteTo(i)
-				copied = i + 1 // the single ? is replaced by the expansion
-				for j := 0; j < elems.Len(); j++ {
-					if j > 0 {
-						out = append(out, ", "...)
+				bindScalar(i, xs.v)
+			case []any:
+				if expandErr = beginExpand(i, len(xs)); expandErr == nil {
+					emitAll(xs, sep, emit)
+				}
+			case []int64:
+				if expandErr = beginExpand(i, len(xs)); expandErr == nil {
+					emitAll(xs, sep, emit)
+				}
+			case []int:
+				if expandErr = beginExpand(i, len(xs)); expandErr == nil {
+					emitAll(xs, sep, emit)
+				}
+			case []uint64:
+				if expandErr = beginExpand(i, len(xs)); expandErr == nil {
+					emitAll(xs, sep, emit)
+				}
+			case []string:
+				if expandErr = beginExpand(i, len(xs)); expandErr == nil {
+					emitAll(xs, sep, emit)
+				}
+			default:
+				elems, ok := sliceValue(arg)
+				if !ok {
+					bindScalar(i, arg)
+					break
+				}
+				if expandErr = beginExpand(i, elems.Len()); expandErr == nil {
+					for j := 0; j < elems.Len(); j++ {
+						sep(j)
+						emit(elems.Index(j).Interface())
 					}
-					emit(elems.Index(j).Interface())
 				}
-				i++
-				continue
 			}
-			if style == bindDollar {
-				rewriteTo(i)
-				copied = i + 1 // the ? becomes $N
-				emit(arg)
-			} else {
-				// Question style keeps the ? in place.
-				n++
-				if expanded {
-					outArgs = append(outArgs, arg)
-				}
+			if expandErr != nil {
+				return "", nil, expandErr
 			}
 			i++
 			continue
@@ -384,6 +432,14 @@ func rebindTemplate(p lexProfile, style bindStyle, query string) (string, int, e
 	}
 	out = append(out, query[copied:]...)
 	return byteString(out), n, nil
+}
+
+// emitAll emits one placeholder per element.
+func emitAll[E any](xs []E, sep func(int), emit func(any)) {
+	for j, x := range xs {
+		sep(j)
+		emit(x)
+	}
 }
 
 // byteString reinterprets b as a string without copying; b must never be

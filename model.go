@@ -42,7 +42,13 @@ type plan struct {
 
 	rels     map[string]*relField
 	relNames []string
-	counts   map[string][]int // relation name → field index of its count target
+	counts   map[string]countTarget // relation name → its int64 count field
+}
+
+// countTarget locates a countof field.
+type countTarget struct {
+	index  []int
+	offset uintptr
 }
 
 // field maps one struct field to one column.
@@ -68,7 +74,9 @@ type relField struct {
 	name   string
 	kind   relKind
 	index  []int
+	offset uintptr
 	target reflect.Type
+	proto  relContainer // zero container; regroup dispatches through it
 
 	fkTag, refTag, joinTag string
 
@@ -171,13 +179,14 @@ func (p *plan) addFields(t reflect.Type) error {
 		sf, tag, opts := r.sf, r.tag, r.opts
 
 		if isRelContainer(sf.Type) {
-			kind, target := containerInfo(sf.Type)
 			if tag != "" {
 				errs = append(errs, fmt.Errorf("field %s: relation containers take no column name", sf.Name))
 				continue
 			}
+			proto := reflect.New(sf.Type).Interface().(relContainer)
 			p.rels[sf.Name] = &relField{
-				name: sf.Name, kind: kind, index: r.index, target: target,
+				name: sf.Name, kind: proto.relKind(), index: r.index, offset: r.offset,
+				target: proto.targetType(), proto: proto,
 				fkTag: opts.fk, refTag: opts.ref, joinTag: opts.join,
 			}
 			p.relNames = append(p.relNames, sf.Name)
@@ -196,10 +205,10 @@ func (p *plan) addFields(t reflect.Type) error {
 			if prev, dup := p.counts[opts.countOf]; dup {
 				errs = append(errs, fmt.Errorf(
 					"fields %s and %s both declare countof:%s; a count has one target",
-					p.typ.FieldByIndex(prev).Name, sf.Name, opts.countOf))
+					p.typ.FieldByIndex(prev.index).Name, sf.Name, opts.countOf))
 				continue
 			}
-			p.counts[opts.countOf] = r.index
+			p.counts[opts.countOf] = countTarget{index: r.index, offset: r.offset}
 			continue
 		}
 		if opts.fk != "" || opts.ref != "" || opts.join != "" {
@@ -403,7 +412,7 @@ func buildPlan(t reflect.Type) (*plan, error) {
 		defaultTable: TableName(t.Name()),
 		byColumn:     make(map[string]*field),
 		rels:         make(map[string]*relField),
-		counts:       make(map[string][]int),
+		counts:       make(map[string]countTarget),
 	}
 	if tn, ok := reflect.New(t).Interface().(TableNamer); ok {
 		p.tableOverride = tn.TableName()

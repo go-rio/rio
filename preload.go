@@ -490,10 +490,11 @@ type relLoadBase struct {
 // after every statement was consumed.
 type relLoad[K comparable, KR keyer[K]] struct {
 	relLoadBase
-	kr        KR
-	keys      []K
-	parentKey []pkey[K]
-	keyed     bool
+	kr          KR
+	keys        []K
+	groupOf     map[K]int32 // key → index in keys
+	parentGroup []int32     // per owner; -1 for a NULL key
+	keyed       bool
 	// buf must stay addressable: scanRel grows it in place.
 	buf     reflect.Value
 	bufKeys []pkey[K]
@@ -563,26 +564,29 @@ func (l *relLoad[K, KR]) prepare(opts []RelOption, stmts []relStatement) ([]relS
 	// Typed keys group; the IN (?) binds the canonical value, whose family
 	// matches the column's.
 	owners := l.owners
-	seen := make(map[K]struct{}, owners.Len())
+	groupOf := make(map[K]int32, owners.Len())
 	keys := make([]K, 0, owners.Len())
 	binds := l.kr.newBinds(owners.Len()) // non-nil only when binds differ from keys
-	l.parentKey = make([]pkey[K], owners.Len())
+	l.parentGroup = make([]int32, owners.Len())
 	for i := 0; i < owners.Len(); i++ {
 		kv := owners.Index(i).FieldByIndex(l.res.ref.index)
 		k, ok := l.kr.key(kv)
 		if !ok {
+			l.parentGroup[i] = -1
 			continue
 		}
-		l.parentKey[i] = pkey[K]{k: k, ok: true}
-		if _, dup := seen[k]; !dup {
-			seen[k] = struct{}{}
+		g, dup := groupOf[k]
+		if !dup {
+			g = int32(len(keys))
+			groupOf[k] = g
 			keys = append(keys, k)
 			binds = l.kr.appendBind(binds, kv)
 		}
+		l.parentGroup[i] = g
 	}
 
 	target := l.res.target
-	l.keys = keys
+	l.keys, l.groupOf = keys, groupOf
 	l.keyed = l.rel.kind == relManyToMany
 	l.buf = reflect.New(reflect.SliceOf(target.typ)).Elem()
 	l.buf.Set(reflect.MakeSlice(reflect.SliceOf(target.typ), 0, len(keys)))
@@ -598,7 +602,8 @@ func (l *relLoad[K, KR]) prepare(opts []RelOption, stmts []relStatement) ([]relS
 				}
 			}
 		}
-		limit := l.db.gram().d.caps().maxBindParams
+		caps := l.db.gram().d.caps()
+		limit := caps.maxBindParams
 		if relArgs >= limit {
 			return nil, fmt.Errorf(
 				"rio: preload relation %s.%s uses %d bind parameter(s) in RelWhere, "+
@@ -609,12 +614,20 @@ func (l *relLoad[K, KR]) prepare(opts []RelOption, stmts []relStatement) ([]relS
 				limit,
 			)
 		}
+		// Typed keys bind as one array where the dialect takes them.
 		chunk := limit - relArgs
+		array := caps.arrayBind && binds == nil
+		if array {
+			chunk = len(keys)
+		}
 		for start := 0; start < len(keys); start += chunk {
 			end := min(start+chunk, len(keys))
 			var bindChunk any = keys[start:end]
 			if binds != nil {
 				bindChunk = binds[start:end]
+			}
+			if array {
+				bindChunk = arrayParam{bindChunk}
 			}
 			sqlText, args, keyed, err := renderRelSelect(l.db.gram(), l.res, l.rel.kind, bindChunk, &rq)
 			if err != nil {
@@ -636,8 +649,7 @@ func (l *relLoad[K, KR]) prepare(opts []RelOption, stmts []relStatement) ([]relS
 
 func (l *relLoad[K, KR]) finish(ctx context.Context) error {
 	rel, res, buf := l.rel, l.res, l.buf
-	elemType := res.target.typ
-	// Nested paths load into buf first, so the copies below carry
+	// Nested paths load into buf first, so the regrouped copies carry
 	// assembled children.
 	if len(l.tails) > 0 && buf.Len() > 0 {
 		if err := preloadValues(ctx, l.db, res.target, buf, l.tails); err != nil {
@@ -645,92 +657,73 @@ func (l *relLoad[K, KR]) finish(ctx context.Context) error {
 		}
 	}
 
-	type indexSpan struct {
-		start int
-		next  int
-		end   int
-	}
-	byKey := make(map[K]indexSpan, len(l.keys))
-	bufKeys := l.bufKeys
+	// Counting sort by owner group keeps the query's row order per owner.
+	n := buf.Len()
+	rowGroup := make([]int32, n)
 	if rel.kind == relManyToMany {
-		for _, bk := range bufKeys {
-			if !bk.ok {
-				continue
-			}
-			span := byKey[bk.k]
-			span.end++
-			byKey[bk.k] = span
+		for i, bk := range l.bufKeys {
+			rowGroup[i] = l.group(bk)
 		}
 	} else {
 		// res.fk is the buffered rows' grouping key for every non-m2m kind.
 		keyField := res.fk
-		bufKeys = make([]pkey[K], buf.Len())
-		for i := 0; i < buf.Len(); i++ {
+		for i := range n {
 			k, ok := l.kr.key(buf.Index(i).FieldByIndex(keyField.index))
-			if !ok {
-				continue // a NULL child-side key groups under no parent
-			}
-			bufKeys[i] = pkey[K]{k: k, ok: true}
-			span := byKey[k]
-			span.end++
-			byKey[k] = span
+			rowGroup[i] = l.group(pkey[K]{k: k, ok: ok})
 		}
 	}
-	grouped := make([]int, buf.Len())
-	offset := 0
-	for k, span := range byKey {
-		count := span.end
-		span.start, span.next, span.end = offset, offset, offset+count
-		byKey[k] = span
-		offset += count
-	}
-	for i, bk := range bufKeys {
-		if !bk.ok {
-			continue // a NULL child-side key groups under no parent
+	groups := len(l.keys)
+	starts := make([]int, groups+1)
+	for _, g := range rowGroup {
+		if g >= 0 {
+			starts[g+1]++
 		}
-		span := byKey[bk.k]
-		grouped[span.next] = i
-		span.next++
-		byKey[bk.k] = span
 	}
-
-	ptrType := reflect.PointerTo(elemType)
-	for i := 0; i < l.owners.Len(); i++ {
-		container := l.owners.Index(i).FieldByIndex(rel.index).Addr().Interface().(relContainer)
-		var matches []int
-		if pk := l.parentKey[i]; pk.ok {
-			span := byKey[pk.k]
-			matches = grouped[span.start:span.end]
+	for g := range groups {
+		starts[g+1] += starts[g]
+	}
+	order := make([]int, starts[groups])
+	fill := append([]int(nil), starts[:groups]...)
+	for i, g := range rowGroup {
+		if g >= 0 {
+			order[fill[g]] = i
+			fill[g]++
 		}
-		switch rel.kind {
-		case relHasMany, relManyToMany:
-			out := reflect.MakeSlice(reflect.SliceOf(elemType), len(matches), len(matches))
-			for k, idx := range matches {
-				out.Index(k).Set(buf.Index(idx))
-			}
-			container.setLoaded(out)
-		case relHasOne, relBelongsTo:
-			if len(matches) == 0 {
-				container.setLoaded(reflect.Zero(ptrType))
-				continue
-			}
-			if rel.kind == relHasOne && len(matches) > 1 {
+	}
+	spans := make([]span, len(l.parentGroup))
+	for i, g := range l.parentGroup {
+		if g >= 0 {
+			spans[i] = span{starts[g], starts[g+1]}
+		}
+	}
+	if rel.kind == relHasOne {
+		for _, s := range spans {
+			if s.end-s.start > 1 {
 				return fmt.Errorf(
 					"rio: relation %s.%s: HasOne loaded %d rows for one parent; "+
 						"the schema evidently allows several — use HasMany, or make %s.%s unique",
 					l.owner.structName,
 					rel.name,
-					len(matches),
+					s.end-s.start,
 					res.target.structName,
 					res.fk.column,
 				)
 			}
-			cp := reflect.New(elemType)
-			cp.Elem().Set(buf.Index(matches[0]))
-			container.setLoaded(cp)
 		}
 	}
+	rel.proto.regroup(l.owners.UnsafePointer(), l.owner.typ.Size(), rel.offset, spans, buf.Interface(), order)
 	return nil
+}
+
+// group maps a buffered row's key to its owner group, -1 when it has none.
+func (l *relLoad[K, KR]) group(k pkey[K]) int32 {
+	if !k.ok {
+		return -1
+	}
+	if g, ok := l.groupOf[k.k]; ok {
+		return g
+	}
+	return -1
 }
 
 // renderRelSelect renders the preload query. keyed reports whether an extra
@@ -792,7 +785,7 @@ func renderRelSelect(
 		b = append(b, '.')
 		b = d.quote(b, res.fk.column)
 	}
-	b = append(b, " IN (?)"...)
+	b = appendKeySet(b, keys)
 	args = append(args, keys)
 
 	if target.softDel != nil && !rq.withTrashed {
@@ -819,6 +812,15 @@ func renderRelSelect(
 
 	sqlText, outArgs, err := finishSQL(d, b, args)
 	return sqlText, outArgs, keyed, err
+}
+
+// appendKeySet renders the owner-key predicate: one array parameter, or the
+// expanded IN list.
+func appendKeySet(b []byte, keys any) []byte {
+	if _, ok := keys.(arrayParam); ok {
+		return append(b, " = ANY(?)"...)
+	}
+	return append(b, " IN (?)"...)
 }
 
 // scanRel appends scanned rows to buf, returning the grown slice and, when
@@ -976,7 +978,7 @@ func renderRelSelectLimited(
 		b = append(b, '.')
 		b = d.quote(b, res.fk.column)
 	}
-	b = append(b, " IN (?)"...)
+	b = appendKeySet(b, keys)
 	args = append(args, keys)
 
 	if target.softDel != nil && !rq.withTrashed {
@@ -1094,7 +1096,7 @@ type countLoadBase struct {
 	db     Queryer
 	res    *resolvedRel
 	kind   relKind
-	target []int // count field index on the owner
+	target countTarget
 	owners reflect.Value
 }
 
@@ -1113,12 +1115,14 @@ func (l *countLoad[K, KR]) consume(sqlRows rows) (int64, error) {
 }
 
 func (l *countLoad[K, KR]) finish(context.Context) error {
+	base := l.owners.UnsafePointer()
+	stride := l.owners.Type().Elem().Size()
 	for i := 0; i < l.owners.Len(); i++ {
 		var n int64
 		if pk := l.parentKey[i]; pk.ok {
 			n = l.byKey[pk.k]
 		}
-		l.owners.Index(i).FieldByIndex(l.target).SetInt(n)
+		*(*int64)(unsafe.Add(base, uintptr(i)*stride+l.target.offset)) = n
 	}
 	return nil
 }
@@ -1203,6 +1207,10 @@ func (l *countLoad[K, KR]) prepare(stmts []relStatement) ([]relStatement, error)
 	res, kind := l.res, l.kind
 	l.byKey = make(map[K]int64, len(keys))
 	chunk := d.caps().maxBindParams
+	array := d.caps().arrayBind && binds == nil
+	if array {
+		chunk = len(keys)
+	}
 	for start := 0; start < len(keys); start += chunk {
 		end := min(start+chunk, len(keys))
 		b := make([]byte, 0, 160)
@@ -1251,11 +1259,14 @@ func (l *countLoad[K, KR]) prepare(stmts []relStatement) ([]relStatement, error)
 			b = append(b, '.')
 			b = d.quote(b, keyCol)
 		}
-		b = append(b, " IN (?)"...)
 		var bindChunk any = keys[start:end]
 		if binds != nil {
 			bindChunk = binds[start:end]
 		}
+		if array {
+			bindChunk = arrayParam{bindChunk}
+		}
+		b = appendKeySet(b, bindChunk)
 		args := []any{bindChunk}
 		if kind != relManyToMany && res.target.softDel != nil {
 			b = append(b, " AND "...)
@@ -1333,6 +1344,8 @@ var countField = sync.OnceValue(func() *field {
 
 // reuseCounts fills count targets from containers the preload just loaded.
 func reuseCounts(p *plan, rv reflect.Value, reusable []string) error {
+	base := rv.UnsafePointer()
+	stride := p.typ.Size()
 	for _, name := range reusable {
 		rel := p.rels[name]
 		target := p.counts[name]
@@ -1342,7 +1355,7 @@ func reuseCounts(p *plan, rv reflect.Value, reusable []string) error {
 			if !loaded {
 				return fmt.Errorf("rio: relation %s.%s was not loaded before count reuse", p.structName, name)
 			}
-			rv.Index(i).FieldByIndex(target).SetInt(int64(n))
+			*(*int64)(unsafe.Add(base, uintptr(i)*stride+target.offset)) = int64(n)
 		}
 	}
 	return nil

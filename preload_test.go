@@ -46,9 +46,12 @@ func TestPreloadHasMany(t *testing.T) {
 		t.Fatalf("All: %v", err)
 	}
 	rel := f.logged()[1]
-	want := `SELECT "posts"."id", "posts"."user_id", "posts"."title" FROM "posts" WHERE "posts"."user_id" IN ($1, $2)`
+	want := `SELECT "posts"."id", "posts"."user_id", "posts"."title" FROM "posts" WHERE "posts"."user_id" = ANY($1)`
 	if rel != want {
 		t.Fatalf("preload sql:\n got: %s\nwant: %s", rel, want)
+	}
+	if keys, ok := f.log[1].args[0].([]int64); !ok || len(keys) != 2 || keys[0] != 1 || keys[1] != 2 {
+		t.Fatalf("keys must bind as one typed array, got %#v", f.log[1].args)
 	}
 	if got := users[0].Posts.Rows(); len(got) != 2 || got[0].Title != "first" || got[1].Title != "third" {
 		t.Fatalf("user1 posts: %+v", got)
@@ -131,8 +134,8 @@ func TestPreloadBelongsToAndNullFK(t *testing.T) {
 		t.Fatalf("All: %v", err)
 	}
 	rel := f.logged()[1]
-	if !strings.Contains(rel, `"orgs"."id" IN ($1)`) {
-		t.Fatalf("dedup to one key: %s", rel)
+	if !strings.Contains(rel, `"orgs"."id" = ANY($1)`) || len(f.log[1].args[0].([]int64)) != 1 {
+		t.Fatalf("dedup to one key: %s %#v", rel, f.log[1].args)
 	}
 	if got := accounts[0].Org.Row(); got == nil || got.Name != "acme" {
 		t.Fatalf("account1 org: %+v", got)
@@ -203,7 +206,7 @@ func TestPreloadManyToMany(t *testing.T) {
 		t.Fatalf("All: %v", err)
 	}
 	rel := f.logged()[1]
-	want := `SELECT "tags"."id", "tags"."name", "account_tags"."account_id" FROM "tags" INNER JOIN "account_tags" ON "account_tags"."tag_id" = "tags"."id" WHERE "account_tags"."account_id" IN ($1, $2)`
+	want := `SELECT "tags"."id", "tags"."name", "account_tags"."account_id" FROM "tags" INNER JOIN "account_tags" ON "account_tags"."tag_id" = "tags"."id" WHERE "account_tags"."account_id" = ANY($1)`
 	if rel != want {
 		t.Fatalf("m2m sql:\n got: %s\nwant: %s", rel, want)
 	}
@@ -544,8 +547,8 @@ func TestPreloadStringKeys(t *testing.T) {
 	if na, nb := len(parents[0].Kids.Rows()), len(parents[1].Kids.Rows()); na != 1 || nb != 2 {
 		t.Fatalf("grouping drifted: %d/%d", na, nb)
 	}
-	if got := f.log[1].args[0]; got != "a" {
-		t.Fatalf("string keys must bind as strings, got %T(%v)", got, got)
+	if got, ok := f.log[1].args[0].([]string); !ok || got[0] != "a" {
+		t.Fatalf("string keys must bind as a string array, got %T(%v)", f.log[1].args[0], f.log[1].args[0])
 	}
 }
 

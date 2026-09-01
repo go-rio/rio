@@ -236,6 +236,18 @@ func (c *fakeConn) PrepareContext(ctx context.Context, query string) (driver.Stm
 
 func (c *fakeConn) Close() error { return nil }
 
+// CheckNamedValue passes slices and uint64 through, as the pgx adapter and
+// the ClickHouse channel do; everything else takes the default conversion.
+func (c *fakeConn) CheckNamedValue(nv *driver.NamedValue) error {
+	if _, ok := nv.Value.(uint64); ok {
+		return nil
+	}
+	if _, ok := sliceValue(nv.Value); ok {
+		return nil
+	}
+	return driver.ErrSkip
+}
+
 func (c *fakeConn) Begin() (driver.Tx, error) {
 	_ = c.f.record("BEGIN", nil)
 	return fakeTx{f: c.f}, nil

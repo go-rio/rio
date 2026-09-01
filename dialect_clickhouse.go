@@ -27,7 +27,10 @@ func (clickhouseDialect) caps() dialectCaps {
 	// do not exist, and Prepare only covers INSERT batching. maxBindParams
 	// is a client-side text budget (every argument is interpolated), sized
 	// to keep IN expansions under the default 256 KiB max_query_size.
-	return dialectCaps{forUpdate: forUpdateReject, maxBindParams: 8192, finalTable: true, bindBytesAsString: true}
+	return dialectCaps{
+		forUpdate: forUpdateReject, maxBindParams: 8192, finalTable: true,
+		bindBytesAsString: true, bindUint64: true,
+	}
 }
 
 func (clickhouseDialect) quote(b []byte, ident string) []byte {

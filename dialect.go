@@ -45,6 +45,12 @@ type dialectCaps struct {
 	// bindBytesAsString rebinds []byte arguments as strings: the ClickHouse channel
 	// would interpolate them as Array(UInt8) literals.
 	bindBytesAsString bool
+	// bindUint64 passes uint64 values above MaxInt64 through; other channels
+	// take them as decimal text because database/sql rejects them.
+	bindUint64 bool
+	// arrayBind binds a typed key slice as one array parameter (= ANY(?))
+	// instead of expanding it: one bind, a key-count-independent statement.
+	arrayBind bool
 }
 
 // Built-in dialects.
@@ -72,6 +78,7 @@ func (postgresDialect) caps() dialectCaps {
 	return dialectCaps{
 		returning: true, conflictTarget: true, forUpdate: forUpdateRender, maxBindParams: 65535,
 		mutations: true, transactions: true, uniqueKeys: true, autoIncrPK: true, stmtPrepare: true,
+		arrayBind: true,
 	}
 }
 
