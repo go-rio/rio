@@ -8,6 +8,8 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"sync"
+	"unsafe"
 )
 
 // resolvedRel is the lazily resolved wiring of one relation.
@@ -1295,15 +1297,19 @@ func scanCounts[K comparable, KR keyer[K]](rows rows, keyType reflect.Type, byKe
 	if err != nil {
 		return 0, err
 	}
-	// One escaping box carries cell, count, and dest: a fresh variadic slice
-	// would heap-allocate per row (see scanScalars).
+	nf := countField()
+	// One escaping box carries cells, count, and dest: a fresh variadic slice
+	// would heap-allocate per row (see scanScalars). Both slots are cells, so
+	// every driver serves this through its one scan path.
 	var box struct {
-		cell colScanner
-		n    int64
-		dest [2]any
+		cell  colScanner
+		nCell colScanner
+		n     int64
+		dest  [2]any
 	}
 	box.cell = colScanner{f: kf, base: keyBuf.UnsafePointer()}
-	box.dest[0], box.dest[1] = &box.cell, &box.n
+	box.nCell = colScanner{f: nf, base: unsafe.Pointer(&box.n)}
+	box.dest[0], box.dest[1] = &box.cell, &box.nCell
 	for rows.Next() {
 		if err := rows.Scan(box.dest[:]...); err != nil {
 			return scanned, err
@@ -1315,6 +1321,15 @@ func scanCounts[K comparable, KR keyer[K]](rows rows, keyType reflect.Type, byKe
 	}
 	return scanned, rows.Err()
 }
+
+// countField is the synthetic int64 cell target scanCounts reuses.
+var countField = sync.OnceValue(func() *field {
+	f, err := synthField("count", "<count>", reflect.TypeFor[int64]())
+	if err != nil {
+		panic(err) // int64 always has a codec
+	}
+	return f
+})
 
 // reuseCounts fills count targets from containers the preload just loaded.
 func reuseCounts(p *plan, rv reflect.Value, reusable []string) error {

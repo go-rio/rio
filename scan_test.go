@@ -225,7 +225,7 @@ func TestEntityColumnMismatchErrors(t *testing.T) {
 	})
 }
 
-// clickhouse-go bypasses database/sql's canonical values, so every native integer width must convert.
+// Some drivers bypass database/sql's canonical values, so every native integer width must convert.
 func TestSrcConvertersAcceptNativeWidths(t *testing.T) {
 	f := &field{name: "N", column: "n", typ: reflect.TypeFor[uint64]()}
 

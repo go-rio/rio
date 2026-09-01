@@ -213,7 +213,7 @@ unique constraints return an error instead of a weaker approximation.
   soft-delete filters, Raw, Query templates, `Query.Final`.
 - Writes: `Insert`, `InsertAll`, explicit `Exec`. UPDATE/DELETE/Upsert,
   transactions, `ForUpdate`, and the statement cache are rejected.
-- clickhouse-go interpolates client-side, so rio binds time as
+- The ClickHouse channel interpolates client-side, so rio binds time as
   offset-carrying microsecond text, rejects values the server would clamp,
   and binds `[]byte` as String (`Array(UInt8)` corrupts).
 - The lexer follows ClickHouse quoting and comment rules; `??` produces the

@@ -59,7 +59,7 @@ func New(db *sql.DB, dialect Dialect, opts ...Option) *DB {
 	}
 	if cfg.stmtCache && !dialect.caps().stmtPrepare {
 		panic("rio: WithStmtCache is not supported on " + dialect.name() +
-			" (clickhouse-go implements Prepare only for INSERT batching; a prepared SELECT fails on first use)")
+			" (the channel has no prepared statements)")
 	}
 	e := &sqlEngine{db: db}
 	if cfg.stmtCache {
@@ -96,9 +96,8 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 	if !d.g.d.caps().transactions {
 		return unsupportedf(
 			"rio: transactions are not supported on %s "+
-				"(the driver's Begin is a no-op and statements would commit independently); "+
-				"group rows into one InsertAll for per-statement atomicity, "+
-				"or use db.Unwrap() with clickhouse-go's native batch API",
+				"(every statement commits independently); "+
+				"group rows into one InsertAll for per-statement atomicity",
 			d.g.d.name(),
 		)
 	}

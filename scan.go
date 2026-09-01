@@ -727,7 +727,7 @@ func convErr(f *field, src any) error {
 	return fmt.Errorf("rio: column %q: cannot convert %T into field %s (%s)", f.column, src, f.name, f.typ)
 }
 
-// The src* converters also accept the natively typed values clickhouse-go
+// The src* converters also accept the natively typed values a driver
 // delivers (uint64, int32, float32, …) beyond database/sql's canonical set.
 
 func srcInt(src any, f *field) (int64, error) {

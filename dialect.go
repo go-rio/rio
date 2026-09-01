@@ -43,7 +43,7 @@ type dialectCaps struct {
 	stmtPrepare    bool          // the driver prepares arbitrary statements (stmt cache)
 	finalTable     bool          // FROM t FINAL merges row versions at read (ClickHouse)
 
-	// bindBytesAsString rebinds []byte arguments as strings: clickhouse-go
+	// bindBytesAsString rebinds []byte arguments as strings: the ClickHouse channel
 	// would interpolate them as Array(UInt8) literals.
 	bindBytesAsString bool
 }
@@ -160,7 +160,7 @@ func (sqliteDialect) translate(err error) error {
 // --- ClickHouse ---
 
 // chTimeFormat is rio's canonical ClickHouse time encoding: text, because
-// clickhouse-go truncates time.Time binds to whole seconds; the explicit UTC
+// the channel interpolates client-side; the explicit UTC
 // offset overrides the column's timezone attribute during parsing.
 const chTimeFormat = "2006-01-02 15:04:05.000000+00:00"
 

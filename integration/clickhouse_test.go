@@ -2,7 +2,6 @@ package integration
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"os"
 	"strconv"
@@ -11,9 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-rio/clickhouse"
 	"github.com/go-rio/rio"
-
-	_ "github.com/ClickHouse/clickhouse-go/v2"
 )
 
 // Runs when RIO_CLICKHOUSE_DSN is set, e.g.
@@ -26,14 +24,9 @@ func clickhouseDB(t *testing.T, opts ...rio.Option) *rio.DB {
 	if dsn == "" {
 		t.Skip("RIO_CLICKHOUSE_DSN not set")
 	}
-	raw, err := sql.Open("clickhouse", dsn)
+	db, err := clickhouse.Open(context.Background(), dsn, opts...)
 	if err != nil {
 		t.Fatal(err)
-	}
-	// No error translator: no unique/FK constraints, so no sentinel mapping.
-	db := rio.New(raw, rio.ClickHouse, opts...)
-	if err := db.Unwrap().Ping(); err != nil {
-		t.Fatalf("ping clickhouse: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	// Version floor: 26+ is where rio's offset-carrying time text parses in
@@ -69,136 +62,6 @@ func chServerVersion(t *testing.T, ctx context.Context, db *rio.DB) (major, mino
 }
 
 // --- layer 1: driver probes (upstream contracts) ---
-
-// TestClickHouseDriverProbes pins the clickhouse-go behaviors the dialect
-// depends on; a failing probe means upstream changed a contract.
-func TestClickHouseDriverProbes(t *testing.T) {
-	db := clickhouseDB(t)
-	raw := db.Unwrap()
-	ctx := context.Background()
-
-	chExec(t, ctx, db,
-		"DROP TABLE IF EXISTS probe_times", "DROP TABLE IF EXISTS probe_bytes",
-		"CREATE TABLE probe_times (id Int64, at DateTime64(6, 'UTC')) ENGINE = MergeTree ORDER BY id",
-		"CREATE TABLE probe_bytes (id Int64, s String) ENGINE = MergeTree ORDER BY id",
-	)
-
-	// Quote-aware binder (the go.mod driver floor): only the bare ? binds.
-	t.Run("quote-aware binding", func(t *testing.T) {
-		var lit, val string
-		row := raw.QueryRowContext(ctx, "SELECT '?' AS lit, ? AS val -- trailing ? stays\n", "bound")
-		if err := row.Scan(&lit, &val); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		if lit != "?" || val != "bound" {
-			t.Fatalf("binder rewrote protected regions: lit=%q val=%q", lit, val)
-		}
-	})
-
-	// \? unescapes to a literal ? — the target of rio's ?? rendering.
-	t.Run("backslash-question restores literal", func(t *testing.T) {
-		var y string
-		row := raw.QueryRowContext(ctx, `SELECT 2 > ? \? 'y' : 'n'`, 1)
-		if err := row.Scan(&y); err != nil {
-			t.Fatalf("ternary through \\?: %v", err)
-		}
-		if y != "y" {
-			t.Fatalf("ternary result: %q", y)
-		}
-	})
-
-	// time.Time args truncate to whole seconds — why rio binds chTimeFormat
-	// text instead; if sub-seconds survive, rio could simplify.
-	t.Run("time.Time direct pass truncates to seconds", func(t *testing.T) {
-		at := time.Date(2024, 1, 2, 3, 4, 5, 123456000, time.UTC)
-		if _, err := raw.ExecContext(ctx, "INSERT INTO probe_times (id, at) VALUES (?, ?)", 1, at); err != nil {
-			t.Fatalf("insert: %v", err)
-		}
-		var got time.Time
-		if err := raw.QueryRowContext(ctx, "SELECT at FROM probe_times WHERE id = 1").Scan(&got); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		if !got.Equal(at.Truncate(time.Second)) {
-			t.Fatalf("driver time handling changed: wrote %v, read %v (expected second truncation)", at, got)
-		}
-	})
-
-	// []byte renders as an Array(UInt8) literal and silently corrupts String
-	// columns — why rio funnels byte payloads as strings.
-	t.Run("bytes direct pass corrupts", func(t *testing.T) {
-		if _, err := raw.ExecContext(ctx, "INSERT INTO probe_bytes (id, s) VALUES (?, ?)", 1, []byte("hi")); err != nil {
-			return // rejected loudly: also proof the funnel is required
-		}
-		var stored string
-		if err := raw.QueryRowContext(ctx, "SELECT s FROM probe_bytes WHERE id = 1").Scan(&stored); err != nil {
-			t.Fatalf("read back: %v", err)
-		}
-		if stored == "hi" {
-			t.Fatal("driver []byte handling changed: the bytes arrived intact — rio's string funnel may be droppable")
-		}
-	})
-
-	// RowsAffected is always 0 and LastInsertId errors — why entity
-	// Update/Delete are rejected.
-	t.Run("RowsAffected is always zero", func(t *testing.T) {
-		res, err := raw.ExecContext(ctx, "INSERT INTO probe_bytes (id, s) VALUES (?, ?)", 2, "real row")
-		if err != nil {
-			t.Fatalf("insert: %v", err)
-		}
-		if n, err := res.RowsAffected(); err != nil || n != 0 {
-			t.Fatalf("driver RowsAffected changed: n=%d err=%v", n, err)
-		}
-		if _, err := res.LastInsertId(); err == nil {
-			t.Fatal("driver LastInsertId changed: must error")
-		}
-		var count uint64
-		row := raw.QueryRowContext(ctx, "SELECT count(*) FROM probe_bytes WHERE id = 2")
-		if err := row.Scan(&count); err != nil || count != 1 {
-			t.Fatalf("the insert itself must land: count=%d err=%v", count, err)
-		}
-	})
-
-	// Begin is a no-op shim: a rolled-back insert stays visible — why db.Tx
-	// is rejected.
-	t.Run("Begin is a fake transaction", func(t *testing.T) {
-		tx, err := raw.Begin()
-		if err != nil {
-			t.Fatalf("Begin: %v", err)
-		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO probe_bytes (id, s) VALUES (?, ?)", 3, "phantom"); err != nil {
-			t.Fatalf("insert in fake tx: %v", err)
-		}
-		_ = tx.Rollback()
-		var count uint64
-		if err := raw.QueryRowContext(ctx, "SELECT count(*) FROM probe_bytes WHERE id = 3").Scan(&count); err != nil {
-			t.Fatalf("count: %v", err)
-		}
-		if count != 1 {
-			t.Fatalf("driver transaction handling changed: rolled-back insert vanished (count=%d)", count)
-		}
-	})
-
-	// Prepare is INSERT-only; a prepared SELECT is unusable — why
-	// WithStmtCache panics at construction.
-	t.Run("Prepare(SELECT) is broken", func(t *testing.T) {
-		stmt, err := raw.PrepareContext(ctx, "SELECT 1")
-		if err != nil {
-			return // rejected at prepare: contract holds
-		}
-		defer func() {
-			if err := stmt.Close(); err != nil {
-				t.Errorf("close prepared SELECT: %v", err)
-			}
-		}()
-		rows, err := stmt.QueryContext(ctx)
-		if err == nil {
-			if err := rows.Close(); err != nil {
-				t.Errorf("close prepared SELECT rows: %v", err)
-			}
-			t.Fatal("driver Prepare changed: a prepared SELECT executed successfully")
-		}
-	})
-}
 
 // --- layer 2: server semantics (experiment matrix T1–T8) ---
 

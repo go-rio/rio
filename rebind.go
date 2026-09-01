@@ -26,7 +26,7 @@ type lexProfile struct {
 	hashSpaceComment     bool // # comments only when followed by ' ' or '!'
 	heredoc              bool // $tag$...$tag$ string literals
 
-	// clickhouse-go consumes \? as a literal question mark.
+	// The ClickHouse channel consumes \? as a literal question mark.
 	backslashQuestion bool
 }
 
@@ -170,7 +170,7 @@ func rebind(p lexProfile, style bindStyle, query string, args []any) (string, []
 			}
 		case '\\':
 			if p.backslashQuestion && i+1 < len(query) && query[i+1] == '?' {
-				// Preserve clickhouse-go's literal-question escape.
+				// Preserve the ClickHouse literal-question escape.
 				i += 2
 				continue
 			}
@@ -495,7 +495,7 @@ func hashSpaceCommentAt(p lexProfile, s string, i int) bool {
 }
 
 // checkDriverBlindRegion rejects a ? inside regions the server lexes as text
-// but clickhouse-go's client-side binder does not (heredocs, // comments) —
+// but the ClickHouse channel's client-side binder does not (heredocs, // comments) —
 // the driver would substitute there. Argument-free statements pass.
 func checkDriverBlindRegion(style bindStyle, query string, start, end, argc int, region, fix string) error {
 	if style != bindQuestionEsc || argc == 0 {
@@ -504,7 +504,7 @@ func checkDriverBlindRegion(style bindStyle, query string, start, end, argc int,
 	for j := start; j < end; j++ {
 		if query[j] == '?' {
 			return fmt.Errorf(
-				"rio: a ? inside %s (byte %d) would be rewritten by clickhouse-go's client-side binder; %s",
+				"rio: a ? inside %s (byte %d) would be rewritten by the ClickHouse client-side binder; %s",
 				region,
 				j,
 				fix,

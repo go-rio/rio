@@ -377,11 +377,11 @@ func TestClickHouseRejectionMatrix(t *testing.T) {
 	}{
 		"Tx": {
 			func(db *DB) error { return db.Tx(ctx, func(tx *Tx) error { return nil }) },
-			"rio: transactions are not supported on clickhouse (the driver's Begin is a no-op and statements would commit independently); group rows into one InsertAll for per-statement atomicity, or use db.Unwrap() with clickhouse-go's native batch API",
+			"rio: transactions are not supported on clickhouse (every statement commits independently); group rows into one InsertAll for per-statement atomicity",
 		},
 		"TxWith": {
 			func(db *DB) error { return db.TxWith(ctx, &sql.TxOptions{}, func(tx *Tx) error { return nil }) },
-			"rio: transactions are not supported on clickhouse (the driver's Begin is a no-op and statements would commit independently); group rows into one InsertAll for per-statement atomicity, or use db.Unwrap() with clickhouse-go's native batch API",
+			"rio: transactions are not supported on clickhouse (every statement commits independently); group rows into one InsertAll for per-statement atomicity",
 		},
 		"Update": {
 			func(db *DB) error { return Update(ctx, db, u) },
@@ -557,8 +557,7 @@ func TestClickHouseStmtCachePanics(t *testing.T) {
 	defer func() {
 		r := recover()
 		want := "rio: WithStmtCache is not supported on clickhouse " +
-			"(clickhouse-go implements Prepare only for INSERT batching; " +
-			"a prepared SELECT fails on first use)"
+			"(the channel has no prepared statements)"
 		if r != want {
 			t.Fatalf("panic:\n got: %v\nwant: %s", r, want)
 		}
@@ -626,14 +625,14 @@ func TestClickHouseDriverBlindRegionsRejected(t *testing.T) {
 	_, err := Raw[int64]("SELECT $$a?b$$, ?", 1).All(ctx, db)
 	requireRejected(t, f, err,
 		"rio: a ? inside a $...$ heredoc (byte 10) would be rewritten by "+
-			"clickhouse-go's client-side binder; use '...' string syntax "+
+			"the ClickHouse client-side binder; use '...' string syntax "+
 			"or bind the value as an argument")
 
 	f = newFakeDB()
 	db = f.open(ClickHouse)
 	_, err = Raw[int64]("SELECT ? // is ? ok\n", 1).All(ctx, db)
 	requireRejected(t, f, err,
-		"rio: a ? inside a // comment (byte 15) would be rewritten by clickhouse-go's client-side binder; use a -- comment")
+		"rio: a ? inside a // comment (byte 15) would be rewritten by the ClickHouse client-side binder; use a -- comment")
 
 	// Exec is the same funnel.
 	f = newFakeDB()
@@ -641,7 +640,7 @@ func TestClickHouseDriverBlindRegionsRejected(t *testing.T) {
 	_, err = Exec(ctx, db, "INSERT INTO t VALUES ($$?$$, ?)", 1)
 	requireRejected(t, f, err,
 		"rio: a ? inside a $...$ heredoc (byte 24) would be rewritten by "+
-			"clickhouse-go's client-side binder; use '...' string syntax "+
+			"the ClickHouse client-side binder; use '...' string syntax "+
 			"or bind the value as an argument")
 }
 

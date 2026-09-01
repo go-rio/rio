@@ -44,7 +44,7 @@ go get github.com/go-rio/sqlite # or postgres, mysql, clickhouse
 | [go-rio/postgres](https://github.com/go-rio/postgres) | pgx (database/sql or native) |
 | [go-rio/mysql](https://github.com/go-rio/mysql) | go-sql-driver/mysql |
 | [go-rio/sqlite](https://github.com/go-rio/sqlite) | modernc.org/sqlite, pure Go |
-| [go-rio/clickhouse](https://github.com/go-rio/clickhouse) | clickhouse-go v2 |
+| [go-rio/clickhouse](https://github.com/go-rio/clickhouse) | native protocol, zero deps |
 
 ```go
 package main
