@@ -22,11 +22,9 @@ func (clickhouseDialect) style() bindStyle  { return bindQuestionEsc }
 func (clickhouseDialect) bindTime(t time.Time) any { return t }
 
 func (clickhouseDialect) caps() dialectCaps {
-	// Append-only OLAP: mutations are asynchronous with no affected-row
-	// count, Begin is a no-op shim, unique keys and generated primary keys
-	// do not exist, and Prepare only covers INSERT batching. maxBindParams
-	// is a client-side text budget (every argument is interpolated), sized
-	// to keep IN expansions under the default 256 KiB max_query_size.
+	// Async mutations report no row count, Begin is a shim, unique and generated
+	// keys do not exist, and Prepare covers only INSERT batching. maxBindParams
+	// budgets interpolated argument text under the default 256 KiB max_query_size.
 	return dialectCaps{
 		forUpdate: forUpdateReject, maxBindParams: 8192, finalTable: true,
 		bindBytesAsString: true, bindUint64: true,
@@ -37,7 +35,7 @@ func (clickhouseDialect) quote(b []byte, ident string) []byte {
 	// Not quoteWith: ClickHouse honors backslash escapes inside quoted
 	// identifiers, so a literal backslash must be doubled.
 	b = append(b, '`')
-	for i := 0; i < len(ident); i++ {
+	for i := range len(ident) {
 		switch c := ident[i]; c {
 		case '`':
 			b = append(b, '`', '`')
@@ -53,15 +51,19 @@ func (clickhouseDialect) quote(b []byte, ident string) []byte {
 }
 
 func (clickhouseDialect) translate(error) error {
-	// ClickHouse has no unique or foreign key constraints, so no server
-	// error maps to a rio sentinel; the go-rio/clickhouse module installs
-	// none either.
+	// No unique or foreign key constraints exist, so no server error maps to a
+	// sentinel; the go-rio/clickhouse module installs no translator either.
 	return nil
 }
 
-// checkBindTime validates a normalized time against the dialect's range.
+// checkBindTime rejects, for ClickHouse only, a normalized time outside the
+// DateTime64 range.
 func checkBindTime(d Dialect, nt time.Time) error {
-	if d.name() != "clickhouse" || !(nt.Before(chTimeMin) || nt.After(chTimeMax)) {
+	if d.name() != "clickhouse" {
+		return nil
+	}
+	inRange := !nt.Before(chTimeMin) && !nt.After(chTimeMax)
+	if inRange {
 		return nil
 	}
 	return fmt.Errorf(

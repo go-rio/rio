@@ -10,29 +10,10 @@ import (
 	"unsafe"
 )
 
+const mysqlUpsertAlias = "_rio_new"
+
 // UpsertOption shapes the conflict clause.
 type UpsertOption func(*upsertSpec)
-
-type upsertSpec struct {
-	conflict    []string
-	update      []string
-	sets        Set      // DoUpdateSet assignments
-	setKeys     []string // sets in canonical order, after normalize
-	doNothing   bool
-	keepTrashed bool
-	conflictBuf [1]string
-	updateBuf   [1]string
-}
-
-type upsertCacheKey struct {
-	update   uint64
-	flags    uint8
-	count    int
-	conflict [4]string
-	overflow string
-}
-
-const mysqlUpsertAlias = "_rio_new"
 
 // OnConflict names the unique-index columns. DoUpdate requires it on
 // PostgreSQL and SQLite; MySQL reacts to any unique index.
@@ -72,6 +53,119 @@ func KeepTrashed() UpsertOption {
 	return func(s *upsertSpec) { s.keepTrashed = true }
 }
 
+// upsertSpec is the normalized option set of one upsert call.
+type upsertSpec struct {
+	conflict    []string
+	update      []string
+	sets        Set      // DoUpdateSet assignments
+	setKeys     []string // sets in canonical order, after normalize
+	doNothing   bool
+	keepTrashed bool
+	conflictBuf [1]string
+	updateBuf   [1]string
+}
+
+func (s *upsertSpec) init() {
+	s.conflict = s.conflictBuf[:0]
+	s.update = s.updateBuf[:0]
+}
+
+// normalize deduplicates the conflict target while preserving caller order
+// and fixes the DoUpdateSet order.
+func (s *upsertSpec) normalize() {
+	if len(s.sets) > 0 {
+		s.setKeys = make([]string, 0, len(s.sets))
+		for k := range s.sets {
+			s.setKeys = append(s.setKeys, k)
+		}
+		slices.Sort(s.setKeys)
+	}
+	if len(s.conflict) < 2 {
+		return
+	}
+	out := s.conflict[:0]
+	for _, c := range s.conflict {
+		if slices.Contains(out, c) {
+			continue
+		}
+		out = append(out, c)
+	}
+	s.conflict = out
+}
+
+// appendSetArgs binds the DoUpdateSet values in canonical order, after the
+// row values, skipping Expr assignments.
+func (s *upsertSpec) appendSetArgs(args []any, p *plan, d Dialect) ([]any, error) {
+	if len(s.sets) == 0 {
+		return args, nil
+	}
+	start := len(args)
+	for _, k := range s.setKeys {
+		v := s.sets[k]
+		if _, isExpr := v.(Expr); isExpr {
+			continue
+		}
+		var err error
+		if _, args, err = appendSetValue(nil, args, "DoUpdateSet", p.byColumn[k], v); err != nil {
+			return nil, err
+		}
+	}
+	bound, err := normalizeArgs(d, args[start:])
+	if err != nil {
+		return nil, err
+	}
+	return append(args[:start], bound...), nil
+}
+
+// upsertCacheKey is the conflict-shape part of the entity SQL-cache key; the
+// zero value marks a statement without a conflict clause.
+type upsertCacheKey struct {
+	update   uint64
+	flags    uint8
+	count    int
+	conflict [4]string
+	overflow string
+}
+
+// upsertSpecKey encodes flags, update fields, and ordered conflict columns.
+func upsertSpecKey(spec *upsertSpec, update []*field) upsertCacheKey {
+	key := upsertCacheKey{count: len(spec.conflict)}
+	if spec.doNothing {
+		key.flags |= 1
+	}
+	if spec.keepTrashed {
+		key.flags |= 2
+	}
+	for _, f := range update {
+		key.update |= 1 << uint(f.ordinal)
+	}
+	for i, c := range spec.conflict[:min(len(spec.conflict), len(key.conflict))] {
+		key.conflict[i] = c
+	}
+	if len(spec.conflict) <= len(key.conflict) && len(spec.sets) == 0 {
+		return key
+	}
+	// overflow carries the conflict columns past the fixed slots and the
+	// DoUpdateSet shape: column=expression or column=? per assignment.
+	var b []byte
+	for _, c := range spec.conflict[min(len(spec.conflict), len(key.conflict)):] {
+		b = append(b, c...)
+		b = append(b, 0)
+	}
+	for _, k := range spec.setKeys {
+		b = append(b, k...)
+		b = append(b, '=')
+		if expr, ok := spec.sets[k].(Expr); ok {
+			b = append(b, expr...)
+		} else {
+			b = append(b, '?')
+		}
+		b = append(b, 0)
+	}
+	key.overflow = byteString(b)
+	return key
+}
+
 // Upsert inserts a row or updates it on unique-key conflict in one statement.
 // Unless KeepTrashed is set, a successful update restores a soft-deleted row.
 // Zero omitzero fields are excluded from both insert and the default update
@@ -91,7 +185,8 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 		opt(&spec)
 	}
 	spec.normalize()
-	if spec.doNothing && (len(spec.update) > 0 || len(spec.sets) > 0) {
+	hasUpdate := len(spec.update) > 0 || len(spec.sets) > 0
+	if spec.doNothing && hasUpdate {
 		return errors.New("rio: Upsert cannot combine DoNothing with DoUpdate/DoUpdateSet")
 	}
 	p, err := planOf[T]()
@@ -104,7 +199,8 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 		return err
 	}
 	// MySQL has no conflict target.
-	if !spec.doNothing && len(spec.conflict) == 0 && d.caps().conflictTarget {
+	needsConflictTarget := !spec.doNothing && d.caps().conflictTarget
+	if needsConflictTarget && len(spec.conflict) == 0 {
 		return errors.New("rio: Upsert with DoUpdate needs OnConflict(columns...) naming the unique index")
 	}
 
@@ -143,6 +239,8 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 
 	table := g.table(p)
 	returning := d.caps().returning
+	// DoNothing returns generated columns only for a fresh insert.
+	insertOnlyBackfill := returning && spec.doNothing && len(back) > 0
 	// Conflict assignments bind no arguments, so the shape is cacheable.
 	sqlText, err := upsertSQL(
 		g,
@@ -161,8 +259,7 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 			if returning && !spec.doNothing {
 				b = appendReturning(b, d, table, p)
 			}
-			if returning && spec.doNothing && len(back) > 0 {
-				// DoNothing returns generated columns only for a fresh insert.
+			if insertOnlyBackfill {
 				b = append(b, " RETURNING "...)
 				for i, f := range back {
 					if i > 0 {
@@ -195,7 +292,7 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 			finishQuery(finish, err, oneIf(err == nil))
 			return err
 		}
-		if returning && spec.doNothing && len(back) > 0 {
+		if insertOnlyBackfill {
 			rows, finish, err := runQuery(
 				ctx,
 				db,
@@ -311,57 +408,6 @@ func (q Query[T]) CreateOrFirst(ctx context.Context, db Queryer, row *T, args ..
 	}
 	return err
 }
-func (s *upsertSpec) init() {
-	s.conflict = s.conflictBuf[:0]
-	s.update = s.updateBuf[:0]
-}
-
-// normalize deduplicates the conflict target while preserving caller order
-// and fixes the DoUpdateSet order.
-func (s *upsertSpec) normalize() {
-	if len(s.sets) > 0 {
-		s.setKeys = make([]string, 0, len(s.sets))
-		for k := range s.sets {
-			s.setKeys = append(s.setKeys, k)
-		}
-		slices.Sort(s.setKeys)
-	}
-	if len(s.conflict) < 2 {
-		return
-	}
-	out := s.conflict[:0]
-	for _, c := range s.conflict {
-		if slices.Contains(out, c) {
-			continue
-		}
-		out = append(out, c)
-	}
-	s.conflict = out
-}
-
-// appendSetArgs binds the DoUpdateSet values in canonical order, after the
-// row values, skipping Expr assignments.
-func (s *upsertSpec) appendSetArgs(args []any, p *plan, d Dialect) ([]any, error) {
-	if len(s.sets) == 0 {
-		return args, nil
-	}
-	start := len(args)
-	for _, k := range s.setKeys {
-		v := s.sets[k]
-		if _, isExpr := v.(Expr); isExpr {
-			continue
-		}
-		var err error
-		if _, args, err = appendSetValue(nil, args, "DoUpdateSet", p.byColumn[k], v); err != nil {
-			return nil, err
-		}
-	}
-	bound, err := normalizeArgs(d, args[start:])
-	if err != nil {
-		return nil, err
-	}
-	return append(args[:start], bound...), nil
-}
 
 // checkUpsertSets validates the DoUpdateSet columns against the plan and the
 // DoUpdate whitelist.
@@ -371,7 +417,8 @@ func checkUpsertSets(p *plan, spec *upsertSpec, update []*field) error {
 		if !ok {
 			return fmt.Errorf("rio: DoUpdateSet: %s has no column %q", p.structName, k)
 		}
-		if f.isPK || f.isVersion || f.isSoftDelete || f.isCreated || f.isUpdated {
+		isMaintained := f.isPK || f.isVersion || f.isSoftDelete || f.isCreated || f.isUpdated
+		if isMaintained {
 			return fmt.Errorf("rio: DoUpdateSet: column %q is maintained by rio and cannot be assigned", k)
 		}
 		if f.readOnly {
@@ -440,45 +487,6 @@ func upsertSQL(
 	)
 }
 
-// upsertSpecKey encodes flags, update fields, and ordered conflict columns.
-func upsertSpecKey(spec *upsertSpec, update []*field) upsertCacheKey {
-	key := upsertCacheKey{count: len(spec.conflict)}
-	if spec.doNothing {
-		key.flags |= 1
-	}
-	if spec.keepTrashed {
-		key.flags |= 2
-	}
-	for _, f := range update {
-		key.update |= 1 << uint(f.ordinal)
-	}
-	for i, c := range spec.conflict[:min(len(spec.conflict), len(key.conflict))] {
-		key.conflict[i] = c
-	}
-	if len(spec.conflict) <= len(key.conflict) && len(spec.sets) == 0 {
-		return key
-	}
-	// overflow carries the conflict columns past the fixed slots and the
-	// DoUpdateSet shape: column=expression or column=? per assignment.
-	var b []byte
-	for _, c := range spec.conflict[min(len(spec.conflict), len(key.conflict)):] {
-		b = append(b, c...)
-		b = append(b, 0)
-	}
-	for _, k := range spec.setKeys {
-		b = append(b, k...)
-		b = append(b, '=')
-		if expr, ok := spec.sets[k].(Expr); ok {
-			b = append(b, expr...)
-		} else {
-			b = append(b, '?')
-		}
-		b = append(b, 0)
-	}
-	key.overflow = byteString(b)
-	return key
-}
-
 // appendConflictBranch renders the dialect's conflict clause and update set;
 // Upsert and UpsertAll share this tail.
 func appendConflictBranch(b []byte, d Dialect, table string, p *plan, update []*field, spec *upsertSpec) []byte {
@@ -536,7 +544,8 @@ func upsertUpdateSet(p *plan, spec *upsertSpec, skipped []*field) ([]*field, err
 			if !ok {
 				return nil, fmt.Errorf("rio: DoUpdate: %s has no column %q", p.structName, c)
 			}
-			if f.isPK || f.isVersion || f.isSoftDelete || f.isCreated || f.isUpdated {
+			isMaintained := f.isPK || f.isVersion || f.isSoftDelete || f.isCreated || f.isUpdated
+			if isMaintained {
 				return nil, fmt.Errorf("rio: DoUpdate: column %q is maintained by rio and cannot be listed", c)
 			}
 			if f.readOnly {

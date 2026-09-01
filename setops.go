@@ -46,33 +46,11 @@ func (q Query[T]) DeleteAllReturning(ctx context.Context, db Queryer, args ...an
 	return rows, err
 }
 
-func (q Query[T]) deleteAll(ctx context.Context, db Queryer, args []any, returning bool) ([]T, int64, error) {
-	if len(q.s.wheres) == 0 && len(q.s.hasConds) == 0 && !q.s.allRows {
-		return nil, 0, ErrMissingWhere
-	}
-	if err := checkSetOpShape("DeleteAll", &q.s); err != nil {
-		return nil, 0, err
-	}
-	g := db.gram()
-	p, state, err := prepareQueryState[T](g.d, &q.s, args)
-	if err != nil {
-		return nil, 0, err
-	}
-	// Check before delegation so errors name DeleteAll.
-	if d := g.d; !d.caps().mutations {
-		return nil, 0, checkDeleteWrite(d, "DeleteAll", g.table(p))
-	}
-	if p.softDel != nil {
-		set := Set{p.softDel.column: g.d.bindTime(normalizeTime(db.conf().clock()))}
-		return (Query[T]{s: state}).updateAll(ctx, db, set, nil, "delete", returning)
-	}
-	return q.forceDeleteAll(ctx, db, p, &state, returning)
-}
-
 // ForceDeleteAll permanently deletes matching rows. It requires conditions
 // or AllRows, including on soft-delete models.
 func (q Query[T]) ForceDeleteAll(ctx context.Context, db Queryer, args ...any) (int64, error) {
-	if len(q.s.wheres) == 0 && len(q.s.hasConds) == 0 && !q.s.allRows {
+	missingWhere := len(q.s.wheres) == 0 && len(q.s.hasConds) == 0 && !q.s.allRows
+	if missingWhere {
 		return 0, ErrMissingWhere
 	}
 	if err := checkSetOpShape("ForceDeleteAll", &q.s); err != nil {
@@ -123,7 +101,8 @@ func (q Query[T]) updateAll(
 	if len(set) == 0 {
 		return nil, 0, errors.New("rio: UpdateAll with an empty Set")
 	}
-	if len(q.s.wheres) == 0 && len(q.s.hasConds) == 0 && !q.s.allRows {
+	missingWhere := len(q.s.wheres) == 0 && len(q.s.hasConds) == 0 && !q.s.allRows
+	if missingWhere {
 		return nil, 0, ErrMissingWhere
 	}
 	if err := checkSetOpShape("UpdateAll", &q.s); err != nil {
@@ -199,6 +178,64 @@ func (q Query[T]) updateAll(
 	return runSetOp[T](ctx, db, hookOp, p, sqlText, outArgs, returning)
 }
 
+func (q Query[T]) deleteAll(ctx context.Context, db Queryer, args []any, returning bool) ([]T, int64, error) {
+	missingWhere := len(q.s.wheres) == 0 && len(q.s.hasConds) == 0 && !q.s.allRows
+	if missingWhere {
+		return nil, 0, ErrMissingWhere
+	}
+	if err := checkSetOpShape("DeleteAll", &q.s); err != nil {
+		return nil, 0, err
+	}
+	g := db.gram()
+	p, state, err := prepareQueryState[T](g.d, &q.s, args)
+	if err != nil {
+		return nil, 0, err
+	}
+	// Check before delegation so errors name DeleteAll.
+	if d := g.d; !d.caps().mutations {
+		return nil, 0, checkDeleteWrite(d, "DeleteAll", g.table(p))
+	}
+	if p.softDel != nil {
+		set := Set{p.softDel.column: g.d.bindTime(normalizeTime(db.conf().clock()))}
+		return (Query[T]{s: state}).updateAll(ctx, db, set, nil, "delete", returning)
+	}
+	return q.forceDeleteAll(ctx, db, p, &state, returning)
+}
+
+func (q Query[T]) forceDeleteAll(
+	ctx context.Context,
+	db Queryer,
+	p *plan,
+	state *queryState,
+	returning bool,
+) ([]T, int64, error) {
+	if err := checkSetOpShape("DeleteAll", state); err != nil {
+		return nil, 0, err
+	}
+	g := db.gram()
+	d := g.d
+	if err := checkReturning(d, returning, "delete"); err != nil {
+		return nil, 0, err
+	}
+	table := g.table(p)
+	b := make([]byte, 0, 96)
+	b = append(b, "DELETE FROM "...)
+	b = d.quote(b, table)
+	var args []any
+	b, args, err := renderWhere(b, args, g, table, p, state, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	if returning {
+		b = appendReturning(b, d, table, p)
+	}
+	sqlText, outArgs, err := finishSQL(g, b, args)
+	if err != nil {
+		return nil, 0, err
+	}
+	return runSetOp[T](ctx, db, "delete", p, sqlText, outArgs, returning)
+}
+
 // appendSetValue renders one assignment's right-hand side: an Expr verbatim,
 // anything else as a bound value (JSON columns encode first).
 func appendSetValue(b []byte, args []any, op string, f *field, v any) ([]byte, []any, error) {
@@ -244,7 +281,15 @@ func checkReturning(d Dialect, returning bool, op string) error {
 }
 
 // runSetOp executes a set-based write, scanning the RETURNING rows when asked.
-func runSetOp[T any](ctx context.Context, db Queryer, op string, p *plan, sqlText string, args []any, returning bool) ([]T, int64, error) {
+func runSetOp[T any](
+	ctx context.Context,
+	db Queryer,
+	op string,
+	p *plan,
+	sqlText string,
+	args []any,
+	returning bool,
+) ([]T, int64, error) {
 	if !returning {
 		n, err := runAffected(ctx, db, op, p.structName, sqlText, args)
 		return nil, n, err
@@ -259,34 +304,6 @@ func runSetOp[T any](ctx context.Context, db Queryer, op string, p *plan, sqlTex
 		return nil, 0, err
 	}
 	return out, int64(len(out)), nil
-}
-
-func (q Query[T]) forceDeleteAll(ctx context.Context, db Queryer, p *plan, state *queryState, returning bool) ([]T, int64, error) {
-	if err := checkSetOpShape("DeleteAll", state); err != nil {
-		return nil, 0, err
-	}
-	g := db.gram()
-	d := g.d
-	if err := checkReturning(d, returning, "delete"); err != nil {
-		return nil, 0, err
-	}
-	table := g.table(p)
-	b := make([]byte, 0, 96)
-	b = append(b, "DELETE FROM "...)
-	b = d.quote(b, table)
-	var args []any
-	b, args, err := renderWhere(b, args, g, table, p, state, nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	if returning {
-		b = appendReturning(b, d, table, p)
-	}
-	sqlText, outArgs, err := finishSQL(g, b, args)
-	if err != nil {
-		return nil, 0, err
-	}
-	return runSetOp[T](ctx, db, "delete", p, sqlText, outArgs, returning)
 }
 
 // checkSetOpShape rejects query clauses a portable set-based write cannot honor.
@@ -315,17 +332,24 @@ func checkSetOpShape(op string, s *queryState) error {
 	if len(s.orders) > 0 {
 		return fmt.Errorf("rio: %s cannot honor OrderBy (a set-based write has no row order); drop it", op)
 	}
-	if len(s.orderKeys) > 0 || s.after != nil || s.before != nil {
+	hasSortKeys := len(s.orderKeys) > 0 || s.after != nil || s.before != nil
+	if hasSortKeys {
 		return fmt.Errorf("rio: %s cannot honor OrderKeys/After/Before (a set-based write has no row order); drop them", op)
 	}
 	if len(s.withs) > 0 || len(s.counts) > 0 {
-		return fmt.Errorf("rio: %s cannot honor With/WithCount (a set-based write returns no entities to load into); drop them", op)
+		return fmt.Errorf(
+			"rio: %s cannot honor With/WithCount (a set-based write returns no entities to load into); drop them",
+			op,
+		)
 	}
 	if s.lock != lockNone {
 		return fmt.Errorf("rio: %s cannot honor ForUpdate/ForShare (the write takes its own row locks); drop it", op)
 	}
 	if s.final {
-		return fmt.Errorf("rio: %s cannot honor Final (FINAL modifies reads, and ClickHouse rejects set-based writes anyway); drop it", op)
+		return fmt.Errorf(
+			"rio: %s cannot honor Final (FINAL modifies reads, and ClickHouse rejects set-based writes anyway); drop it",
+			op,
+		)
 	}
 	return nil
 }

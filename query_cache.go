@@ -8,10 +8,7 @@ import (
 	"weak"
 )
 
-type queryCache struct {
-	entries sync.Map
-}
-
+// queryCacheOp is the terminal method a cached shape was rendered for.
 type queryCacheOp uint8
 
 const (
@@ -34,21 +31,10 @@ type queryCacheKey struct {
 	column  string
 }
 
-// cachedQuery stores a scalar SQL shape and its deferred-argument positions.
-type cachedQuery struct {
-	sql             string
-	args            []any
-	execPos         []int
-	missing         []cachedDeferred
-	plan            *plan
-	execCount       int
-	hasIdentityArgs bool
-}
-
-type cachedDeferred struct {
-	end    int
-	clause string
-	expr   string
+// queryCache memoizes a Must query's rendered SQL per executing grammar and
+// terminal method; a nil cache disables memoization.
+type queryCache struct {
+	entries sync.Map
 }
 
 func (c *queryCache) load(key queryCacheKey, d Dialect, execArgs []any) (*cachedQuery, []any, bool, error) {
@@ -83,9 +69,8 @@ func (c *queryCache) store(
 	}
 	actual, loaded := c.entries.LoadOrStore(key, entry)
 	if !loaded {
-		// The first store arms a cleanup dropping the entry when the grammar
-		// is collected. The cleanup holds the cache weakly too: a discarded
-		// Query must not live until every handle it ever ran on dies.
+		// The first store arms a cleanup that drops the entry when the grammar
+		// is collected; it holds the cache weakly so handles never pin a Query.
 		cache := weak.Make(c)
 		runtime.AddCleanup(g, func(k queryCacheKey) {
 			if qc := cache.Value(); qc != nil {
@@ -99,47 +84,23 @@ func (c *queryCache) store(
 	return winner.sql, bound, err
 }
 
-func (c *cachedQuery) bind(d Dialect, execArgs []any) ([]any, error) {
-	if len(execArgs) != c.execCount {
-		if len(execArgs) < c.execCount {
-			for _, deferred := range c.missing {
-				if len(execArgs) < deferred.end {
-					return nil, fmt.Errorf(
-						"rio: query needs at least %d deferred argument(s), got %d (at %s(%q))",
-						deferred.end,
-						len(execArgs),
-						deferred.clause,
-						deferred.expr,
-					)
-				}
-			}
-		}
-		return nil, fmt.Errorf("rio: query takes %d deferred argument(s), got %d", c.execCount, len(execArgs))
-	}
-	if c.hasIdentityArgs {
-		return normalizeArgs(d, execArgs)
-	}
-	if len(execArgs) == 0 {
-		return c.args, nil
-	}
-	normalized, err := normalizeArgs(d, execArgs)
-	if err != nil {
-		return nil, err
-	}
-	out := append([]any(nil), c.args...)
-	for i, pos := range c.execPos {
-		out[pos] = normalized[i]
-	}
-	return out, nil
+// cachedDeferred is one deferred-argument clause; bind names it when the
+// execution arguments run short.
+type cachedDeferred struct {
+	end    int
+	clause string
+	expr   string
 }
 
-func hasExpandableExecArg(args []any) bool {
-	for _, arg := range args {
-		if dynamicArg(arg) {
-			return true
-		}
-	}
-	return false
+// cachedQuery stores a scalar SQL shape and its deferred-argument positions.
+type cachedQuery struct {
+	sql             string
+	args            []any
+	execPos         []int
+	missing         []cachedDeferred
+	plan            *plan
+	execCount       int
+	hasIdentityArgs bool
 }
 
 func newCachedQuery(
@@ -260,6 +221,49 @@ func newCachedQuery(
 		entry.args[pos] = nil
 	}
 	return entry, true
+}
+
+func (c *cachedQuery) bind(d Dialect, execArgs []any) ([]any, error) {
+	if len(execArgs) != c.execCount {
+		if len(execArgs) < c.execCount {
+			for _, deferred := range c.missing {
+				if len(execArgs) < deferred.end {
+					return nil, fmt.Errorf(
+						"rio: query needs at least %d deferred argument(s), got %d (at %s(%q))",
+						deferred.end,
+						len(execArgs),
+						deferred.clause,
+						deferred.expr,
+					)
+				}
+			}
+		}
+		return nil, fmt.Errorf("rio: query takes %d deferred argument(s), got %d", c.execCount, len(execArgs))
+	}
+	if c.hasIdentityArgs {
+		return normalizeArgs(d, execArgs)
+	}
+	if len(execArgs) == 0 {
+		return c.args, nil
+	}
+	normalized, err := normalizeArgs(d, execArgs)
+	if err != nil {
+		return nil, err
+	}
+	out := append([]any(nil), c.args...)
+	for i, pos := range c.execPos {
+		out[pos] = normalized[i]
+	}
+	return out, nil
+}
+
+func hasExpandableExecArg(args []any) bool {
+	for _, arg := range args {
+		if dynamicArg(arg) {
+			return true
+		}
+	}
+	return false
 }
 
 func prepareCachedSelect[T any](

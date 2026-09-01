@@ -8,6 +8,24 @@ import (
 	"sync"
 )
 
+type stmtPreparer interface {
+	PrepareContext(context.Context, string) (*sql.Stmt, error)
+}
+
+type stmtEntry struct {
+	sql  string
+	stmt *sql.Stmt
+}
+
+// stmtFlight is one in-progress prepare; waiters retry when it failed only
+// because the preparer's context died.
+type stmtFlight struct {
+	done        chan struct{}
+	stmt        *sql.Stmt
+	err         error
+	shouldRetry bool
+}
+
 // stmtCache is an LRU of prepared statements keyed by SQL text: IN (?)
 // expansion makes every slice length a distinct statement. *sql.Stmt is
 // reference-counted, so closing an evicted statement mid-query is safe.
@@ -22,20 +40,14 @@ type stmtCache struct {
 	isClosed bool
 }
 
-type stmtPreparer interface {
-	PrepareContext(context.Context, string) (*sql.Stmt, error)
-}
-
-type stmtEntry struct {
-	sql  string
-	stmt *sql.Stmt
-}
-
-type stmtFlight struct {
-	done        chan struct{}
-	stmt        *sql.Stmt
-	err         error
-	shouldRetry bool
+func newStmtCache(prepare stmtPreparer, capacity int) *stmtCache {
+	return &stmtCache{
+		prepare: prepare,
+		cap:     capacity,
+		bySQL:   make(map[string]*list.Element),
+		lru:     list.New(),
+		flight:  make(map[string]*stmtFlight),
+	}
 }
 
 func (c *stmtCache) get(ctx context.Context, sqlText string) (*sql.Stmt, error) {
@@ -134,15 +146,5 @@ func (c *stmtCache) close() {
 	c.mu.Unlock()
 	for _, st := range stmts {
 		_ = st.Close()
-	}
-}
-
-func newStmtCache(prepare stmtPreparer, capacity int) *stmtCache {
-	return &stmtCache{
-		prepare: prepare,
-		cap:     capacity,
-		bySQL:   make(map[string]*list.Element),
-		lru:     list.New(),
-		flight:  make(map[string]*stmtFlight),
 	}
 }

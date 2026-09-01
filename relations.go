@@ -17,6 +17,7 @@ const (
 	relManyToMany
 )
 
+// String implements fmt.Stringer with the kind's container type name.
 func (k relKind) String() string {
 	switch k {
 	case relHasMany:
@@ -102,6 +103,16 @@ func (r *HasMany[T]) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+func (HasMany[T]) relKind() relKind         { return relHasMany }
+func (HasMany[T]) targetType() reflect.Type { return reflect.TypeFor[T]() }
+func (r HasMany[T]) loadedLen() (int, bool) { return len(r.rows), r.loaded }
+func (*HasMany[T]) regroup(owners unsafe.Pointer, stride, offset uintptr, spans []span, buf any, order []int) {
+	slab := regroupSlab(buf.([]T), order)
+	for i, s := range spans {
+		(*HasMany[T])(unsafe.Add(owners, uintptr(i)*stride+offset)).Set(slab[s.start:s.end:s.end])
+	}
+}
+
 // ManyToMany is HasMany across a join table.
 type ManyToMany[T any] struct {
 	loaded bool
@@ -149,6 +160,16 @@ func (r *ManyToMany[T]) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+func (ManyToMany[T]) relKind() relKind         { return relManyToMany }
+func (ManyToMany[T]) targetType() reflect.Type { return reflect.TypeFor[T]() }
+func (r ManyToMany[T]) loadedLen() (int, bool) { return len(r.rows), r.loaded }
+func (*ManyToMany[T]) regroup(owners unsafe.Pointer, stride, offset uintptr, spans []span, buf any, order []int) {
+	slab := regroupSlab(buf.([]T), order)
+	for i, s := range spans {
+		(*ManyToMany[T])(unsafe.Add(owners, uintptr(i)*stride+offset)).Set(slab[s.start:s.end:s.end])
+	}
+}
+
 // HasOne holds the "single child row pointing at this row" side of a
 // one-to-one relation.
 type HasOne[T any] struct {
@@ -193,6 +214,22 @@ func (r *HasOne[T]) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+func (HasOne[T]) relKind() relKind         { return relHasOne }
+func (HasOne[T]) targetType() reflect.Type { return reflect.TypeFor[T]() }
+func (r HasOne[T]) loadedLen() (int, bool) { return 0, r.loaded }
+func (*HasOne[T]) regroup(owners unsafe.Pointer, stride, offset uintptr, spans []span, buf any, order []int) {
+	copies := regroupCopies(buf.([]T), spans, order)
+	for i, s := range spans {
+		c := (*HasOne[T])(unsafe.Add(owners, uintptr(i)*stride+offset))
+		if s.end == s.start {
+			c.Set(nil)
+			continue
+		}
+		c.Set(&copies[0])
+		copies = copies[1:]
+	}
+}
+
 // BelongsTo holds the parent row referenced by a foreign key on this row.
 // A NULL foreign key preloads as loaded-nil: Row returns nil, no panic.
 type BelongsTo[T any] struct {
@@ -235,41 +272,6 @@ func (r *BelongsTo[T]) UnmarshalJSON(b []byte) error {
 	}
 	r.Set(row)
 	return nil
-}
-func (HasMany[T]) relKind() relKind         { return relHasMany }
-func (HasMany[T]) targetType() reflect.Type { return reflect.TypeFor[T]() }
-func (r HasMany[T]) loadedLen() (int, bool) { return len(r.rows), r.loaded }
-func (*HasMany[T]) regroup(owners unsafe.Pointer, stride, offset uintptr, spans []span, buf any, order []int) {
-	slab := regroupSlab(buf.([]T), order)
-	for i, s := range spans {
-		(*HasMany[T])(unsafe.Add(owners, uintptr(i)*stride+offset)).Set(slab[s.start:s.end:s.end])
-	}
-}
-
-func (ManyToMany[T]) relKind() relKind         { return relManyToMany }
-func (ManyToMany[T]) targetType() reflect.Type { return reflect.TypeFor[T]() }
-func (r ManyToMany[T]) loadedLen() (int, bool) { return len(r.rows), r.loaded }
-func (*ManyToMany[T]) regroup(owners unsafe.Pointer, stride, offset uintptr, spans []span, buf any, order []int) {
-	slab := regroupSlab(buf.([]T), order)
-	for i, s := range spans {
-		(*ManyToMany[T])(unsafe.Add(owners, uintptr(i)*stride+offset)).Set(slab[s.start:s.end:s.end])
-	}
-}
-
-func (HasOne[T]) relKind() relKind         { return relHasOne }
-func (HasOne[T]) targetType() reflect.Type { return reflect.TypeFor[T]() }
-func (r HasOne[T]) loadedLen() (int, bool) { return 0, r.loaded }
-func (*HasOne[T]) regroup(owners unsafe.Pointer, stride, offset uintptr, spans []span, buf any, order []int) {
-	copies := regroupCopies(buf.([]T), spans, order)
-	for i, s := range spans {
-		c := (*HasOne[T])(unsafe.Add(owners, uintptr(i)*stride+offset))
-		if s.end == s.start {
-			c.Set(nil)
-			continue
-		}
-		c.Set(&copies[0])
-		copies = copies[1:]
-	}
 }
 
 func (BelongsTo[T]) relKind() relKind         { return relBelongsTo }

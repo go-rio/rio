@@ -6,11 +6,6 @@ import (
 	"fmt"
 )
 
-type sqlStateCoder interface {
-	error
-	SQLState() string
-}
-
 var (
 	// ErrNotFound reports that no row matched. It wraps sql.ErrNoRows.
 	ErrNotFound = fmt.Errorf("rio: record not found (%w)", sql.ErrNoRows)
@@ -33,6 +28,12 @@ var (
 	// ErrNoPrimaryKey reports an operation that requires a model primary key.
 	ErrNoPrimaryKey = errors.New("rio: model has no primary key")
 )
+
+// sqlStateCoder is the SQLSTATE accessor pgx and lib/pq errors expose.
+type sqlStateCoder interface {
+	error
+	SQLState() string
+}
 
 // unsupportedError makes dialect capability errors match errors.ErrUnsupported.
 type unsupportedError string

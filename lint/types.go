@@ -34,6 +34,28 @@ const (
 
 var timeType = reflect.TypeFor[time.Time]()
 
+// acceptable maps, per dialect and Go class, the database types that scan and bind cleanly.
+var acceptable = map[rio.Dialect]map[goClass][]string{
+	rio.Postgres: {
+		classInt:    {"smallint", "integer", "bigint"},
+		classFloat:  {"real", "double precision", "numeric"},
+		classString: {"text", "character varying", "character", "uuid"},
+		classBool:   {"boolean"},
+		classTime:   {"timestamp with time zone", "timestamp without time zone", "date"},
+		classBytes:  {"bytea"},
+		classJSON:   {"json", "jsonb", "text", "character varying"},
+	},
+	rio.MySQL: {
+		classInt:    {"tinyint", "smallint", "mediumint", "int", "bigint"},
+		classFloat:  {"float", "double", "decimal"},
+		classString: {"char", "varchar", "text", "tinytext", "mediumtext", "longtext", "enum"},
+		classBool:   {"tinyint"},
+		classTime:   {"datetime", "timestamp", "date"},
+		classBytes:  {"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob"},
+		classJSON:   {"json", "text", "mediumtext", "longtext"},
+	},
+}
+
 func classOf(c rio.ColumnSchema) goClass {
 	if c.Scanner {
 		// The type's own Scan/Value decide its representation; judging the underlying kind would second-guess them.
@@ -67,28 +89,7 @@ func classOf(c rio.ColumnSchema) goClass {
 	return classOther
 }
 
-// acceptable maps, per dialect and Go class, the database types that scan and bind cleanly.
-var acceptable = map[rio.Dialect]map[goClass][]string{
-	rio.Postgres: {
-		classInt:    {"smallint", "integer", "bigint"},
-		classFloat:  {"real", "double precision", "numeric"},
-		classString: {"text", "character varying", "character", "uuid"},
-		classBool:   {"boolean"},
-		classTime:   {"timestamp with time zone", "timestamp without time zone", "date"},
-		classBytes:  {"bytea"},
-		classJSON:   {"json", "jsonb", "text", "character varying"},
-	},
-	rio.MySQL: {
-		classInt:    {"tinyint", "smallint", "mediumint", "int", "bigint"},
-		classFloat:  {"float", "double", "decimal"},
-		classString: {"char", "varchar", "text", "tinytext", "mediumtext", "longtext", "enum"},
-		classBool:   {"tinyint"},
-		classTime:   {"datetime", "timestamp", "date"},
-		classBytes:  {"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob"},
-		classJSON:   {"json", "text", "mediumtext", "longtext"},
-	},
-}
-
+// verdictFor rules on one live column type against the model column's class.
 func verdictFor(dialect rio.Dialect, dataType string, c rio.ColumnSchema) verdict {
 	class := classOf(c)
 	if class == classOther {

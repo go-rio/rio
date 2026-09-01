@@ -52,16 +52,6 @@ type Subquery struct {
 	render func(g *grammar) ([]byte, []any, error)
 }
 
-// dynamicArg reports arguments that change the rendered statement: slices
-// expand, subqueries splice.
-func dynamicArg(arg any) bool {
-	if _, ok := arg.(Subquery); ok {
-		return true
-	}
-	_, ok := sliceValue(arg)
-	return ok
-}
-
 // bindStyle selects the output placeholder form.
 type bindStyle int
 
@@ -314,7 +304,7 @@ func rebindFrom(p lexProfile, style bindStyle, query string, args []any, g *gram
 					break
 				}
 				if expandErr = beginExpand(i, elems.Len()); expandErr == nil {
-					for j := 0; j < elems.Len(); j++ {
+					for j := range elems.Len() {
 						sep(j)
 						emit(elems.Index(j).Interface())
 					}
@@ -481,6 +471,94 @@ func rebindTemplate(p lexProfile, style bindStyle, query string) (string, int, e
 	return byteString(out), n, nil
 }
 
+// rebindCount counts into *n the placeholders rebindFrom would bind under p.
+func rebindCount(p lexProfile, query string, n *int) (string, []any, error) {
+	i := 0
+	for i < len(query) {
+		switch query[i] {
+		case '\'':
+			i = skipQuoted(query, i, '\'', p.backslashEscapes)
+		case '"':
+			i = skipQuoted(query, i, '"', (p.backslashEscapes && p.doubleQuoteIsString) || p.quotedIdentBackslash)
+		case '`':
+			if p.backtickIdent {
+				i = skipQuoted(query, i, '`', p.quotedIdentBackslash)
+			} else {
+				i++
+			}
+		case '[':
+			if p.bracketIdent {
+				i = skipUntilByte(query, i+1, ']')
+			} else {
+				i++
+			}
+		case '$':
+			if p.dollarQuote && !identByteBefore(query, i) {
+				if end, ok := skipDollarQuoted(query, i); ok {
+					i = end
+					continue
+				}
+			}
+			if p.heredoc && !identByteBefore(query, i) {
+				if end, ok := skipHeredoc(query, i); ok {
+					i = end
+					continue
+				}
+			}
+			i++
+		case '-':
+			if i+1 < len(query) && query[i+1] == '-' && (p.looseDashComment || dashCommentOK(query, i)) {
+				i = skipLineComment(query, i)
+			} else {
+				i++
+			}
+		case '#':
+			if p.hashComment || hashSpaceCommentAt(p, query, i) {
+				i = skipLineComment(query, i)
+			} else {
+				i++
+			}
+		case '/':
+			if p.slashSlashComment && i+1 < len(query) && query[i+1] == '/' {
+				i = skipLineComment(query, i)
+			} else if i+1 < len(query) && query[i+1] == '*' {
+				i = skipBlockComment(query, i, p.nestedBlockComments)
+			} else {
+				i++
+			}
+		case 'E', 'e':
+			if p.eStrings && i+1 < len(query) && query[i+1] == '\'' && !identByteBefore(query, i) {
+				i = skipQuoted(query, i+1, '\'', true)
+			} else {
+				i++
+			}
+		case '\\':
+			if p.backslashQuestion && i+1 < len(query) && query[i+1] == '?' {
+				i += 2
+			} else {
+				i++
+			}
+		case '?':
+			if i+1 < len(query) && query[i+1] == '?' {
+				i += 2
+				continue
+			}
+			*n++
+			i++
+		default:
+			i++
+		}
+	}
+	return "", nil, nil
+}
+
+// countPlaceholders is used only for error messages.
+func countPlaceholders(p lexProfile, query string) int {
+	n := 0
+	_, _, _ = rebindCount(p, query, &n)
+	return n
+}
+
 // emitAll emits one placeholder per element.
 func emitAll[E any](xs []E, sep func(int), emit func(any)) {
 	for j, x := range xs {
@@ -597,9 +675,9 @@ func hashSpaceCommentAt(p lexProfile, s string, i int) bool {
 	return p.hashSpaceComment && i+1 < len(s) && (s[i+1] == ' ' || s[i+1] == '!')
 }
 
-// checkDriverBlindRegion rejects a ? inside regions the server lexes as text
-// but the ClickHouse channel's client-side binder does not (heredocs, // comments) —
-// the driver would substitute there. Argument-free statements pass.
+// checkDriverBlindRegion rejects a ? inside a region the server lexes as text
+// but ClickHouse's client-side binder does not (heredocs, // comments);
+// argument-free statements pass.
 func checkDriverBlindRegion(style bindStyle, query string, start, end, argc int, region, fix string) error {
 	if style != bindQuestionEsc || argc == 0 {
 		return nil
@@ -680,89 +758,12 @@ func sliceValue(arg any) (reflect.Value, bool) {
 	return reflect.ValueOf(arg), true
 }
 
-// countPlaceholders is used only for error messages.
-func countPlaceholders(p lexProfile, query string) int {
-	n := 0
-	_, _, _ = rebindCount(p, query, &n)
-	return n
-}
-
-func rebindCount(p lexProfile, query string, n *int) (string, []any, error) {
-	i := 0
-	for i < len(query) {
-		switch query[i] {
-		case '\'':
-			i = skipQuoted(query, i, '\'', p.backslashEscapes)
-		case '"':
-			i = skipQuoted(query, i, '"', (p.backslashEscapes && p.doubleQuoteIsString) || p.quotedIdentBackslash)
-		case '`':
-			if p.backtickIdent {
-				i = skipQuoted(query, i, '`', p.quotedIdentBackslash)
-			} else {
-				i++
-			}
-		case '[':
-			if p.bracketIdent {
-				i = skipUntilByte(query, i+1, ']')
-			} else {
-				i++
-			}
-		case '$':
-			if p.dollarQuote && !identByteBefore(query, i) {
-				if end, ok := skipDollarQuoted(query, i); ok {
-					i = end
-					continue
-				}
-			}
-			if p.heredoc && !identByteBefore(query, i) {
-				if end, ok := skipHeredoc(query, i); ok {
-					i = end
-					continue
-				}
-			}
-			i++
-		case '-':
-			if i+1 < len(query) && query[i+1] == '-' && (p.looseDashComment || dashCommentOK(query, i)) {
-				i = skipLineComment(query, i)
-			} else {
-				i++
-			}
-		case '#':
-			if p.hashComment || hashSpaceCommentAt(p, query, i) {
-				i = skipLineComment(query, i)
-			} else {
-				i++
-			}
-		case '/':
-			if p.slashSlashComment && i+1 < len(query) && query[i+1] == '/' {
-				i = skipLineComment(query, i)
-			} else if i+1 < len(query) && query[i+1] == '*' {
-				i = skipBlockComment(query, i, p.nestedBlockComments)
-			} else {
-				i++
-			}
-		case 'E', 'e':
-			if p.eStrings && i+1 < len(query) && query[i+1] == '\'' && !identByteBefore(query, i) {
-				i = skipQuoted(query, i+1, '\'', true)
-			} else {
-				i++
-			}
-		case '\\':
-			if p.backslashQuestion && i+1 < len(query) && query[i+1] == '?' {
-				i += 2
-			} else {
-				i++
-			}
-		case '?':
-			if i+1 < len(query) && query[i+1] == '?' {
-				i += 2
-				continue
-			}
-			*n++
-			i++
-		default:
-			i++
-		}
+// dynamicArg reports arguments that change the rendered statement: slices
+// expand, subqueries splice.
+func dynamicArg(arg any) bool {
+	if _, ok := arg.(Subquery); ok {
+		return true
 	}
-	return "", nil, nil
+	_, ok := sliceValue(arg)
+	return ok
 }

@@ -10,6 +10,24 @@ import (
 	"unsafe"
 )
 
+// softProbeState is the row state probeSoftState scans back: the current
+// softdelete stamp and, when the model has one, the current version.
+type softProbeState struct {
+	found   bool
+	deleted reflect.Value // *T of the softdelete field's type
+	version reflect.Value // *T of the version field's type; zero Value without one
+}
+
+// trashed reports whether the probed stamp marks the row deleted: a non-nil
+// pointer, or (the NULL↔zero-time exception) a non-zero time.Time.
+func (st softProbeState) trashed() bool {
+	v := st.deleted.Elem()
+	if v.Kind() == reflect.Pointer {
+		return !v.IsNil()
+	}
+	return !v.Interface().(time.Time).IsZero()
+}
+
 // Insert writes one row and backfills generated columns supported by the
 // dialect. Zero omitzero fields use database defaults; zero auto-increment
 // keys are omitted. It initializes timestamps and a zero version before
@@ -42,7 +60,9 @@ func Insert[T any](ctx context.Context, db Queryer, row *T) error {
 		return fmt.Errorf("rio: clickhouse has no DEFAULT VALUES statement; set at least one column on %s", p.structName)
 	}
 	returning := d.caps().returning && len(back) > 0
-	if returning && d.name() == "sqlite" && len(back) == 1 && back[0] == p.autoIncr {
+	// SQLite backfills a lone auto-increment key from LastInsertId instead.
+	sqliteAutoIncrOnly := d.name() == "sqlite" && len(back) == 1 && back[0] == p.autoIncr
+	if returning && sqliteAutoIncrOnly {
 		returning = false
 	}
 	build := func() []byte {
@@ -252,6 +272,7 @@ func Restore[T any](ctx context.Context, db Queryer, row *T) error {
 	}
 	return nil
 }
+
 func softDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 	rv, err := rowValue("Delete", row)
 	if err != nil {
@@ -358,7 +379,7 @@ func hardDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 	return nil
 }
 
-// These checks reject dialects without synchronous, reliable affected-row counts.
+// checkUpdateWrite rejects dialects whose UPDATE is asynchronous or uncounted.
 func checkUpdateWrite(d Dialect, op, table string) error {
 	if d.caps().mutations {
 		return nil
@@ -374,6 +395,7 @@ func checkUpdateWrite(d Dialect, op, table string) error {
 	)
 }
 
+// checkDeleteWrite rejects dialects whose DELETE is an asynchronous mutation.
 func checkDeleteWrite(d Dialect, op, table string) error {
 	if d.caps().mutations {
 		return nil
@@ -387,6 +409,7 @@ func checkDeleteWrite(d Dialect, op, table string) error {
 	)
 }
 
+// checkRestoreWrite rejects dialects whose soft-delete UPDATE is asynchronous.
 func checkRestoreWrite(d Dialect, op string) error {
 	if d.caps().mutations {
 		return nil
@@ -440,7 +463,8 @@ func updateSet(p *plan, cols []string) ([]*field, error) {
 		if !ok {
 			return nil, fmt.Errorf("rio: Update: %s has no column %q (column names, not Go field names)", p.structName, c)
 		}
-		if f.isPK || f.isVersion || f.isCreated {
+		isMaintained := f.isPK || f.isVersion || f.isCreated
+		if isMaintained {
 			return nil, fmt.Errorf("rio: Update: column %q is maintained by rio and cannot be listed", c)
 		}
 		if f.readOnly {
@@ -558,7 +582,8 @@ func insertColumns(
 	nb := len(buf)
 	args = make([]any, 0, len(p.fields))
 	for i, f := range p.fields {
-		if f.readOnly || ((f.isAutoIncr || f.omitZero) && fieldIsZero(f, base, rv)) {
+		omittable := f.isAutoIncr || f.omitZero
+		if f.readOnly || (omittable && fieldIsZero(f, base, rv)) {
 			nb--
 			buf[nb] = f
 			continue
@@ -841,24 +866,6 @@ func appendCurrentReadProbeTail(b []byte, d Dialect) []byte {
 		return b
 	}
 	return append(b, " LIMIT 1 FOR UPDATE"...)
-}
-
-// softProbeState is the row state probeSoftState scans back: the current
-// softdelete stamp and, when the model has one, the current version.
-type softProbeState struct {
-	found   bool
-	deleted reflect.Value // *T of the softdelete field's type
-	version reflect.Value // *T of the version field's type; zero Value without one
-}
-
-// trashed reports whether the probed stamp marks the row deleted: a non-nil
-// pointer, or (the NULL↔zero-time exception) a non-zero time.Time.
-func (st softProbeState) trashed() bool {
-	v := st.deleted.Elem()
-	if v.Kind() == reflect.Pointer {
-		return !v.IsNil()
-	}
-	return !v.Interface().(time.Time).IsZero()
 }
 
 // probeCell scans f into the standalone buffer dst (a *T): colScanner writes

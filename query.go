@@ -14,6 +14,7 @@ import (
 	"time"
 )
 
+// cond is one Where or Having fragment with its inline arguments.
 type cond struct {
 	expr string
 	args []any
@@ -25,6 +26,34 @@ const (
 	trashDefault trashMode = iota // filter soft-deleted rows out
 	trashWith                     // include them
 	trashOnly                     // only them
+)
+
+type lockMode uint8
+
+const (
+	lockNone lockMode = iota
+	lockUpdate
+	lockShare
+)
+
+// LockOption refines a row lock: what happens when a row is already locked.
+type LockOption uint8
+
+const (
+	// NoWait fails immediately instead of waiting for a locked row.
+	NoWait LockOption = iota + 1
+	// SkipLocked leaves out rows another transaction holds locked.
+	SkipLocked
+)
+
+// selectShape is the projection renderSelect produces: entity rows, count(*),
+// or an existence probe.
+type selectShape int
+
+const (
+	selectRows selectShape = iota
+	selectCount
+	selectExists
 )
 
 // queryState is the non-generic body shared by renderers and preloaders.
@@ -63,6 +92,34 @@ type queryState struct {
 	keyArgs []any
 }
 
+// noteCondArity records an inline-argument mismatch per fragment. Deferred and
+// dialect-sensitive fragments are checked at execution time.
+func (s *queryState) noteCondArity(clause, expr string, argc int) {
+	if argc == 0 || s.err != nil {
+		return
+	}
+	var sqliteCount int
+	_, _, _ = rebindCount(sqliteLex, expr, &sqliteCount)
+	if sqliteCount == argc {
+		return
+	}
+	var postgresCount, mysqlCount, clickhouseCount int
+	_, _, _ = rebindCount(pgLex, expr, &postgresCount)
+	_, _, _ = rebindCount(mysqlLex, expr, &mysqlCount)
+	_, _, _ = rebindCount(chLex, expr, &clickhouseCount)
+	dialectsDisagree := postgresCount != mysqlCount || mysqlCount != sqliteCount || sqliteCount != clickhouseCount
+	if dialectsDisagree {
+		return
+	}
+	s.err = fmt.Errorf(
+		"rio: %s(%q) has %d placeholder(s) but %d argument(s)",
+		clause,
+		expr,
+		postgresCount,
+		argc,
+	)
+}
+
 // hasCond describes one WhereHas or WhereHasNot EXISTS predicate.
 type hasCond struct {
 	path      string
@@ -76,14 +133,6 @@ type Query[T any] struct {
 	s     queryState
 	cache *queryCache
 }
-
-type selectShape int
-
-const (
-	selectRows selectShape = iota
-	selectCount
-	selectExists
-)
 
 // From starts a query for T's table.
 func From[T any]() Query[T] {
@@ -145,24 +194,6 @@ func (q Query[T]) Offset(n int) Query[T] {
 	q.s.offset, q.s.offsetSet = n, true
 	return q
 }
-
-// LockOption refines a row lock: what happens when a row is already locked.
-type LockOption uint8
-
-const (
-	// NoWait fails immediately instead of waiting for a locked row.
-	NoWait LockOption = iota + 1
-	// SkipLocked leaves out rows another transaction holds locked.
-	SkipLocked
-)
-
-type lockMode uint8
-
-const (
-	lockNone lockMode = iota
-	lockUpdate
-	lockShare
-)
 
 // ForUpdate renders SELECT ... FOR UPDATE, with at most one LockOption. A
 // no-op on SQLite; rejected on ClickHouse.
@@ -258,6 +289,45 @@ func (q Query[T]) With(path string, opts ...RelOption) Query[T] {
 // placeholders from Where and Having fragments in final SQL order.
 func (q Query[T]) All(ctx context.Context, db Queryer, args ...any) ([]T, error) {
 	return q.all(ctx, db, queryCacheAll, args)
+}
+
+func (q Query[T]) all(ctx context.Context, db Queryer, op queryCacheOp, args []any) ([]T, error) {
+	g := db.gram()
+	key := queryCacheKey{grammar: g.weakSelf, op: op}
+	p, state, sqlText, bound, err := prepareCachedSelect[T](
+		q.cache,
+		key,
+		g,
+		&q.s,
+		selectRows,
+		args,
+	)
+	if err != nil {
+		return nil, err
+	}
+	rows, finish, err := runQuery(
+		ctx,
+		db,
+		"select",
+		p.structName,
+		sqlText,
+		bound,
+	)
+	if err != nil {
+		return nil, err
+	}
+	out, err := scanAllCap[T](rows, p, false, 0, queryCapacity(state.limit, state.limitSet))
+	finishQuery(finish, err, int64(len(out)))
+	if err != nil {
+		return nil, err
+	}
+	if state.before != nil {
+		slices.Reverse(out) // the reversed query read the page backwards
+	}
+	if err := loadQueryRelations(ctx, db, p, out, state.withs, state.counts); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // First returns the first matching row or ErrNotFound. It adds LIMIT 1 only
@@ -385,7 +455,10 @@ func (q Query[T]) Count(ctx context.Context, db Queryer, args ...any) (int64, er
 		return 0, errors.New("rio: Count with GroupBy/Having is a projection (rows or groups?); use Raw")
 	}
 	if q.s.limitSet || q.s.offsetSet {
-		return 0, errors.New("rio: Count cannot honor Limit/Offset (COUNT aggregates before LIMIT applies); drop them, or count the window with Raw")
+		return 0, errors.New(
+			"rio: Count cannot honor Limit/Offset (COUNT aggregates before LIMIT applies); " +
+				"drop them, or count the window with Raw",
+		)
 	}
 	g := db.gram()
 	key := queryCacheKey{grammar: g.weakSelf, op: queryCacheCount}
@@ -556,6 +629,85 @@ func (q Query[T]) Pluck[V any](ctx context.Context, db Queryer, column string, a
 	return out, err
 }
 
+// Chunk yields the matching rows in keyset pages of size rows: one bounded
+// query per page, the connection released between pages, With and WithCount
+// applied per page. Pages follow OrderKeys, defaulting to the primary key;
+// Limit, Offset, After, and Before are refused.
+func (q Query[T]) Chunk(ctx context.Context, db Queryer, size int, args ...any) iter.Seq2[[]T, error] {
+	execArgs := copyArgs(args)
+	return func(yield func([]T, error) bool) {
+		if size <= 0 {
+			yield(nil, fmt.Errorf("rio: Chunk requires a positive size, got %d", size))
+			return
+		}
+		hasPaging := q.s.limitSet || q.s.offsetSet || q.s.after != nil || q.s.before != nil
+		if hasPaging {
+			yield(nil, errors.New("rio: Chunk owns Limit, Offset, After, and Before; drop them"))
+			return
+		}
+		page := q
+		page.cache = nil
+		if len(page.s.orderKeys) == 0 {
+			p, err := planOf[T]()
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			for _, pk := range p.pks {
+				page.s.orderKeys = append(page.s.orderKeys, SortKey{Column: pk.column})
+			}
+		}
+		page.s.limit, page.s.limitSet = size, true
+		for {
+			rows, err := page.All(ctx, db, execArgs...)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			if len(rows) == 0 {
+				return
+			}
+			if !yield(rows, nil) || len(rows) < size {
+				return
+			}
+			cur, err := page.CursorAt(&rows[len(rows)-1])
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			page.s.after = &cur
+		}
+	}
+}
+
+// Sub embeds the query as a ? argument projecting one mapped column, for
+// IN (?), EXISTS (?), and scalar comparisons; the caller writes the
+// parentheses. The query's own Where arguments must be inline.
+func (q Query[T]) Sub(column string) Subquery {
+	return Subquery{render: func(g *grammar) ([]byte, []any, error) {
+		p, state, err := prepareQueryState[T](g.d, &q.s, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		f, ok := p.byColumn[column]
+		if !ok {
+			return nil, nil, fmt.Errorf("rio: Sub: %s has no column %q (expressions go through Raw)", p.structName, column)
+		}
+		return renderPluckRaw(g, p, f, &state)
+	}}
+}
+
+// SQL renders the statement All would run on db, with its bound arguments,
+// without executing it.
+func (q Query[T]) SQL(db Queryer, args ...any) (string, []any, error) {
+	g := db.gram()
+	p, state, err := prepareQueryState[T](g.d, &q.s, args)
+	if err != nil {
+		return "", nil, err
+	}
+	return renderSelect(g, p, &state, selectRows)
+}
+
 // Find fetches a row by primary key. Pass composite key parts in struct-field
 // declaration order.
 func Find[T any](ctx context.Context, db Queryer, key ...any) (*T, error) {
@@ -630,182 +782,6 @@ func Find[T any](ctx context.Context, db Queryer, key ...any) (*T, error) {
 	return out, err
 }
 
-func (q Query[T]) all(ctx context.Context, db Queryer, op queryCacheOp, args []any) ([]T, error) {
-	g := db.gram()
-	key := queryCacheKey{grammar: g.weakSelf, op: op}
-	p, state, sqlText, bound, err := prepareCachedSelect[T](
-		q.cache,
-		key,
-		g,
-		&q.s,
-		selectRows,
-		args,
-	)
-	if err != nil {
-		return nil, err
-	}
-	rows, finish, err := runQuery(
-		ctx,
-		db,
-		"select",
-		p.structName,
-		sqlText,
-		bound,
-	)
-	if err != nil {
-		return nil, err
-	}
-	out, err := scanAllCap[T](rows, p, false, 0, queryCapacity(state.limit, state.limitSet))
-	finishQuery(finish, err, int64(len(out)))
-	if err != nil {
-		return nil, err
-	}
-	if state.before != nil {
-		slices.Reverse(out) // the reversed query read the page backwards
-	}
-	if err := loadQueryRelations(ctx, db, p, out, state.withs, state.counts); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// Chunk yields the matching rows in keyset pages of size rows: one bounded
-// query per page, the connection released between pages, With and WithCount
-// applied per page. Pages follow OrderKeys, defaulting to the primary key;
-// Limit, Offset, After, and Before are refused.
-func (q Query[T]) Chunk(ctx context.Context, db Queryer, size int, args ...any) iter.Seq2[[]T, error] {
-	execArgs := copyArgs(args)
-	return func(yield func([]T, error) bool) {
-		if size <= 0 {
-			yield(nil, fmt.Errorf("rio: Chunk requires a positive size, got %d", size))
-			return
-		}
-		if q.s.limitSet || q.s.offsetSet || q.s.after != nil || q.s.before != nil {
-			yield(nil, errors.New("rio: Chunk owns Limit, Offset, After, and Before; drop them"))
-			return
-		}
-		page := q
-		page.cache = nil
-		if len(page.s.orderKeys) == 0 {
-			p, err := planOf[T]()
-			if err != nil {
-				yield(nil, err)
-				return
-			}
-			for _, pk := range p.pks {
-				page.s.orderKeys = append(page.s.orderKeys, SortKey{Column: pk.column})
-			}
-		}
-		page.s.limit, page.s.limitSet = size, true
-		for {
-			rows, err := page.All(ctx, db, execArgs...)
-			if err != nil {
-				yield(nil, err)
-				return
-			}
-			if len(rows) == 0 {
-				return
-			}
-			if !yield(rows, nil) || len(rows) < size {
-				return
-			}
-			cur, err := page.CursorAt(&rows[len(rows)-1])
-			if err != nil {
-				yield(nil, err)
-				return
-			}
-			page.s.after = &cur
-		}
-	}
-}
-
-// noteCondArity records an inline-argument mismatch per fragment. Deferred and
-// dialect-sensitive fragments are checked at execution time.
-func (s *queryState) noteCondArity(clause, expr string, argc int) {
-	if argc == 0 || s.err != nil {
-		return
-	}
-	var sqliteCount int
-	_, _, _ = rebindCount(sqliteLex, expr, &sqliteCount)
-	if sqliteCount == argc {
-		return
-	}
-	var postgresCount, mysqlCount, clickhouseCount int
-	_, _, _ = rebindCount(pgLex, expr, &postgresCount)
-	_, _, _ = rebindCount(mysqlLex, expr, &mysqlCount)
-	_, _, _ = rebindCount(chLex, expr, &clickhouseCount)
-	if postgresCount != mysqlCount || mysqlCount != sqliteCount || sqliteCount != clickhouseCount {
-		return
-	}
-	s.err = fmt.Errorf(
-		"rio: %s(%q) has %d placeholder(s) but %d argument(s)",
-		clause,
-		expr,
-		postgresCount,
-		argc,
-	)
-}
-
-// copyArgs prevents a caller's variadic slice from aliasing query state.
-func copyArgs(args []any) []any {
-	if len(args) == 0 {
-		return nil
-	}
-	return append([]any(nil), args...)
-}
-
-// appendOne preserves immutability by preventing shared growth capacity.
-func appendOne[E any](s []E, e E) []E {
-	return append(s[:len(s):len(s)], e)
-}
-
-func loadQueryRelations[T any](
-	ctx context.Context,
-	db Queryer,
-	p *plan,
-	rows []T,
-	withs []preloadSpec,
-	counts []countSpec,
-) error {
-	if len(rows) == 0 || (len(withs) == 0 && len(counts) == 0) {
-		return nil
-	}
-	rv := reflect.ValueOf(rows)
-	queried, reusable := splitCounts(p, withs, counts)
-	stmts := make([]relStatement, 0, len(withs)+len(queried))
-	finishes := make([]relFinisher, 0, len(withs)+len(queried))
-	stmts, finishes, err := collectRelationLayer(db, p, rv, withs, stmts, finishes)
-	if err != nil {
-		return err
-	}
-	stmts, finishes, err = prepareCountLoads(db, p, rv, queried, stmts, finishes)
-	if err != nil {
-		return err
-	}
-	if err := runRelLayer(ctx, db, stmts, finishes); err != nil {
-		return err
-	}
-	return reuseCounts(p, rv, reusable)
-}
-
-func queryCapacity(limit int, isSet bool) int {
-	if isSet && limit > 0 && limit <= 1024 {
-		return limit
-	}
-	return 0
-}
-
-func pkColumns(p *plan) string {
-	var s strings.Builder
-	for i, pk := range p.pks {
-		if i > 0 {
-			s.WriteString(", ")
-		}
-		s.WriteString(pk.column)
-	}
-	return s.String()
-}
-
 // renderSelect qualifies entity columns so JOINs cannot make them ambiguous.
 func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string, []any, error) {
 	d := g.d
@@ -814,7 +790,8 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 	}
 	table := g.table(p)
 	var sortKeys []resolvedKey
-	if len(s.orderKeys) > 0 || s.after != nil || s.before != nil {
+	hasSortKeys := len(s.orderKeys) > 0 || s.after != nil || s.before != nil
+	if hasSortKeys {
 		var err error
 		if sortKeys, err = resolveSortKeys(p, s); err != nil {
 			return "", nil, err
@@ -1153,7 +1130,8 @@ func renderExists(
 		b = append(b, '.')
 		b = d.quote(b, res.ref.column)
 	}
-	if target.softDel != nil && !(tail == "" && leaf.withTrashed) {
+	leafWithTrashed := tail == "" && leaf.withTrashed
+	if target.softDel != nil && !leafWithTrashed {
 		b = append(b, " AND "...)
 		b = d.quote(b, alias)
 		b = append(b, '.')
@@ -1220,7 +1198,7 @@ func normalizeArgs(d Dialect, args []any) ([]any, error) {
 	out := args
 	cloned := false
 	for i, a := range args {
-		var v any
+		var v any // stays nil for NULL-like inputs
 		switch t := a.(type) {
 		case time.Time:
 			nt := normalizeTime(t)
@@ -1229,9 +1207,7 @@ func normalizeArgs(d Dialect, args []any) ([]any, error) {
 			}
 			v = d.bindTime(nt)
 		case *time.Time:
-			if t == nil {
-				v = nil
-			} else {
+			if t != nil {
 				nt := normalizeTime(*t)
 				if err := checkBindTime(d, nt); err != nil {
 					return nil, err
@@ -1239,9 +1215,7 @@ func normalizeArgs(d Dialect, args []any) ([]any, error) {
 				v = d.bindTime(nt)
 			}
 		case sql.NullTime:
-			if !t.Valid {
-				v = nil
-			} else {
+			if t.Valid {
 				nt := normalizeTime(t.Time)
 				if err := checkBindTime(d, nt); err != nil {
 					return nil, err
@@ -1249,9 +1223,7 @@ func normalizeArgs(d Dialect, args []any) ([]any, error) {
 				v = d.bindTime(nt)
 			}
 		case sql.Null[time.Time]:
-			if !t.Valid {
-				v = nil
-			} else {
+			if t.Valid {
 				nt := normalizeTime(t.V)
 				if err := checkBindTime(d, nt); err != nil {
 					return nil, err
@@ -1273,9 +1245,7 @@ func normalizeArgs(d Dialect, args []any) ([]any, error) {
 			if !d.caps().bindBytesAsString {
 				continue
 			}
-			if t == nil {
-				v = nil
-			} else {
+			if t != nil {
 				v = string(t)
 			}
 		default:
@@ -1313,7 +1283,8 @@ func renderPluckRaw(g *grammar, p *plan, f *field, s *queryState) ([]byte, []any
 	}
 	table := g.table(p)
 	var sortKeys []resolvedKey
-	if len(s.orderKeys) > 0 || s.after != nil || s.before != nil {
+	hasSortKeys := len(s.orderKeys) > 0 || s.after != nil || s.before != nil
+	if hasSortKeys {
 		var kerr error
 		if sortKeys, kerr = resolveSortKeys(p, s); kerr != nil {
 			return nil, nil, kerr
@@ -1365,30 +1336,65 @@ func renderPluckRaw(g *grammar, p *plan, f *field, s *queryState) ([]byte, []any
 	return b, args, nil
 }
 
-// Sub embeds the query as a ? argument projecting one mapped column, for
-// IN (?), EXISTS (?), and scalar comparisons; the caller writes the
-// parentheses. The query's own Where arguments must be inline.
-func (q Query[T]) Sub(column string) Subquery {
-	return Subquery{render: func(g *grammar) ([]byte, []any, error) {
-		p, state, err := prepareQueryState[T](g.d, &q.s, nil)
-		if err != nil {
-			return nil, nil, err
-		}
-		f, ok := p.byColumn[column]
-		if !ok {
-			return nil, nil, fmt.Errorf("rio: Sub: %s has no column %q (expressions go through Raw)", p.structName, column)
-		}
-		return renderPluckRaw(g, p, f, &state)
-	}}
+// copyArgs prevents a caller's variadic slice from aliasing query state.
+func copyArgs(args []any) []any {
+	if len(args) == 0 {
+		return nil
+	}
+	return append([]any(nil), args...)
 }
 
-// SQL renders the statement All would run on db, with its bound arguments,
-// without executing it.
-func (q Query[T]) SQL(db Queryer, args ...any) (string, []any, error) {
-	g := db.gram()
-	p, state, err := prepareQueryState[T](g.d, &q.s, args)
-	if err != nil {
-		return "", nil, err
+// appendOne preserves immutability by preventing shared growth capacity.
+func appendOne[E any](s []E, e E) []E {
+	return append(s[:len(s):len(s)], e)
+}
+
+// loadQueryRelations runs one result set's With and WithCount loads as a
+// single relation layer.
+func loadQueryRelations[T any](
+	ctx context.Context,
+	db Queryer,
+	p *plan,
+	rows []T,
+	withs []preloadSpec,
+	counts []countSpec,
+) error {
+	nothingToLoad := len(withs) == 0 && len(counts) == 0
+	if len(rows) == 0 || nothingToLoad {
+		return nil
 	}
-	return renderSelect(g, p, &state, selectRows)
+	rv := reflect.ValueOf(rows)
+	queried, reusable := splitCounts(p, withs, counts)
+	stmts := make([]relStatement, 0, len(withs)+len(queried))
+	finishes := make([]relFinisher, 0, len(withs)+len(queried))
+	stmts, finishes, err := collectRelationLayer(db, p, rv, withs, stmts, finishes)
+	if err != nil {
+		return err
+	}
+	stmts, finishes, err = prepareCountLoads(db, p, rv, queried, stmts, finishes)
+	if err != nil {
+		return err
+	}
+	if err := runRelLayer(ctx, db, stmts, finishes); err != nil {
+		return err
+	}
+	return reuseCounts(p, rv, reusable)
+}
+
+func queryCapacity(limit int, isSet bool) int {
+	if isSet && limit > 0 && limit <= 1024 {
+		return limit
+	}
+	return 0
+}
+
+func pkColumns(p *plan) string {
+	var s strings.Builder
+	for i, pk := range p.pks {
+		if i > 0 {
+			s.WriteString(", ")
+		}
+		s.WriteString(pk.column)
+	}
+	return s.String()
 }

@@ -27,6 +27,7 @@ const (
 	Error
 )
 
+// String returns the severity's lower-case name: "error", "warn", or "notice".
 func (s Severity) String() string {
 	switch s {
 	case Error:
@@ -65,6 +66,8 @@ func (r *Report) Errors() []Finding {
 	return out
 }
 
+func (r *Report) add(f Finding) { r.Findings = append(r.Findings, f) }
+
 // Check compares each model's mapping under db against the live schema.
 // It is read-only and reports only decidable drift.
 func Check(ctx context.Context, db *rio.DB, models ...any) (*Report, error) {
@@ -95,8 +98,6 @@ func Check(ctx context.Context, db *rio.DB, models ...any) (*Report, error) {
 	return report, nil
 }
 
-func (r *Report) add(f Finding) { r.Findings = append(r.Findings, f) }
-
 func checkTable(report *Report, dialect rio.Dialect, ts *rio.TableSchema, cols []dbColumn) {
 	add := func(sev Severity, kind, column, msg string) {
 		report.add(Finding{Severity: sev, Kind: kind, Model: ts.Struct, Table: ts.Table, Column: column, Message: msg})
@@ -115,10 +116,13 @@ func checkTable(report *Report, dialect rio.Dialect, ts *rio.TableSchema, cols [
 				fmt.Sprintf("column %q is mapped by %s.%s but missing from the table; every query naming it fails", mc.Name, ts.Struct, mc.Field))
 			continue
 		}
-		if dc.nullable && !mc.Nullable {
+		nullUnhandled := dc.nullable && !mc.Nullable
+		needlessPointer := !dc.nullable && mc.Nullable && mc.GoType.Kind() == reflect.Pointer
+		switch {
+		case nullUnhandled:
 			add(Warn, "nullability", mc.Name,
 				fmt.Sprintf("column %q is nullable but %s scans it into non-nullable %s; a NULL row fails to scan — use a pointer or add NOT NULL", mc.Name, ts.Struct, mc.GoType))
-		} else if !dc.nullable && mc.Nullable && mc.GoType.Kind() == reflect.Pointer {
+		case needlessPointer:
 			add(Notice, "nullability", mc.Name,
 				fmt.Sprintf("column %q is NOT NULL but %s maps it through pointer %s; the nil case cannot occur", mc.Name, ts.Struct, mc.GoType))
 		}

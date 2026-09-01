@@ -11,6 +11,9 @@ import (
 	"time"
 )
 
+// cursorVersion prefixes every token.
+const cursorVersion = byte(1)
+
 // SortKey is one column of a structured ordering. It names a mapped column —
 // not verbatim SQL — so rio can read its value back out of rows to issue
 // cursors.
@@ -29,50 +32,7 @@ type Cursor struct {
 	values []any
 }
 
-// IsZero reports whether the cursor marks no position.
-func (c Cursor) IsZero() bool { return c.fp == 0 && c.values == nil }
-
-// cursorVersion prefixes every token.
-const cursorVersion = byte(1)
-
-// String encodes the cursor as a URL-safe token.
-func (c Cursor) String() string {
-	b := []byte{cursorVersion}
-	b = binary.BigEndian.AppendUint64(b, c.fp)
-	for _, v := range c.values {
-		var tag byte
-		var body string
-		switch t := v.(type) {
-		case int64:
-			tag, body = 'i', strconv.FormatInt(t, 10)
-		case uint64:
-			tag, body = 'u', strconv.FormatUint(t, 10)
-		case float64:
-			// Bit-exact: formatting would round-trip imprecisely.
-			tag, body = 'f', strconv.FormatUint(math.Float64bits(t), 16)
-		case bool:
-			tag, body = 'b', strconv.FormatBool(t)
-		case string:
-			tag, body = 's', t
-		case time.Time:
-			tag, body = 't', t.UTC().Format(time.RFC3339Nano)
-		default:
-			// Hand-built cursors with other types encode as their print form
-			// and bind as strings.
-			tag, body = 's', fmt.Sprint(t)
-		}
-		b = append(b, tag)
-		b = appendCursorString(b, body)
-	}
-	return base64.RawURLEncoding.EncodeToString(b)
-}
-
-func appendCursorString(b []byte, s string) []byte {
-	b = binary.BigEndian.AppendUint32(b, uint32(len(s)))
-	return append(b, s...)
-}
-
-// ParseCursor decodes a token String produced. Malformed input fails here; a
+// ParseCursor decodes a token produced by String. Malformed input fails here; a
 // token for a different ordering fails at After's fingerprint check.
 func ParseCursor(s string) (Cursor, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(s)
@@ -136,10 +96,118 @@ func ParseCursor(s string) (Cursor, error) {
 	return c, nil
 }
 
+// IsZero reports whether the cursor marks no position.
+func (c Cursor) IsZero() bool { return c.fp == 0 && c.values == nil }
+
+// String encodes the cursor as a URL-safe token.
+func (c Cursor) String() string {
+	b := []byte{cursorVersion}
+	b = binary.BigEndian.AppendUint64(b, c.fp)
+	for _, v := range c.values {
+		var tag byte
+		var body string
+		switch t := v.(type) {
+		case int64:
+			tag, body = 'i', strconv.FormatInt(t, 10)
+		case uint64:
+			tag, body = 'u', strconv.FormatUint(t, 10)
+		case float64:
+			// Bit-exact: formatting would round-trip imprecisely.
+			tag, body = 'f', strconv.FormatUint(math.Float64bits(t), 16)
+		case bool:
+			tag, body = 'b', strconv.FormatBool(t)
+		case string:
+			tag, body = 's', t
+		case time.Time:
+			tag, body = 't', t.UTC().Format(time.RFC3339Nano)
+		default:
+			// Hand-built cursors with other types encode as their print form
+			// and bind as strings.
+			tag, body = 's', fmt.Sprint(t)
+		}
+		b = append(b, tag)
+		b = appendCursorString(b, body)
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// check verifies the cursor against the query's resolved ordering.
+func (c *Cursor) check(clause string, keys []resolvedKey) error {
+	if c.IsZero() {
+		return fmt.Errorf("rio: %s: the zero Cursor marks no position; omit %s for the first page", clause, clause)
+	}
+	if c.fp != sortKeyFingerprint(keys) {
+		return fmt.Errorf("rio: %s: the cursor was issued for a different ordering than this query's OrderKeys", clause)
+	}
+	if len(c.values) != len(keys) {
+		return fmt.Errorf("rio: %s: the cursor carries %d value(s) for %d sort key(s)", clause, len(c.values), len(keys))
+	}
+	return nil
+}
+
 // resolvedKey is one sort key bound to its plan field.
 type resolvedKey struct {
 	f    *field
 	desc bool
+}
+
+// OrderKeys sets the structured ordering cursor pagination requires, rendered
+// as the query's ORDER BY; it cannot mix with verbatim OrderBy. Primary-key
+// columns missing from keys are appended as tie-breakers, following the last
+// declared direction.
+func (q Query[T]) OrderKeys(keys ...SortKey) Query[T] {
+	q.cache = nil
+	q.s.orderKeys = append(append([]SortKey(nil), q.s.orderKeys...), keys...)
+	return q
+}
+
+// After resumes past the position c marks: rows strictly after it in the
+// OrderKeys ordering. c must come from CursorAt under the same OrderKeys; a
+// different ordering fails loudly.
+func (q Query[T]) After(c Cursor) Query[T] {
+	q.cache = nil
+	q.s.after = &c
+	return q
+}
+
+// Before selects the page ending at the position c marks: the rows strictly
+// before it, still in OrderKeys order. It runs the reversed query and turns
+// the page around, so Rows cannot stream it.
+func (q Query[T]) Before(c Cursor) Query[T] {
+	q.cache = nil
+	q.s.before = &c
+	return q
+}
+
+// CursorAt issues the cursor marking row's position under the query's
+// OrderKeys: After the last row of a page for the next page, Before the first
+// row for the previous one. The row must hold the values the database stores
+// (any row rio scanned does).
+func (q Query[T]) CursorAt(row *T) (Cursor, error) {
+	p, err := planOf[T]()
+	if err != nil {
+		return Cursor{}, err
+	}
+	keys, err := resolveSortKeys(p, &q.s)
+	if err != nil {
+		return Cursor{}, err
+	}
+	rv := reflect.ValueOf(row).Elem()
+	c := Cursor{fp: sortKeyFingerprint(keys), values: make([]any, 0, len(keys))}
+	for _, k := range keys {
+		v, err := cursorValue(k.f, rv)
+		if err != nil {
+			return Cursor{}, err
+		}
+		c.values = append(c.values, v)
+	}
+	return c, nil
+}
+
+// appendCursorString appends s behind a big-endian uint32 length prefix.
+func appendCursorString(b []byte, s string) []byte {
+	b = binary.BigEndian.AppendUint32(b, uint32(len(s)))
+	return append(b, s...)
 }
 
 // resolveSortKeys validates the declared keys against the plan and appends
@@ -234,20 +302,6 @@ func cursorValue(f *field, rv reflect.Value) (any, error) {
 	return nil, fmt.Errorf("rio: cursor: column %q is not a cursor scalar", f.column)
 }
 
-// check verifies the cursor against the query's resolved ordering.
-func (c *Cursor) check(clause string, keys []resolvedKey) error {
-	if c.IsZero() {
-		return fmt.Errorf("rio: %s: the zero Cursor marks no position; omit %s for the first page", clause, clause)
-	}
-	if c.fp != sortKeyFingerprint(keys) {
-		return fmt.Errorf("rio: %s: the cursor was issued for a different ordering than this query's OrderKeys", clause)
-	}
-	if len(c.values) != len(keys) {
-		return fmt.Errorf("rio: %s: the cursor carries %d value(s) for %d sort key(s)", clause, len(c.values), len(keys))
-	}
-	return nil
-}
-
 // renderKeyset appends the expanded keyset predicate, ((k0 > ?) OR (k0 = ? AND
 // k1 > ?) OR ...): row-value syntax is neither portable nor mixed-direction.
 // reverse flips every comparison for Before.
@@ -258,7 +312,7 @@ func renderKeyset(b []byte, args []any, d Dialect, table string, keys []resolved
 			b = append(b, " OR "...)
 		}
 		b = append(b, '(')
-		for j := 0; j < i; j++ {
+		for j := range i {
 			b = d.quote(b, table)
 			b = append(b, '.')
 			b = d.quote(b, keys[j].f.column)
@@ -299,57 +353,4 @@ func appendOrderKeys(b []byte, d Dialect, table string, keys []resolvedKey, reve
 		}
 	}
 	return b
-}
-
-// OrderKeys sets the structured ordering cursor pagination requires, rendered
-// as the query's ORDER BY; it cannot mix with verbatim OrderBy. Primary-key
-// columns missing from keys are appended as tie-breakers, following the last
-// declared direction.
-func (q Query[T]) OrderKeys(keys ...SortKey) Query[T] {
-	q.cache = nil
-	q.s.orderKeys = append(append([]SortKey(nil), q.s.orderKeys...), keys...)
-	return q
-}
-
-// After resumes past the position c marks: rows strictly after it in the
-// OrderKeys ordering. c must come from CursorAt under the same OrderKeys; a
-// different ordering fails loudly.
-func (q Query[T]) After(c Cursor) Query[T] {
-	q.cache = nil
-	q.s.after = &c
-	return q
-}
-
-// Before selects the page ending at the position c marks: the rows strictly
-// before it, still in OrderKeys order. It runs the reversed query and turns
-// the page around, so Rows cannot stream it.
-func (q Query[T]) Before(c Cursor) Query[T] {
-	q.cache = nil
-	q.s.before = &c
-	return q
-}
-
-// CursorAt issues the cursor marking row's position under the query's
-// OrderKeys: After the last row of a page for the next page, Before the first
-// row for the previous one. The row must hold the values the database stores
-// (any row rio scanned does).
-func (q Query[T]) CursorAt(row *T) (Cursor, error) {
-	p, err := planOf[T]()
-	if err != nil {
-		return Cursor{}, err
-	}
-	keys, err := resolveSortKeys(p, &q.s)
-	if err != nil {
-		return Cursor{}, err
-	}
-	rv := reflect.ValueOf(row).Elem()
-	c := Cursor{fp: sortKeyFingerprint(keys), values: make([]any, 0, len(keys))}
-	for _, k := range keys {
-		v, err := cursorValue(k.f, rv)
-		if err != nil {
-			return Cursor{}, err
-		}
-		c.values = append(c.values, v)
-	}
-	return c, nil
 }

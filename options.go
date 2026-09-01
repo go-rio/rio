@@ -18,11 +18,19 @@ type config struct {
 	driverHandle any
 }
 
+func defaultConfig() *config {
+	return &config{
+		clock:   time.Now,
+		logArgs: true,
+		stmtCap: 512,
+	}
+}
+
 // Option configures a DB handle at construction time.
 type Option func(*config)
 
 // WithQueryHook installs a read-only hook for executed statements and
-// transaction control.
+// transaction control; a nil hook is ignored.
 func WithQueryHook(h QueryHook) Option {
 	return func(c *config) {
 		if h != nil {
@@ -32,7 +40,7 @@ func WithQueryHook(h QueryHook) Option {
 }
 
 // WithClock replaces the time source used for CreatedAt/UpdatedAt and soft
-// deletes. Intended for tests.
+// deletes; nil is ignored. Intended for tests.
 func WithClock(now func() time.Time) Option {
 	return func(c *config) {
 		if now != nil {
@@ -89,6 +97,15 @@ func WithoutStmtCache() Option {
 	return func(c *config) { c.stmtCache = false }
 }
 
+// crudKey identifies one rendered entity-CRUD statement shape.
+type crudKey struct {
+	plan *plan
+	op   string
+	bits uint64 // participating-column bitmap for shape-variable statements
+	rows int    // VALUES tuple count for batch statements
+	spec upsertCacheKey
+}
+
 // grammar isolates SQL caches by dialect and rendering options.
 type grammar struct {
 	d          Dialect
@@ -102,12 +119,10 @@ type grammar struct {
 	crud sync.Map
 }
 
-type crudKey struct {
-	plan *plan
-	op   string
-	bits uint64 // participating-column bitmap for shape-variable statements
-	rows int    // VALUES tuple count for batch statements
-	spec upsertCacheKey
+func newGrammar(d Dialect, cfg *config) *grammar {
+	g := &grammar{d: d, tableNamer: cfg.tableNamer}
+	g.weakSelf = weak.Make(g)
+	return g
 }
 
 // cachedSQL renders entity-CRUD SQL once per grammar and shape.
@@ -146,18 +161,4 @@ func (g *grammar) table(p *plan) string {
 		return g.tableNamer(p.structName)
 	}
 	return p.defaultTable
-}
-
-func defaultConfig() *config {
-	return &config{
-		clock:   time.Now,
-		logArgs: true,
-		stmtCap: 512,
-	}
-}
-
-func newGrammar(d Dialect, cfg *config) *grammar {
-	g := &grammar{d: d, tableNamer: cfg.tableNamer}
-	g.weakSelf = weak.Make(g)
-	return g
 }

@@ -98,7 +98,8 @@ func renderAggregate(g *grammar, p *plan, fn string, f *field, s *queryState) (s
 	}
 	table := g.table(p)
 	var sortKeys []resolvedKey
-	if len(s.orderKeys) > 0 || s.after != nil || s.before != nil {
+	usesSortKeys := len(s.orderKeys) > 0 || s.after != nil || s.before != nil
+	if usesSortKeys {
 		var err error
 		if sortKeys, err = resolveSortKeys(p, s); err != nil {
 			return "", nil, err
@@ -108,7 +109,8 @@ func renderAggregate(g *grammar, p *plan, fn string, f *field, s *queryState) (s
 	b = append(b, "SELECT "...)
 	b = append(b, fn...)
 	b = append(b, '(')
-	if s.distinct && (fn == "sum" || fn == "avg") {
+	foldsDistinct := fn == "sum" || fn == "avg"
+	if s.distinct && foldsDistinct {
 		b = append(b, "DISTINCT "...)
 	}
 	b = d.quote(b, table)

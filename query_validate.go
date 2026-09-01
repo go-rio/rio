@@ -35,7 +35,8 @@ func validateQueryState(p *plan, s *queryState) error {
 	if err := checkNoArgClauses(p, s); err != nil {
 		return err
 	}
-	if len(s.orderKeys) > 0 || s.after != nil || s.before != nil {
+	hasSortKeys := len(s.orderKeys) > 0 || s.after != nil || s.before != nil
+	if hasSortKeys {
 		keys, err := resolveSortKeys(p, s)
 		if err != nil {
 			return err
@@ -143,12 +144,13 @@ func validateRelOptions(p *plan, s *queryState) error {
 	return nil
 }
 
-// Relation options require inline arguments because they execute separately
-// or inside a nested query with explicit argument order.
+// validateRelOptionSet requires inline RelWhere arguments: relation options
+// run in a separate or nested query whose argument order is fixed.
 func validateRelOptionSet(p *plan, clause, path string, rq *relQuery) error {
 	for _, w := range rq.wheres {
 		pg, my, sqlite, clickhouse := placeholderCounts(w.expr)
-		if pg != my || my != sqlite || sqlite != clickhouse {
+		dialectsDisagree := pg != my || my != sqlite || sqlite != clickhouse
+		if dialectsDisagree {
 			return fmt.Errorf(
 				"rio: Validate[%s]: %s(%q) cannot verify RelWhere(%q) placeholder count independent of dialect",
 				p.structName,

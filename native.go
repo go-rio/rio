@@ -8,16 +8,12 @@ import (
 	"time"
 )
 
-// rio's native driver SPI: a driver module implements these interfaces around
-// its native client and hands them to NewNative. Everything here is
-// driver-module SPI, not application API — applications construct through the
-// driver module (postgres.OpenNative).
-//
-// Extension policy, as in database/sql/driver: NativeDB, NativeTx, and
-// NativeRows are frozen within v1 — new capabilities arrive as optional
-// interfaces discovered by type assertion, never as new methods on these
-// three. NativeCell is the sealed, rio-implemented counterpart and grows the
-// other way.
+// Driver-module SPI: a driver implements NativeDB, NativeTx, and NativeRows
+// around its native client and hands them to NewNative; applications construct
+// through the driver module (postgres.OpenNative). As in database/sql/driver,
+// those three interfaces are frozen within v1 — new capabilities arrive as
+// optional interfaces discovered by type assertion. NativeCell is the sealed,
+// rio-implemented counterpart and may grow.
 
 // NativeDB is a driver-native execution channel: what rio needs from a driver
 // pool. SQL arrives fully rendered in the dialect's placeholder form; args
@@ -66,12 +62,19 @@ const (
 	// NativeKindScanner is the fallback and zero value: pass the cell
 	// itself to the driver's sql.Scanner path.
 	NativeKindScanner NativeScanKind = iota
+	// NativeKindInt marks an integer field; SetInt64 is its direct path.
 	NativeKindInt
+	// NativeKindUint marks an unsigned integer field; SetUint64 is its direct path.
 	NativeKindUint
+	// NativeKindFloat marks a float field; SetFloat64 is its direct path.
 	NativeKindFloat
+	// NativeKindBool marks a bool field; SetBool is its direct path.
 	NativeKindBool
+	// NativeKindString marks a string field; SetString is its direct path.
 	NativeKindString
+	// NativeKindBytes marks a []byte field; SetBytes is its direct path.
 	NativeKindBytes
+	// NativeKindTime marks a time.Time field; SetTime is its direct path.
 	NativeKindTime
 	// NativeKindJSON takes the column's raw JSON payload through SetBytes or
 	// SetString, not a value decoded driver-side.
@@ -158,6 +161,53 @@ func NewNative(nc NativeConfig, dialect Dialect, opts ...Option) *DB {
 	}
 }
 
+// BatchStatement is one rendered statement of a batch: SQL in the dialect's
+// placeholder form and its bind values, as NativeDB.Query receives them.
+type BatchStatement struct {
+	SQL  string
+	Args []any
+}
+
+// NativeBatcher is an optional capability of a NativeDB or NativeTx:
+// executing a group of independent row-returning statements in one driver
+// round trip. Implementations queue every statement and flush once; results
+// are consumed strictly in submission order.
+type NativeBatcher interface {
+	QueryBatch(ctx context.Context, stmts []BatchStatement) (NativeBatchResults, error)
+}
+
+// NativeBatchResults yields each batched statement's rows in submission
+// order. Rows returns the next statement's result — its NativeRows must be
+// fully consumed and closed before the next call — and reports done when
+// every statement's result has been handed out. Close releases the batch and
+// surfaces any deferred protocol error; it must be called once, after
+// consumption stops (early on failure is fine).
+type NativeBatchResults interface {
+	Rows() (rows NativeRows, done bool, err error)
+	Close() error
+}
+
+// NativeCopier is an optional capability of a NativeDB or NativeTx:
+// bulk-loading rows through the driver's streaming copy protocol (PostgreSQL
+// COPY FROM). table is the resolved, unquoted table name split into schema
+// segments ([]string{"app", "users"}); the driver quotes each segment. next
+// returns one row's bind values in columns order, (nil, nil) when the batch
+// is exhausted, or a non-nil error to abort the copy; the returned slice is
+// valid only until the next call, so encode it before pulling the next row.
+type NativeCopier interface {
+	CopyIn(ctx context.Context, table []string, columns []string, next func() ([]any, error)) (int64, error)
+}
+
+// batchEngine is the internal seam preload probes for round-trip batching.
+type batchEngine interface {
+	batcher() (NativeBatcher, bool)
+}
+
+// copyEngine is the internal seam InsertAll probes for streaming bulk loads.
+type copyEngine interface {
+	copier() (NativeCopier, bool)
+}
+
 // nativeRows adapts the pgx-shaped NativeRows to the internal rows seam;
 // Close returns Err so deferred protocol errors surface at close time.
 type nativeRows struct {
@@ -214,6 +264,9 @@ func (e *nativeEngine) close() error {
 	return errors.Join(verr, e.nd.Close())
 }
 
+func (e *nativeEngine) batcher() (NativeBatcher, bool) { b, ok := e.nd.(NativeBatcher); return b, ok }
+func (e *nativeEngine) copier() (NativeCopier, bool)   { c, ok := e.nd.(NativeCopier); return c, ok }
+
 // nativeTxEngine executes on one NativeTx. Rollback passes ctx through;
 // rio's cleanup callers already decouple cancellation.
 type nativeTxEngine struct {
@@ -239,57 +292,5 @@ func (e nativeTxEngine) query(ctx context.Context, sqlText string, args []any) (
 func (e nativeTxEngine) commit(ctx context.Context) error   { return e.nt.Commit(ctx) }
 func (e nativeTxEngine) rollback(ctx context.Context) error { return e.nt.Rollback(ctx) }
 
-// --- optional capabilities ---
-
-// BatchStatement is one rendered statement of a batch: SQL in the dialect's
-// placeholder form and its bind values, as NativeDB.Query receives them.
-type BatchStatement struct {
-	SQL  string
-	Args []any
-}
-
-// NativeBatcher is an optional capability of a NativeDB or NativeTx:
-// executing a group of independent row-returning statements in one driver
-// round trip. Implementations queue every statement and flush once; results
-// are consumed strictly in submission order.
-type NativeBatcher interface {
-	QueryBatch(ctx context.Context, stmts []BatchStatement) (NativeBatchResults, error)
-}
-
-// NativeBatchResults yields each batched statement's rows in submission
-// order. Rows returns the next statement's result — its NativeRows must be
-// fully consumed and closed before the next call — and reports done when
-// every statement's result has been handed out. Close releases the batch and
-// surfaces any deferred protocol error; it must be called once, after
-// consumption stops (early on failure is fine).
-type NativeBatchResults interface {
-	Rows() (rows NativeRows, done bool, err error)
-	Close() error
-}
-
-func (e *nativeEngine) batcher() (NativeBatcher, bool)  { b, ok := e.nd.(NativeBatcher); return b, ok }
 func (e nativeTxEngine) batcher() (NativeBatcher, bool) { b, ok := e.nt.(NativeBatcher); return b, ok }
-
-// batchEngine is the internal seam preload probes for round-trip batching.
-type batchEngine interface {
-	batcher() (NativeBatcher, bool)
-}
-
-// NativeCopier is an optional capability of a NativeDB or NativeTx:
-// bulk-loading rows through the driver's streaming copy protocol (PostgreSQL
-// COPY FROM). table is the resolved, unquoted table name split into schema
-// segments ([]string{"app", "users"}); the driver quotes each segment. next
-// returns one row's bind values in columns order, (nil, nil) when the batch
-// is exhausted, or a non-nil error to abort the copy; the returned slice is
-// valid only until the next call, so encode it before pulling the next row.
-type NativeCopier interface {
-	CopyIn(ctx context.Context, table []string, columns []string, next func() ([]any, error)) (int64, error)
-}
-
-func (e *nativeEngine) copier() (NativeCopier, bool)  { c, ok := e.nd.(NativeCopier); return c, ok }
-func (e nativeTxEngine) copier() (NativeCopier, bool) { c, ok := e.nt.(NativeCopier); return c, ok }
-
-// copyEngine is the internal seam InsertAll probes for streaming bulk loads.
-type copyEngine interface {
-	copier() (NativeCopier, bool)
-}
+func (e nativeTxEngine) copier() (NativeCopier, bool)   { c, ok := e.nt.(NativeCopier); return c, ok }

@@ -23,16 +23,6 @@ func Raw[T any](sqlText string, args ...any) RawQuery[T] {
 	return RawQuery[T]{sql: sqlText, args: copyArgs(args)}
 }
 
-// Exec runs a hand-written statement through the shared pipeline and returns
-// the driver result.
-func Exec(ctx context.Context, db Queryer, sqlText string, args ...any) (sql.Result, error) {
-	rebound, outArgs, err := finishSQLText(db.gram(), sqlText, copyArgs(args))
-	if err != nil {
-		return nil, err
-	}
-	return run(ctx, db, "exec", "", rebound, outArgs)
-}
-
 // All runs the query and scans every row.
 func (r RawQuery[T]) All(ctx context.Context, db Queryer) ([]T, error) {
 	return r.scan(ctx, db, 0)
@@ -134,4 +124,14 @@ func (r RawQuery[T]) scan(ctx context.Context, db Queryer, maxRows int) ([]T, er
 	out, err := scanAllN[T](rows, p, true, maxRows)
 	finishQuery(finish, err, int64(len(out)))
 	return out, err
+}
+
+// Exec runs a hand-written statement through the shared pipeline and returns
+// the driver result. The SQL is verbatim; never build it from untrusted input.
+func Exec(ctx context.Context, db Queryer, sqlText string, args ...any) (sql.Result, error) {
+	rebound, outArgs, err := finishSQLText(db.gram(), sqlText, copyArgs(args))
+	if err != nil {
+		return nil, err
+	}
+	return run(ctx, db, "exec", "", rebound, outArgs)
 }

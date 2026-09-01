@@ -57,34 +57,38 @@ func (e *sqlEngine) stmt(ctx context.Context, sqlText string, nargs int) (*sql.S
 }
 
 func (e *sqlEngine) exec(ctx context.Context, sqlText string, args []any) (sql.Result, error) {
-	if st, ok, err := e.stmt(ctx, sqlText, len(args)); err != nil {
+	st, ok, err := e.stmt(ctx, sqlText, len(args))
+	if err != nil {
 		return nil, err
-	} else if ok {
-		res, err := st.ExecContext(ctx, args...)
-		if isStmtClosed(err) {
-			// A concurrent eviction closed the handle before it ran; direct
-			// execution is safe.
-			return e.db.ExecContext(ctx, sqlText, args...)
-		}
-		return res, e.evictOnSchemaChange(sqlText, err)
 	}
-	return e.db.ExecContext(ctx, sqlText, args...)
+	if !ok {
+		return e.db.ExecContext(ctx, sqlText, args...)
+	}
+	res, err := st.ExecContext(ctx, args...)
+	if isStmtClosed(err) {
+		// A concurrent eviction closed the handle before it ran; direct
+		// execution is safe.
+		return e.db.ExecContext(ctx, sqlText, args...)
+	}
+	return res, e.evictOnSchemaChange(sqlText, err)
 }
 
 func (e *sqlEngine) query(ctx context.Context, sqlText string, args []any) (rows, error) {
-	if st, ok, err := e.stmt(ctx, sqlText, len(args)); err != nil {
+	st, ok, err := e.stmt(ctx, sqlText, len(args))
+	if err != nil {
 		return nil, err
-	} else if ok {
-		rs, err := st.QueryContext(ctx, args...)
-		if isStmtClosed(err) {
-			return e.directQuery(ctx, sqlText, args)
-		}
-		if err != nil {
-			return nil, e.evictOnSchemaChange(sqlText, err)
-		}
-		return rs, nil
 	}
-	return e.directQuery(ctx, sqlText, args)
+	if !ok {
+		return e.directQuery(ctx, sqlText, args)
+	}
+	rs, err := st.QueryContext(ctx, args...)
+	if isStmtClosed(err) {
+		return e.directQuery(ctx, sqlText, args)
+	}
+	if err != nil {
+		return nil, e.evictOnSchemaChange(sqlText, err)
+	}
+	return rs, nil
 }
 
 func (e *sqlEngine) directQuery(ctx context.Context, sqlText string, args []any) (rows, error) {
@@ -126,6 +130,8 @@ func (e *sqlEngine) evictOnSchemaChange(sqlText string, err error) error {
 	return err
 }
 
+// sqlTxEngine executes on one *sql.Tx; its statement cache ends with the
+// transaction.
 type sqlTxEngine struct {
 	tx    *sql.Tx
 	stmts *stmtCache
@@ -178,8 +184,8 @@ func (e *sqlTxEngine) directQuery(ctx context.Context, sqlText string, args []an
 	return rs, nil
 }
 
-// database/sql's finishers take no context and always reach the driver; the
-// seam's context is deliberately unused.
+// commit and rollback ignore ctx: database/sql's finishers take no context
+// and always reach the driver.
 func (e *sqlTxEngine) commit(context.Context) error {
 	err := e.tx.Commit()
 	if e.stmts != nil {
@@ -187,6 +193,7 @@ func (e *sqlTxEngine) commit(context.Context) error {
 	}
 	return err
 }
+
 func (e *sqlTxEngine) rollback(context.Context) error {
 	err := e.tx.Rollback()
 	if e.stmts != nil {

@@ -32,18 +32,6 @@ type DB struct {
 	handle any // driver-owned handle (WithDriverHandle / NativeConfig.Handle)
 }
 
-// Tx is a transaction handle. Like *sql.Tx it is bound to one connection and
-// must not be used concurrently.
-type Tx struct {
-	tx  *sql.Tx // Unwrap's view; nil without a *sql.Tx
-	e   txEngine
-	g   *grammar
-	cfg *config
-	// spSeq is shared by every Tx wrapper of one root transaction and only
-	// grows, so savepoint names are never reused.
-	spSeq *int
-}
-
 // New wraps an existing *sql.DB. Panics on a nil db or dialect, and on
 // WithStmtCache with a dialect that cannot prepare statements (ClickHouse).
 func New(db *sql.DB, dialect Dialect, opts ...Option) *DB {
@@ -134,6 +122,34 @@ func (d *DB) TxWith(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) er
 	return observe(ctx, d.cfg, d.g.d, "commit", "COMMIT", func(ctx context.Context) error { return te.commit(ctx) })
 }
 
+func (d *DB) eng() engine    { return d.e }
+func (d *DB) gram() *grammar { return d.g }
+func (d *DB) conf() *config  { return d.cfg }
+
+// finishTx rolls the transaction back on a cancellation-decoupled context
+// (a dead ctx must not suppress cleanup) and tolerates sql.ErrTxDone.
+func (d *DB) finishTx(ctx context.Context, te txEngine, cause error) error {
+	err := observeCleanup(ctx, d.cfg, d.g.d, "rollback", "ROLLBACK", func(ctx context.Context) error {
+		return te.rollback(ctx)
+	})
+	if err != nil && !errors.Is(err, sql.ErrTxDone) {
+		return fmt.Errorf("rio: rollback after %q failed: %w", cause, err)
+	}
+	return nil
+}
+
+// Tx is a transaction handle. Like *sql.Tx it is bound to one connection and
+// must not be used concurrently.
+type Tx struct {
+	tx  *sql.Tx // Unwrap's view; nil without a *sql.Tx
+	e   txEngine
+	g   *grammar
+	cfg *config
+	// spSeq is shared by every Tx wrapper of one root transaction and only
+	// grows, so savepoint names are never reused.
+	spSeq *int
+}
+
 // Unwrap returns the underlying *sql.Tx, or nil on the native channel.
 func (t *Tx) Unwrap() *sql.Tx { return t.tx }
 
@@ -155,9 +171,8 @@ func (t *Tx) Tx(ctx context.Context, fn func(tx *Tx) error) (err error) {
 	if err := t.spExec(ctx, "SAVEPOINT "+name); err != nil {
 		return err
 	}
-	// Cleanup runs cancellation-decoupled: when fn fails because ctx died,
-	// ROLLBACK TO must still reach the database or the savepoint's writes
-	// survive into the outer commit.
+	// Cleanup is cancellation-decoupled: when fn fails because ctx died,
+	// ROLLBACK TO must still reach the database or the savepoint's writes commit.
 	cleanup := context.WithoutCancel(ctx)
 	inner := &Tx{tx: t.tx, e: t.e, g: t.g, cfg: t.cfg, spSeq: t.spSeq}
 	defer func() {
@@ -178,22 +193,6 @@ func (t *Tx) Tx(ctx context.Context, fn func(tx *Tx) error) (err error) {
 	return t.spExec(cleanup, "RELEASE SAVEPOINT "+name)
 }
 
-func (d *DB) eng() engine    { return d.e }
-func (d *DB) gram() *grammar { return d.g }
-func (d *DB) conf() *config  { return d.cfg }
-
-// finishTx rolls the transaction back on a cancellation-decoupled context
-// (a dead ctx must not suppress cleanup) and tolerates sql.ErrTxDone.
-func (d *DB) finishTx(ctx context.Context, te txEngine, cause error) error {
-	err := observeCleanup(ctx, d.cfg, d.g.d, "rollback", "ROLLBACK", func(ctx context.Context) error {
-		return te.rollback(ctx)
-	})
-	if err != nil && !errors.Is(err, sql.ErrTxDone) {
-		return fmt.Errorf("rio: rollback after %q failed: %w", cause, err)
-	}
-	return nil
-}
-
 func (t *Tx) eng() engine    { return t.e }
 func (t *Tx) gram() *grammar { return t.g }
 func (t *Tx) conf() *config  { return t.cfg }
@@ -211,6 +210,27 @@ func (t *Tx) spExec(ctx context.Context, stmt string) error {
 		_, err := t.e.exec(ctx, stmt, nil)
 		return err
 	})
+}
+
+// relStatement is one derived relation-loading statement; its loader owns
+// draining and closing the rows.
+type relStatement struct {
+	phase   string
+	model   string
+	sqlText string
+	args    []any
+	load    relConsumer
+}
+
+// relConsumer drains one derived statement's rows into its loader's buffer;
+// one loader serves every chunk statement of its relation.
+type relConsumer interface {
+	consume(rows) (int64, error)
+}
+
+// relFinisher assembles a loader's buffered rows once its layer ran.
+type relFinisher interface {
+	finish(context.Context) error
 }
 
 // observeCleanup runs fn even when a BeforeQuery hook panics; the panic then
@@ -384,27 +404,6 @@ func finishQuery(finish func(error, int64), err error, returned int64) {
 		return
 	}
 	finish(missIsSuccess(err), returned)
-}
-
-// relStatement is one derived relation-loading statement; its loader owns
-// draining and closing the rows.
-type relStatement struct {
-	phase   string
-	model   string
-	sqlText string
-	args    []any
-	load    relConsumer
-}
-
-// relConsumer drains one derived statement's rows into its loader's buffer;
-// one loader serves every chunk statement of its relation.
-type relConsumer interface {
-	consume(rows) (int64, error)
-}
-
-// relFinisher assembles a loader's buffered rows once its layer ran.
-type relFinisher interface {
-	finish(context.Context) error
 }
 
 // runRelLayer runs a relation layer's statements first, then its finishes,

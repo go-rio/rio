@@ -94,7 +94,8 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 		opt(&spec)
 	}
 	spec.normalize()
-	if spec.doNothing && (len(spec.update) > 0 || len(spec.sets) > 0) {
+	hasUpdate := len(spec.update) > 0 || len(spec.sets) > 0
+	if spec.doNothing && hasUpdate {
 		return errors.New("rio: UpsertAll cannot combine DoNothing with DoUpdate/DoUpdateSet")
 	}
 	p, err := planOf[T]()
@@ -106,7 +107,8 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 	if err := checkUpsertWrite(d, "UpsertAll"); err != nil {
 		return err
 	}
-	if !spec.doNothing && len(spec.conflict) == 0 && d.caps().conflictTarget {
+	needsConflictTarget := !spec.doNothing && d.caps().conflictTarget
+	if needsConflictTarget && len(spec.conflict) == 0 {
 		return errors.New("rio: UpsertAll with DoUpdate needs OnConflict(columns...) naming the unique index")
 	}
 	now := normalizeTime(db.conf().clock())

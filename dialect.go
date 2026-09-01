@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+// sqliteTimeFormat is rio's canonical SQLite time encoding: sortable text,
+// accepted by SQLite's date functions; values are already UTC (bindArg).
+const sqliteTimeFormat = "2006-01-02 15:04:05.999999+00:00"
+
 // Dialect identifies one of the built-in SQL dialects. All methods are
 // unexported: driver modules pick a built-in value, never implement one.
 type Dialect interface {
@@ -20,6 +24,24 @@ type Dialect interface {
 	// bindTime converts a time.Time into the driver-facing bind value.
 	bindTime(t time.Time) any
 }
+
+// Built-in dialects: driver modules select one, and New and NewNative take it.
+var (
+	// Postgres renders $n placeholders, RETURNING, and ON CONFLICT (columns),
+	// and binds a typed key slice as one array parameter.
+	Postgres Dialect = postgresDialect{}
+	// MySQL renders ? placeholders and ON DUPLICATE KEY UPDATE; it has no
+	// RETURNING and no conflict target.
+	MySQL Dialect = mysqlDialect{}
+	// SQLite renders ? placeholders, RETURNING, and ON CONFLICT (columns);
+	// ForUpdate is elided because the whole database locks, times bind as
+	// sqliteTimeFormat text, and statements chunk under 999 parameters.
+	SQLite Dialect = sqliteDialect{}
+	// ClickHouse is append-only OLAP: no transactions, row locks, unique keys,
+	// or generated keys, and every argument interpolates client-side; see
+	// clickhouseDialect.caps for the exact surface.
+	ClickHouse Dialect = clickhouseDialect{}
+)
 
 // forUpdateMode is what a dialect does with Query.ForUpdate.
 type forUpdateMode uint8
@@ -53,20 +75,6 @@ type dialectCaps struct {
 	arrayBind bool
 }
 
-// Built-in dialects.
-var (
-	Postgres   Dialect = postgresDialect{}
-	MySQL      Dialect = mysqlDialect{}
-	SQLite     Dialect = sqliteDialect{}
-	ClickHouse Dialect = clickhouseDialect{}
-)
-
-// sqliteTimeFormat is rio's canonical SQLite time encoding: sortable text,
-// accepted by SQLite's date functions; values are already UTC (bindArg).
-const sqliteTimeFormat = "2006-01-02 15:04:05.999999+00:00"
-
-// --- PostgreSQL ---
-
 type postgresDialect struct{}
 
 func (postgresDialect) name() string             { return "postgres" }
@@ -96,8 +104,6 @@ func (postgresDialect) translate(err error) error {
 	return nil
 }
 
-// --- MySQL ---
-
 type mysqlDialect struct{}
 
 func (mysqlDialect) name() string             { return "mysql" }
@@ -121,8 +127,6 @@ func (mysqlDialect) translate(error) error {
 	// go-rio/mysql module installs the precise errno-based translator.
 	return nil
 }
-
-// --- SQLite ---
 
 type sqliteDialect struct{}
 
@@ -166,7 +170,7 @@ func (sqliteDialect) translate(err error) error {
 func quoteWith(b []byte, ident string, q byte) []byte {
 	b = append(b, q)
 	start := 0
-	for i := 0; i < len(ident); i++ {
+	for i := range len(ident) {
 		switch ident[i] {
 		case q: // double the quote character
 			b = append(b, ident[start:i+1]...)

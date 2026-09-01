@@ -9,6 +9,13 @@ import (
 	"time"
 )
 
+var plans sync.Map // reflect.Type → *plan | error
+
+var (
+	timeType    = reflect.TypeFor[time.Time]()
+	timePtrType = reflect.TypeFor[*time.Time]()
+)
+
 // TableNamer overrides the convention-derived table name for one model.
 type TableNamer interface {
 	TableName() string
@@ -32,9 +39,8 @@ type plan struct {
 	created   *field
 	updated   *field
 
-	// Precomputed insert partitions: every writable column (insAll), or every
-	// writable column but the auto-increment PK (insCols); the back lists are
-	// what RETURNING loads.
+	// Insert partitions: every writable column (insAll) or all but the
+	// auto-increment PK (insCols); the back lists are what RETURNING loads.
 	insAll, insAllBack []*field
 	insCols, insBack   []*field
 	insAllBits         uint64
@@ -46,90 +52,75 @@ type plan struct {
 	counts   map[string]countTarget // relation name → its int64 count field
 }
 
-// countTarget locates a countof field.
-type countTarget struct {
-	index  []int
-	offset uintptr
+func planOf[T any]() (*plan, error) {
+	return planFor(reflect.TypeFor[T]())
 }
 
-// field maps one struct field to one column.
-type field struct {
-	name    string
-	column  string
-	index   []int   // reflect traversal path (embedding)
-	offset  uintptr // cumulative offset — valid because only value embedding is allowed
-	ordinal int     // position in plan.fields, the bit in SQL-cache bitmaps
-	typ     reflect.Type
-
-	isPK, isAutoIncr, omitZero, jsonCol bool
-	isVersion, isSoftDelete             bool
-	isCreated, isUpdated                bool
-	noAutoIncr, readOnly                bool
-
-	code fieldCodec // scan/bind strategy, decided once at plan time
+// planFor returns t's cached plan; a model rejected once stays rejected with
+// the same error.
+func planFor(t reflect.Type) (*plan, error) {
+	if v, ok := plans.Load(t); ok {
+		if p, ok := v.(*plan); ok {
+			return p, nil
+		}
+		return nil, v.(error)
+	}
+	p, err := buildPlan(t)
+	if err != nil {
+		plans.LoadOrStore(t, err)
+		return nil, err
+	}
+	actual, _ := plans.LoadOrStore(t, p)
+	if p, ok := actual.(*plan); ok {
+		return p, nil
+	}
+	return nil, actual.(error)
 }
 
-// relField is a relation declaration. Resolution is deferred to first use:
-// eager resolution would recurse on mutually referencing models.
-type relField struct {
-	name   string
-	kind   relKind
-	index  []int
-	offset uintptr
-	target reflect.Type
-	proto  relContainer // zero container; regroup dispatches through it
+func buildPlan(t reflect.Type) (*plan, error) {
+	if t.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("rio: model must be a struct, got %s", t)
+	}
+	p := &plan{
+		typ:          t,
+		structName:   t.Name(),
+		defaultTable: TableName(t.Name()),
+		byColumn:     make(map[string]*field),
+		rels:         make(map[string]*relField),
+		counts:       make(map[string]countTarget),
+	}
+	if tn, ok := reflect.New(t).Interface().(TableNamer); ok {
+		p.tableOverride = tn.TableName()
+	}
 
-	fkTag, refTag, joinTag string
-
-	once     sync.Once
-	resolved *resolvedRel
-	rerr     error
+	var errs []error
+	if err := p.addFields(t); err != nil {
+		errs = append(errs, err)
+	}
+	for i, f := range p.fields {
+		f.ordinal = i
+		if f.isPK {
+			p.pks = append(p.pks, f)
+		}
+	}
+	errs = append(errs, p.classify()...)
+	if err := errors.Join(errs...); err != nil {
+		return nil, fmt.Errorf("rio: invalid model %s: %w", t.Name(), err)
+	}
+	// Only valid models register: a rejected shape must not poison the hint.
+	for name, rf := range p.rels {
+		registerRelFieldName(t.FieldByIndex(rf.index).Type, name)
+	}
+	return p, nil
 }
-
-// rawField is one struct field as collected before shadowing resolution:
-// every exported field and every anonymous embedded struct, at every depth.
-type rawField struct {
-	sf      reflect.StructField
-	owner   reflect.Type // declaring struct, for collision messages
-	index   []int
-	offset  uintptr
-	tag     string
-	opts    tagOpts
-	flatten bool // anonymous value struct that flattens rather than mapping
-}
-
-type tagOpts struct {
-	skip       bool
-	pk         bool
-	omitZero   bool
-	json       bool
-	version    bool
-	softDelete bool
-	noStamp    bool
-	noAutoIncr bool
-	readOnly   bool
-	fk, ref    string
-	join       string
-	countOf    string
-}
-
-var plans sync.Map // reflect.Type → *plan | error
-
-var (
-	timeType    = reflect.TypeFor[time.Time]()
-	timePtrType = reflect.TypeFor[*time.Time]()
-)
-
-func (r *rawField) depth() int { return len(r.index) - 1 }
 
 func (p *plan) addFields(t reflect.Type) error {
 	var errs []error
 	var raw []rawField
 	collectFields(t, nil, 0, &raw, &errs)
 
-	// Shadowing matches encoding/json: for one Go field name the shallowest
-	// declaration wins, even a rio:"-" or renamed one. Two at the same
-	// shallowest depth are a Go ambiguous selector; rio rejects them.
+	// Shadowing matches encoding/json: the shallowest declaration of a name
+	// wins, even a rio:"-" or renamed one; two at the same depth are rejected.
 	type nameState struct {
 		winner int // index into raw of the shallowest occurrence
 		clash  int // second occurrence at the same depth, -1 when unique
@@ -213,7 +204,8 @@ func (p *plan) addFields(t reflect.Type) error {
 			p.counts[opts.countOf] = countTarget{index: r.index, offset: r.offset}
 			continue
 		}
-		if opts.fk != "" || opts.ref != "" || opts.join != "" {
+		hasRelTag := opts.fk != "" || opts.ref != "" || opts.join != ""
+		if hasRelTag {
 			errs = append(errs, fmt.Errorf("field %s: fk/ref/join apply only to relation containers", sf.Name))
 			continue
 		}
@@ -249,7 +241,8 @@ func (p *plan) addFields(t reflect.Type) error {
 		if f.column == "" {
 			f.column = snakeCase(sf.Name)
 		}
-		if opts.readOnly && (opts.omitZero || opts.version || opts.softDelete) {
+		writeRole := opts.omitZero || opts.version || opts.softDelete
+		if opts.readOnly && writeRole {
 			errs = append(errs, fmt.Errorf("field %s: readonly cannot combine with omitzero, version, or softdelete", sf.Name))
 			continue
 		}
@@ -259,10 +252,11 @@ func (p *plan) addFields(t reflect.Type) error {
 		if opts.softDelete {
 			f.isSoftDelete = true
 		}
-		if !opts.noStamp && !opts.softDelete && !opts.version && !opts.readOnly &&
-			(sf.Type == timeType || sf.Type == timePtrType) {
-			// The CreatedAt/UpdatedAt convention is name-based; an explicit
-			// role tag wins. *time.Time is stamped too.
+		// The CreatedAt/UpdatedAt convention is name-based; an explicit role
+		// tag wins. *time.Time is stamped too.
+		stampable := !opts.noStamp && !opts.softDelete && !opts.version && !opts.readOnly
+		isTime := sf.Type == timeType || sf.Type == timePtrType
+		if stampable && isTime {
 			switch sf.Name {
 			case "CreatedAt":
 				f.isCreated = true
@@ -270,7 +264,8 @@ func (p *plan) addFields(t reflect.Type) error {
 				f.isUpdated = true
 			}
 		}
-		if sf.Name == "ID" && !opts.pk && !opts.json && !opts.version && !opts.softDelete {
+		roleFree := !opts.pk && !opts.json && !opts.version && !opts.softDelete
+		if sf.Name == "ID" && roleFree {
 			idConv = f
 		}
 		f.noAutoIncr = opts.noAutoIncr
@@ -359,9 +354,10 @@ func (p *plan) classify() []error {
 		errs = append(errs, errors.New("the version column cannot be part of the primary key"))
 	}
 	for _, f := range p.fields {
-		if f.isPK || f.isCreated || f.isVersion || f.isSoftDelete || f.readOnly {
-			// Softdelete stays out of updatable: a full-column Update would
-			// write deleted_at back to NULL and resurrect the row.
+		// Softdelete stays out of updatable: a full-column Update would
+		// write deleted_at back to NULL and resurrect the row.
+		pinned := f.isPK || f.isCreated || f.isVersion || f.isSoftDelete || f.readOnly
+		if pinned {
 			continue
 		}
 		p.updatable = append(p.updatable, f)
@@ -392,70 +388,81 @@ func (p *plan) classify() []error {
 	}
 	return errs
 }
-func planOf[T any]() (*plan, error) {
-	return planFor(reflect.TypeFor[T]())
+
+// countTarget locates a countof field.
+type countTarget struct {
+	index  []int
+	offset uintptr
 }
 
-func planFor(t reflect.Type) (*plan, error) {
-	if v, ok := plans.Load(t); ok {
-		if p, ok := v.(*plan); ok {
-			return p, nil
-		}
-		return nil, v.(error)
-	}
-	p, err := buildPlan(t)
-	if err != nil {
-		plans.LoadOrStore(t, err)
-		return nil, err
-	}
-	actual, _ := plans.LoadOrStore(t, p)
-	if p, ok := actual.(*plan); ok {
-		return p, nil
-	}
-	return nil, actual.(error)
+// field maps one struct field to one column.
+type field struct {
+	name    string
+	column  string
+	index   []int   // reflect traversal path (embedding)
+	offset  uintptr // cumulative offset — valid because only value embedding is allowed
+	ordinal int     // position in plan.fields, the bit in SQL-cache bitmaps
+	typ     reflect.Type
+
+	isPK, isAutoIncr, omitZero, jsonCol bool
+	isVersion, isSoftDelete             bool
+	isCreated, isUpdated                bool
+	noAutoIncr, readOnly                bool
+
+	code fieldCodec // scan/bind strategy, decided once at plan time
 }
 
-func buildPlan(t reflect.Type) (*plan, error) {
-	if t.Kind() != reflect.Struct {
-		return nil, fmt.Errorf("rio: model must be a struct, got %s", t)
-	}
-	p := &plan{
-		typ:          t,
-		structName:   t.Name(),
-		defaultTable: TableName(t.Name()),
-		byColumn:     make(map[string]*field),
-		rels:         make(map[string]*relField),
-		counts:       make(map[string]countTarget),
-	}
-	if tn, ok := reflect.New(t).Interface().(TableNamer); ok {
-		p.tableOverride = tn.TableName()
-	}
+// relField is a relation declaration. Resolution is deferred to first use:
+// eager resolution would recurse on mutually referencing models.
+type relField struct {
+	name   string
+	kind   relKind
+	index  []int
+	offset uintptr
+	target reflect.Type
+	proto  relContainer // zero container; regroup dispatches through it
 
-	var errs []error
-	if err := p.addFields(t); err != nil {
-		errs = append(errs, err)
-	}
-	for i, f := range p.fields {
-		f.ordinal = i
-		if f.isPK {
-			p.pks = append(p.pks, f)
-		}
-	}
-	errs = append(errs, p.classify()...)
-	if err := errors.Join(errs...); err != nil {
-		return nil, fmt.Errorf("rio: invalid model %s: %w", t.Name(), err)
-	}
-	// Only valid models register: a rejected shape must not poison the hint.
-	for name, rf := range p.rels {
-		registerRelFieldName(t.FieldByIndex(rf.index).Type, name)
-	}
-	return p, nil
+	fkTag, refTag, joinTag string
+
+	once     sync.Once
+	resolved *resolvedRel
+	rerr     error
+}
+
+// rawField is one struct field as collected before shadowing resolution:
+// every exported field and every anonymous embedded struct, at every depth.
+type rawField struct {
+	sf      reflect.StructField
+	owner   reflect.Type // declaring struct, for collision messages
+	index   []int
+	offset  uintptr
+	tag     string
+	opts    tagOpts
+	flatten bool // anonymous value struct that flattens rather than mapping
+}
+
+func (r *rawField) depth() int { return len(r.index) - 1 }
+
+// tagOpts is the parsed option set of one rio tag.
+type tagOpts struct {
+	skip       bool
+	pk         bool
+	omitZero   bool
+	json       bool
+	version    bool
+	softDelete bool
+	noStamp    bool
+	noAutoIncr bool
+	readOnly   bool
+	fk, ref    string
+	join       string
+	countOf    string
 }
 
 // collectFields gathers the raw field set depth-first; only tag syntax
 // errors are reported here — the rest waits for shadowing resolution.
 func collectFields(t reflect.Type, prefix []int, baseOffset uintptr, raw *[]rawField, errs *[]error) {
-	for i := 0; i < t.NumField(); i++ {
+	for i := range t.NumField() {
 		sf := t.Field(i)
 		if !sf.IsExported() {
 			// Unexported embedded structs still promote exported fields (as
@@ -472,14 +479,19 @@ func collectFields(t reflect.Type, prefix []int, baseOffset uintptr, raw *[]rawF
 			continue
 		}
 		index := append(append([]int(nil), prefix...), i)
+		// Anonymous value structs flatten unless a tag makes them a column;
+		// the field still shadows, and is shadowed, by its Go name.
+		mapsNoColumn := !opts.skip && tag == "" && !opts.json
+		plainStruct := sf.Type.Kind() == reflect.Struct && sf.Type != timeType && !isRelContainer(sf.Type)
 		r := rawField{
-			sf: sf, owner: t, index: index, offset: baseOffset + sf.Offset,
-			tag: tag, opts: opts,
-
-			// Anonymous value structs flatten unless a tag makes them a column;
-			// the field still shadows, and is shadowed, by its Go name.
-			flatten: sf.Anonymous && !opts.skip && tag == "" && !opts.json &&
-				sf.Type.Kind() == reflect.Struct && sf.Type != timeType && !isRelContainer(sf.Type)}
+			sf:      sf,
+			owner:   t,
+			index:   index,
+			offset:  baseOffset + sf.Offset,
+			tag:     tag,
+			opts:    opts,
+			flatten: sf.Anonymous && mapsNoColumn && plainStruct,
+		}
 		*raw = append(*raw, r)
 		if r.flatten {
 			collectFields(sf.Type, index, r.offset, raw, errs)
