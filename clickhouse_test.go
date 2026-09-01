@@ -725,8 +725,6 @@ func TestClickHouseQuoteEscapesBackticksAndBackslashes(t *testing.T) {
 
 // --- time binding ---
 
-// Times pass through untouched so the driver renders them; normalization
-// still folds zoned inputs onto the same UTC instant.
 func TestClickHouseTimeBindsPassThrough(t *testing.T) {
 	at := time.Date(2024, 1, 2, 3, 4, 5, 123456789, time.UTC)
 	bound := ClickHouse.bindTime(normalizeTime(at)).(time.Time)

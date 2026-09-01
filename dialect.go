@@ -171,9 +171,8 @@ func (clickhouseDialect) name() string      { return "clickhouse" }
 func (clickhouseDialect) lexer() lexProfile { return chLex }
 func (clickhouseDialect) style() bindStyle  { return bindQuestionEsc }
 
-// Times pass through: the driver renders them as epoch-microsecond function
-// expressions, which — unlike offset-carrying text — the primary-key range
-// analyzer accepts.
+// Times pass through; the driver renders the epoch-microsecond form the
+// primary-key range analyzer accepts.
 func (clickhouseDialect) bindTime(t time.Time) any { return t }
 
 func (clickhouseDialect) caps() dialectCaps {
