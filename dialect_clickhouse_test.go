@@ -14,8 +14,6 @@ import (
 // This file freezes the ClickHouse dialect's public behavior: golden SQL for
 // the supported surface, exact rejection messages with proof no SQL was sent.
 
-
-
 // --- supported surface: golden SQL ---
 
 func TestClickHouseSelectGolden(t *testing.T) {
