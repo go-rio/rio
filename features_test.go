@@ -702,12 +702,31 @@ func TestForUpdateCapability(t *testing.T) {
 		t.Fatalf("pg: %s", fpg.logged()[0])
 	}
 
+	fpg.queueRows(userCols)
+	_, _ = From[User]().Where("id = ?", 1).ForUpdate(SkipLocked).All(ctx, pg)
+	if !strings.HasSuffix(fpg.logged()[1], " FOR UPDATE SKIP LOCKED") {
+		t.Fatalf("pg skip locked: %s", fpg.logged()[1])
+	}
+	fpg.queueRows(userCols)
+	_, _ = From[User]().Where("id = ?", 1).ForShare(NoWait).All(ctx, pg)
+	if !strings.HasSuffix(fpg.logged()[2], " FOR SHARE NOWAIT") {
+		t.Fatalf("pg share nowait: %s", fpg.logged()[2])
+	}
+
+	fmy := newFakeDB()
+	my := fmy.open(MySQL)
+	fmy.queueRows(userCols)
+	_, _ = From[User]().Where("id = ?", 1).ForShare(SkipLocked).All(ctx, my)
+	if !strings.HasSuffix(fmy.logged()[0], " FOR SHARE SKIP LOCKED") {
+		t.Fatalf("mysql: %s", fmy.logged()[0])
+	}
+
 	flite := newFakeDB()
 	lite := flite.open(SQLite)
 	flite.queueRows(userCols)
-	_, _ = From[User]().Where("id = ?", 1).ForUpdate().All(ctx, lite)
-	if strings.Contains(flite.logged()[0], "FOR UPDATE") {
-		t.Fatalf("sqlite locks the whole db, FOR UPDATE must be a no-op: %s", flite.logged()[0])
+	_, _ = From[User]().Where("id = ?", 1).ForUpdate(NoWait).All(ctx, lite)
+	if strings.Contains(flite.logged()[0], "FOR ") {
+		t.Fatalf("sqlite locks the whole db, row locks must be a no-op: %s", flite.logged()[0])
 	}
 }
 
@@ -1271,6 +1290,61 @@ func TestWithCount(t *testing.T) {
 	}
 }
 
+// A filtered count queries on its own even when the relation is preloaded.
+func TestWithCountFiltered(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
+	f.queueRows([]string{"id", "board_id"}, []driver.Value{int64(10), int64(1)})
+	f.queueRows([]string{"board_id", "count"}, []driver.Value{int64(1), int64(2)})
+
+	boards, err := From[Board]().With("Posts").WithCount("Posts", RelWhere("published = ?", true)).All(ctx, db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	want := `SELECT "board_posts"."board_id", count(*) FROM "board_posts" WHERE "board_posts"."board_id" = ANY($1) AND (published = $2) GROUP BY "board_posts"."board_id"`
+	counts := f.loggedContaining("count(*)")
+	if len(counts) != 1 || counts[0].sql != want || counts[0].args[1] != true {
+		t.Fatalf("filtered count:\n%+v", counts)
+	}
+	if boards[0].PostsCount != 2 || len(boards[0].Posts.Rows()) != 1 {
+		t.Fatalf("filtered count is not the preload's length: %+v", boards[0])
+	}
+	err = From[Board]().WithCount("Posts", RelLimit(1)).Validate()
+	if err == nil || !strings.Contains(err.Error(), "RelWhere and RelWithTrashed only") {
+		t.Fatalf("WithCount with RelLimit: %v", err)
+	}
+}
+
+// Relation options are evaluated at build time, so Must caches the main
+// shape with them present; WhereHas leaf arguments bind inline after Where.
+func TestMustCachesOptionedRelations(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	q := From[User]().Where("id = ?").
+		With("Posts", RelWhere("title <> ?", "draft")).
+		WhereHas("Posts", RelWhere("title = ?", "pinned")).
+		Must()
+	for _, id := range []int64{1, 2} {
+		f.queueRows(userCols, userRow(id, "a@x"))
+		f.queueRows(postCols)
+		if _, err := q.All(ctx, db, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries := 0
+	q.cache.entries.Range(func(_, _ any) bool { entries++; return true })
+	if entries != 1 {
+		t.Fatalf("cache entries = %d, want 1", entries)
+	}
+	mains := f.loggedContaining(`FROM "users"`)
+	if len(mains) != 2 || mains[0].sql != mains[1].sql || mains[1].args[0] != int64(2) || mains[1].args[1] != "pinned" {
+		t.Fatalf("cached shape must rebind deferred and inline args: %+v", mains)
+	}
+}
+
 func TestWithCountReusesFullPreload(t *testing.T) {
 	f := newFakeDB()
 	db := f.open(SQLite)
@@ -1304,7 +1378,7 @@ func TestWithCountReusesOrderedPreload(t *testing.T) {
 	)
 
 	boards, err := From[Board]().
-		With("Posts", RelOrder("id DESC")).
+		With("Posts", RelOrderBy("id DESC")).
 		WithCount("Posts").
 		All(context.Background(), db)
 	if err != nil {
@@ -1329,20 +1403,20 @@ func TestRelOptionsChangeCount(t *testing.T) {
 		want bool
 	}{
 		{name: "none"},
-		{name: "order", opts: []RelOption{RelOrder("id")}},
+		{name: "order", opts: []RelOption{RelOrderBy("id")}},
 		{name: "where", opts: []RelOption{RelWhere("id > ?", 1)}, want: true},
 		{name: "limit", opts: []RelOption{RelLimit(1)}, want: true},
 		{name: "with trashed", opts: []RelOption{RelWithTrashed()}, want: true},
 		{
 			name: "order and where",
-			opts: []RelOption{RelOrder("id"), RelWhere("id > ?", 1)},
+			opts: []RelOption{RelOrderBy("id"), RelWhere("id > ?", 1)},
 			want: true,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := relOptionsChangeCount(tc.opts); got != tc.want {
-				t.Fatalf("relOptionsChangeCount() = %t, want %t", got, tc.want)
+			if got := relOptions(tc.opts).changesCount; got != tc.want {
+				t.Fatalf("relOptions().changesCount = %t, want %t", got, tc.want)
 			}
 		})
 	}
@@ -1412,7 +1486,7 @@ func TestRelLimitWindowQuery(t *testing.T) {
 		[]driver.Value{int64(11), int64(1), "second"},
 	)
 
-	users, err := From[User]().With("Posts", RelOrder("id DESC"), RelLimit(2)).All(ctx, db)
+	users, err := From[User]().With("Posts", RelOrderBy("id DESC"), RelLimit(2)).All(ctx, db)
 	if err != nil {
 		t.Fatalf("All: %v", err)
 	}
@@ -2949,14 +3023,14 @@ func TestWithCountEmptyNameErrors(t *testing.T) {
 	}
 }
 
-// The windowed preload carries an outer ORDER BY so RelOrder survives.
+// The windowed preload carries an outer ORDER BY so RelOrderBy survives.
 func TestRelLimitOuterOrderBy(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
 	db := f.open()
 	f.queueRows(userCols, userRow(1, "a@x"))
 	f.queueRows(postCols, []driver.Value{int64(10), int64(1), "t"})
-	_, err := From[User]().With("Posts", RelOrder("id DESC"), RelLimit(2)).All(ctx, db)
+	_, err := From[User]().With("Posts", RelOrderBy("id DESC"), RelLimit(2)).All(ctx, db)
 	if err != nil {
 		t.Fatalf("All: %v", err)
 	}

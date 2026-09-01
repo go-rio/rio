@@ -167,7 +167,7 @@ func runSuite(t *testing.T, db *rio.DB, dialect string) {
 			t.Fatalf("post: %v", err)
 		}
 	}
-	users, err := rio.From[User]().With("Posts", rio.RelOrder("id")).All(ctx, db)
+	users, err := rio.From[User]().With("Posts", rio.RelOrderBy("id")).All(ctx, db)
 	if err != nil {
 		t.Fatalf("preload: %v", err)
 	}
@@ -320,7 +320,7 @@ func runV02Suite(t *testing.T, db *rio.DB, dialect string) {
 
 	// RelLimit with deterministic order.
 	limited, err := rio.From[Author]().Where("id = ?", alice.ID).
-		With("Articles", rio.RelOrder("score DESC"), rio.RelLimit(2)).All(ctx, db)
+		With("Articles", rio.RelOrderBy("score DESC"), rio.RelLimit(2)).All(ctx, db)
 	if err != nil {
 		t.Fatalf("RelLimit: %v", err)
 	}
@@ -343,7 +343,7 @@ func runV02Suite(t *testing.T, db *rio.DB, dialect string) {
 	if err := rio.Attach(ctx, db, alice, "Topics", golang.ID); err != nil {
 		t.Fatalf("Attach must be idempotent: %v", err)
 	}
-	tagged, err := rio.From[Author]().With("Topics", rio.RelOrder("name")).Where("id = ?", alice.ID).All(ctx, db)
+	tagged, err := rio.From[Author]().With("Topics", rio.RelOrderBy("name")).Where("id = ?", alice.ID).All(ctx, db)
 	if err != nil || len(tagged[0].Topics.Rows()) != 2 {
 		t.Fatalf("attach round-trip: %v %+v", err, tagged)
 	}

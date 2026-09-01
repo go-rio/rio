@@ -104,17 +104,31 @@ func maxPlaceholderCount(expr string) int {
 }
 
 func validateRelOptions(p *plan, s *queryState) error {
-	for _, spec := range s.withs {
-		if err := validateRelOptionSet(p, "With", spec.path, spec.opts); err != nil {
+	for i := range s.withs {
+		if err := validateRelOptionSet(p, "With", s.withs[i].path, &s.withs[i].rq); err != nil {
 			return err
 		}
 	}
-	for _, hc := range s.hasConds {
+	for i := range s.hasConds {
+		hc := &s.hasConds[i]
 		clause := "WhereHas"
 		if hc.isNegated {
 			clause = "WhereHasNot"
 		}
-		if err := validateRelOptionSet(p, clause, hc.path, hc.opts); err != nil {
+		if err := validateRelOptionSet(p, clause, hc.path, &hc.rq); err != nil {
+			return err
+		}
+	}
+	for i := range s.counts {
+		c := &s.counts[i]
+		if len(c.rq.orders) > 0 || c.rq.limitSet {
+			return fmt.Errorf(
+				"rio: Validate[%s]: WithCount(%q) takes RelWhere and RelWithTrashed only; order and limit do not change a count",
+				p.structName,
+				c.relation,
+			)
+		}
+		if err := validateRelOptionSet(p, "WithCount", c.relation, &c.rq); err != nil {
 			return err
 		}
 	}
@@ -123,11 +137,7 @@ func validateRelOptions(p *plan, s *queryState) error {
 
 // Relation options require inline arguments because they execute separately
 // or inside a nested query with explicit argument order.
-func validateRelOptionSet(p *plan, clause, path string, opts []RelOption) error {
-	var rq relQuery
-	for _, opt := range opts {
-		opt(&rq)
-	}
+func validateRelOptionSet(p *plan, clause, path string, rq *relQuery) error {
 	for _, w := range rq.wheres {
 		pg, my, sqlite, clickhouse := placeholderCounts(w.expr)
 		if pg != my || my != sqlite || sqlite != clickhouse {
@@ -155,7 +165,7 @@ func validateRelOptionSet(p *plan, clause, path string, opts []RelOption) error 
 	for _, order := range rq.orders {
 		if holes := maxPlaceholderCount(order); holes > 0 {
 			return fmt.Errorf(
-				"rio: Validate[%s]: %s(%q) RelOrder(%q) contains %d placeholder(s), but RelOrder has no argument channel",
+				"rio: Validate[%s]: %s(%q) RelOrderBy(%q) contains %d placeholder(s), but RelOrderBy has no argument channel",
 				p.structName,
 				clause,
 				path,
@@ -218,8 +228,9 @@ func validateRelationPath(p *plan, path string) error {
 	return nil
 }
 
-func validateCounts(p *plan, counts []string) error {
-	for _, name := range counts {
+func validateCounts(p *plan, counts []countSpec) error {
+	for _, c := range counts {
+		name := c.relation
 		rel, ok := p.rels[name]
 		if !ok {
 			return fmt.Errorf("rio: %s has no relation %q", p.structName, name)

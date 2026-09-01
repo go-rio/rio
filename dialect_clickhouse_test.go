@@ -223,7 +223,7 @@ func TestClickHouseRelLimitWindowGolden(t *testing.T) {
 	f.queueRows(userCols, userRow(1, "a@x"))
 	f.queueRows(postCols, []driver.Value{int64(10), int64(1), "first"})
 
-	_, err := From[User]().With("Posts", RelOrder("id DESC"), RelLimit(1)).All(ctx, db)
+	_, err := From[User]().With("Posts", RelOrderBy("id DESC"), RelLimit(1)).All(ctx, db)
 	if err != nil {
 		t.Fatalf("All: %v", err)
 	}
@@ -519,8 +519,8 @@ func TestCapabilityRejectionsAreErrUnsupported(t *testing.T) {
 
 func TestClickHouseForUpdateRejected(t *testing.T) {
 	ctx := context.Background()
-	const want = "rio: ForUpdate is not supported on clickhouse (no row locks); " +
-		"remove it — reads there are lock-free snapshots"
+	const want = "rio: row locks are not supported on clickhouse; " +
+		"remove ForUpdate/ForShare — reads there are lock-free snapshots"
 
 	f := newFakeDB()
 	db := f.open(ClickHouse)

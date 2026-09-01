@@ -246,8 +246,8 @@ func checkSetOpShape(op string, s *queryState) error {
 	if len(s.withs) > 0 || len(s.counts) > 0 {
 		return fmt.Errorf("rio: %s cannot honor With/WithCount (a set-based write returns no entities to load into); drop them", op)
 	}
-	if s.forUpdate {
-		return fmt.Errorf("rio: %s cannot honor ForUpdate (the write takes its own row locks); drop it", op)
+	if s.lock != lockNone {
+		return fmt.Errorf("rio: %s cannot honor ForUpdate/ForShare (the write takes its own row locks); drop it", op)
 	}
 	if s.final {
 		return fmt.Errorf("rio: %s cannot honor Final (FINAL modifies reads, and ClickHouse rejects set-based writes anyway); drop it", op)

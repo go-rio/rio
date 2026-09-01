@@ -180,7 +180,7 @@ func TestPreloadRelOptions(t *testing.T) {
 	f.queueRows(postCols)
 
 	_, err := From[User]().
-		With("Posts", RelWhere("title <> ?", ""), RelOrder("id DESC")).
+		With("Posts", RelWhere("title <> ?", ""), RelOrderBy("id DESC")).
 		All(context.Background(), db)
 	if err != nil {
 		t.Fatalf("All: %v", err)

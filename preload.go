@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"reflect"
-	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -27,10 +26,16 @@ type resolvedRel struct {
 	joinFK, joinRef string // join-table columns: owner side, target side
 }
 
-// preloadSpec is one With() request: a dot path plus leaf options.
+// preloadSpec is one With() request: a dot path plus its leaf options.
 type preloadSpec struct {
 	path string
-	opts []RelOption
+	rq   relQuery
+}
+
+// countSpec is one WithCount() request.
+type countSpec struct {
+	relation string
+	rq       relQuery
 }
 
 // RelOption customizes how one preloaded relation is fetched.
@@ -45,6 +50,26 @@ type relQuery struct {
 	changesCount bool
 }
 
+// relOptions evaluates opts once, at build time.
+func relOptions(opts []RelOption) relQuery {
+	var rq relQuery
+	for _, opt := range opts {
+		opt(&rq)
+	}
+	return rq
+}
+
+// merge folds another request for the same relation into rq.
+func (rq *relQuery) merge(o *relQuery) {
+	rq.wheres = append(rq.wheres, o.wheres...)
+	rq.orders = append(rq.orders, o.orders...)
+	rq.withTrashed = rq.withTrashed || o.withTrashed
+	if o.limitSet {
+		rq.limit, rq.limitSet = o.limit, true
+	}
+	rq.changesCount = rq.changesCount || o.changesCount
+}
+
 // RelWhere restricts the preloaded rows. The condition runs inside the
 // preload's own query, so it can only reference the related table's columns.
 // The expression is included verbatim; never build it from untrusted input.
@@ -55,9 +80,9 @@ func RelWhere(expr string, args ...any) RelOption {
 	}
 }
 
-// RelOrder orders the preloaded rows before they are grouped per parent.
+// RelOrderBy orders the preloaded rows before they are grouped per parent.
 // The term is included verbatim; never build it from untrusted input.
-func RelOrder(expr string) RelOption {
+func RelOrderBy(expr string) RelOption {
 	return func(rq *relQuery) { rq.orders = append(rq.orders, expr) }
 }
 
@@ -71,7 +96,7 @@ func RelWithTrashed() RelOption {
 }
 
 // RelLimit caps the preloaded rows per parent, not overall. Order within
-// each parent follows RelOrder, defaulting to the target's primary key.
+// each parent follows RelOrderBy, defaulting to the target's primary key.
 // Requires window functions (PostgreSQL, MySQL 8+, SQLite 3.25+).
 // RelLimit(0) loads no children, not all of them.
 func RelLimit(n int) RelOption {
@@ -243,7 +268,7 @@ func collectRelationLayer(
 		return stmts, finishes, nil
 	}
 	type group struct {
-		opts  []RelOption
+		rq    relQuery
 		tails []preloadSpec
 	}
 	groups := make(map[string]*group, len(specs))
@@ -257,9 +282,9 @@ func collectRelationLayer(
 			order = append(order, head)
 		}
 		if tail == "" {
-			g.opts = append(g.opts, s.opts...)
+			g.rq.merge(&s.rq)
 		} else {
-			g.tails = append(g.tails, preloadSpec{path: tail, opts: s.opts})
+			g.tails = append(g.tails, preloadSpec{path: tail, rq: s.rq})
 		}
 	}
 	sort.Strings(order) // deterministic query order run to run
@@ -278,7 +303,7 @@ func collectRelationLayer(
 		g := groups[head]
 		var l relFinisher
 		var err error
-		stmts, l, err = prepareRelationLoad(db, p, rel, rows, g.opts, g.tails, stmts)
+		stmts, l, err = prepareRelationLoad(db, p, rel, rows, &g.rq, g.tails, stmts)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -519,7 +544,7 @@ func prepareRelationLoad(
 	owner *plan,
 	rel *relField,
 	owners reflect.Value,
-	opts []RelOption,
+	rq *relQuery,
 	tails []preloadSpec,
 	stmts []relStatement,
 ) ([]relStatement, relFinisher, error) {
@@ -537,30 +562,25 @@ func prepareRelationLoad(
 	base := relLoadBase{db: db, owner: owner, rel: rel, res: res, owners: owners, tails: tails}
 	switch relKeyFam(res.ref.typ, res.fk.typ) {
 	case kfInt:
-		return prepareRel[int64, intKeyer](base, opts, stmts)
+		return prepareRel[int64, intKeyer](base, rq, stmts)
 	case kfUint:
-		return prepareRel[uint64, uintKeyer](base, opts, stmts)
+		return prepareRel[uint64, uintKeyer](base, rq, stmts)
 	case kfStr:
-		return prepareRel[string, strKeyer](base, opts, stmts)
+		return prepareRel[string, strKeyer](base, rq, stmts)
 	default:
-		return prepareRel[any, anyKeyer](base, opts, stmts)
+		return prepareRel[any, anyKeyer](base, rq, stmts)
 	}
 }
 
 // prepareRel instantiates the load in its key space.
-func prepareRel[K comparable, KR keyer[K]](base relLoadBase, opts []RelOption, stmts []relStatement) ([]relStatement, relFinisher, error) {
+func prepareRel[K comparable, KR keyer[K]](base relLoadBase, rq *relQuery, stmts []relStatement) ([]relStatement, relFinisher, error) {
 	l := &relLoad[K, KR]{relLoadBase: base}
-	stmts, err := l.prepare(opts, stmts)
+	stmts, err := l.prepare(rq, stmts)
 	return stmts, l, err
 }
 
 // prepare renders the relation's chunked preload statements onto stmts.
-func (l *relLoad[K, KR]) prepare(opts []RelOption, stmts []relStatement) ([]relStatement, error) {
-	var rq relQuery
-	for _, opt := range opts {
-		opt(&rq)
-	}
-
+func (l *relLoad[K, KR]) prepare(rq *relQuery, stmts []relStatement) ([]relStatement, error) {
 	// Typed keys group; the IN (?) binds the canonical value, whose family
 	// matches the column's.
 	owners := l.owners
@@ -629,7 +649,7 @@ func (l *relLoad[K, KR]) prepare(opts []RelOption, stmts []relStatement) ([]relS
 			if array {
 				bindChunk = arrayParam{bindChunk}
 			}
-			sqlText, args, keyed, err := renderRelSelect(l.db.gram(), l.res, l.rel.kind, bindChunk, &rq)
+			sqlText, args, keyed, err := renderRelSelect(l.db.gram(), l.res, l.rel.kind, bindChunk, rq)
 			if err != nil {
 				return nil, err
 			}
@@ -1003,7 +1023,7 @@ func renderRelSelectLimited(
 	b = append(b, " <= "...)
 	b = strconv.AppendInt(b, int64(rq.limit), 10)
 	// The inner ORDER BY only decides which rows survive; without this outer
-	// ORDER BY (partition, then row number) the RelOrder order is lost.
+	// ORDER BY (partition, then row number) the RelOrderBy order is lost.
 	b = append(b, " ORDER BY "...)
 	if keyed {
 		b = d.quote(b, "rio_w")
@@ -1023,17 +1043,10 @@ func renderRelSelectLimited(
 	return sqlText, outArgs, keyed, err
 }
 
-func relOptionsChangeCount(opts []RelOption) bool {
-	var rq relQuery
-	for _, opt := range opts {
-		opt(&rq)
-	}
-	return rq.changesCount
-}
-
-// splitCounts partitions WithCount targets: a relation the same query fully
-// preloads reads its count off the loaded containers; the rest query.
-func splitCounts(p *plan, specs []preloadSpec, counts []string) (queried, reusable []string) {
+// splitCounts partitions WithCount targets: an unfiltered count of a relation
+// the same query fully preloads reads off the loaded containers; the rest
+// query.
+func splitCounts(p *plan, specs []preloadSpec, counts []countSpec) (queried []countSpec, reusable []string) {
 	if len(counts) == 0 {
 		return nil, nil
 	}
@@ -1043,21 +1056,23 @@ func splitCounts(p *plan, specs []preloadSpec, counts []string) (queried, reusab
 		if _, seen := full[head]; !seen {
 			full[head] = true
 		}
-		if tail == "" && relOptionsChangeCount(spec.opts) {
+		if tail == "" && spec.rq.changesCount {
 			full[head] = false
 		}
 	}
-	for _, name := range counts {
-		if slices.Contains(queried, name) || slices.Contains(reusable, name) {
+	seen := make(map[string]bool, len(counts))
+	for _, c := range counts {
+		if seen[c.relation] {
 			continue
 		}
-		rel, ok := p.rels[name]
-		_, hasTarget := p.counts[name]
+		seen[c.relation] = true
+		rel, ok := p.rels[c.relation]
+		_, hasTarget := p.counts[c.relation]
 		countable := ok && hasTarget && (rel.kind == relHasMany || rel.kind == relManyToMany)
-		if full[name] && countable {
-			reusable = append(reusable, name)
+		if full[c.relation] && countable && !c.rq.changesCount {
+			reusable = append(reusable, c.relation)
 		} else {
-			queried = append(queried, name)
+			queried = append(queried, c)
 		}
 	}
 	return queried, reusable
@@ -1069,7 +1084,7 @@ func prepareCountLoads(
 	db Queryer,
 	p *plan,
 	rows reflect.Value,
-	counts []string,
+	counts []countSpec,
 	stmts []relStatement,
 	finishes []relFinisher,
 ) ([]relStatement, []relFinisher, error) {
@@ -1077,10 +1092,10 @@ func prepareCountLoads(
 		return stmts, finishes, nil
 	}
 	// counts arrives deduplicated by splitCounts.
-	for _, name := range counts {
+	for i := range counts {
 		var l relFinisher
 		var err error
-		stmts, l, err = prepareCountLoad(db, p, name, rows, stmts)
+		stmts, l, err = prepareCountLoad(db, p, &counts[i], rows, stmts)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1096,6 +1111,7 @@ type countLoadBase struct {
 	db     Queryer
 	res    *resolvedRel
 	kind   relKind
+	rq     *relQuery
 	target countTarget
 	owners reflect.Value
 }
@@ -1133,10 +1149,11 @@ func (l *countLoad[K, KR]) finish(context.Context) error {
 func prepareCountLoad(
 	db Queryer,
 	owner *plan,
-	name string,
+	spec *countSpec,
 	owners reflect.Value,
 	stmts []relStatement,
 ) ([]relStatement, relFinisher, error) {
+	name := spec.relation
 	rel, ok := owner.rels[name]
 	if !ok {
 		return nil, nil, fmt.Errorf("rio: %s has no relation %q", owner.structName, name)
@@ -1161,7 +1178,7 @@ func prepareCountLoad(
 	if err != nil {
 		return nil, nil, err
 	}
-	base := countLoadBase{db: db, res: res, kind: rel.kind, target: target, owners: owners}
+	base := countLoadBase{db: db, res: res, kind: rel.kind, rq: &spec.rq, target: target, owners: owners}
 	switch relKeyFam(res.ref.typ) {
 	case kfInt:
 		return prepareCount[int64, intKeyer](base, stmts)
@@ -1235,7 +1252,7 @@ func (l *countLoad[K, KR]) prepare(stmts []relStatement) ([]relStatement, error)
 			b = d.quote(b, res.joinTable)
 			b = append(b, '.')
 			b = d.quote(b, res.joinRef)
-			if res.target.softDel != nil {
+			if res.target.softDel != nil && !l.rq.withTrashed {
 				b = append(b, " AND "...)
 				b = d.quote(b, g.table(res.target))
 				b = append(b, '.')
@@ -1268,12 +1285,18 @@ func (l *countLoad[K, KR]) prepare(stmts []relStatement) ([]relStatement, error)
 		}
 		b = appendKeySet(b, bindChunk)
 		args := []any{bindChunk}
-		if kind != relManyToMany && res.target.softDel != nil {
+		if kind != relManyToMany && res.target.softDel != nil && !l.rq.withTrashed {
 			b = append(b, " AND "...)
 			b = d.quote(b, g.table(res.target))
 			b = append(b, '.')
 			b = d.quote(b, res.target.softDel.column)
 			b = append(b, " IS NULL"...)
+		}
+		for _, w := range l.rq.wheres {
+			b = append(b, " AND ("...)
+			b = append(b, w.expr...)
+			b = append(b, ')')
+			args = append(args, w.args...)
 		}
 		b = append(b, " GROUP BY "...)
 		if kind == relManyToMany {

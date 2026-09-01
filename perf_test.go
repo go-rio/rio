@@ -996,7 +996,7 @@ func BenchmarkPreloadManyToMany(b *testing.B) {
 
 func BenchmarkPreloadRelLimit(b *testing.B) {
 	db := (&loopDB{sets: []fakeRows{benchOwnerRows(100), benchChildRows("bench_owner_id", "title", 100, 5)}}).open(SQLite)
-	q := From[benchOwner]().With("Posts", RelLimit(5), RelOrder("id"))
+	q := From[benchOwner]().With("Posts", RelLimit(5), RelOrderBy("id"))
 	ctx := context.Background()
 	b.ReportAllocs()
 	for b.Loop() {

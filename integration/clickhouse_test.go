@@ -352,9 +352,9 @@ func TestClickHouseSuite(t *testing.T) {
 	chExec(t, ctx, db, "INSERT INTO writer_subjects VALUES (1, 1), (1, 2)")
 
 	writers, err := rio.From[Writer]().OrderBy("id").
-		With("Posts", rio.RelOrder("score DESC"), rio.RelLimit(2)).
+		With("Posts", rio.RelOrderBy("score DESC"), rio.RelLimit(2)).
 		With("Bio").
-		With("Topics", rio.RelOrder("name")).
+		With("Topics", rio.RelOrderBy("name")).
 		WithCount("Posts").
 		All(ctx, db)
 	if err != nil {
@@ -362,7 +362,7 @@ func TestClickHouseSuite(t *testing.T) {
 	}
 	a := writers[0]
 	if got := a.Posts.Rows(); len(got) != 2 || got[0].Title != "three" || got[1].Title != "two" {
-		t.Fatalf("HasMany + RelLimit + RelOrder: %+v", got)
+		t.Fatalf("HasMany + RelLimit + RelOrderBy: %+v", got)
 	}
 	if bio := a.Bio.Row(); bio == nil || bio.Text != "hi" {
 		t.Fatalf("HasOne: %+v", bio)

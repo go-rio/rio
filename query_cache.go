@@ -22,6 +22,7 @@ const (
 	queryCacheCount
 	queryCacheExists
 	queryCachePluck
+	queryCacheAggregate
 )
 
 // queryCacheKey identifies one rendered shape. The grammar is held weakly so
@@ -209,15 +210,12 @@ func newCachedQuery(
 	if !conditions("Where", s.wheres) {
 		return nil, false
 	}
-	for _, hc := range s.hasConds {
-		// A RelOption may derive a different query on each call.
-		if len(hc.opts) != 0 {
-			return nil, false
-		}
-	}
-	for _, spec := range s.withs {
-		if len(spec.opts) != 0 {
-			return nil, false
+	// WhereHas leaf conditions bind inline, in render order after Where.
+	for i := range s.hasConds {
+		for _, w := range s.hasConds[i].rq.wheres {
+			if !staticArgs(w.args) {
+				return nil, false
+			}
 		}
 	}
 	if !conditions("Having", s.havings) {

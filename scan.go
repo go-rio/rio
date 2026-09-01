@@ -1046,6 +1046,10 @@ func finishRows(rows rows, finish func(error, int64), err error, returned int64)
 	return err
 }
 
+// defaultScanCap seeds result slices whose size is unknown: growth from one
+// element costs four extra allocations before a hundred rows.
+const defaultScanCap = 16
+
 func scanAllN[T any](rows rows, p *plan, byName bool, maxRows int) (out []T, err error) {
 	return scanAllCap[T](rows, p, byName, maxRows, maxRows)
 }
@@ -1063,7 +1067,7 @@ func scanAllCap[T any](rows rows, p *plan, byName bool, maxRows, capacity int) (
 	}
 	rs := newRowScanner(fields, nil)
 	defer rs.release()
-	out = make([]T, 0, capacity)
+	out = make([]T, 0, max(capacity, defaultScanCap))
 	for (maxRows <= 0 || len(out) < maxRows) && rows.Next() {
 		out = append(out, *new(T))
 		if err := rs.scan(rows, unsafe.Pointer(&out[len(out)-1])); err != nil {
@@ -1093,7 +1097,7 @@ func scanScalarsCap[T any](rows rows, maxRows, capacity int) (out []T, err error
 	}
 	box.cell = colScanner{f: f}
 	box.dest[0] = &box.cell
-	out = make([]T, 0, capacity)
+	out = make([]T, 0, max(capacity, defaultScanCap))
 	for (maxRows <= 0 || len(out) < maxRows) && rows.Next() {
 		out = append(out, *new(T))
 		box.cell.base = unsafe.Pointer(&out[len(out)-1])

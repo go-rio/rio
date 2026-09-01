@@ -34,9 +34,9 @@ func TestQueryValidateRelationOptions(t *testing.T) {
 		{"With RelWhere missing arg", From[User]().With("Posts", RelWhere("title = ?")), "must bind inline"},
 		{"WhereHas RelWhere excess arg", From[User]().WhereHas("Posts", RelWhere("active", true)), "must bind inline"},
 		{
-			"With RelOrder placeholder",
-			From[User]().With("Posts", RelOrder("CASE WHEN title = ? THEN 0 END")),
-			"RelOrder has no argument channel",
+			"With RelOrderBy placeholder",
+			From[User]().With("Posts", RelOrderBy("CASE WHEN title = ? THEN 0 END")),
+			"RelOrderBy has no argument channel",
 		},
 		{"With negative RelLimit", From[User]().With("Posts", RelLimit(-1)), "RelLimit requires a non-negative value"},
 	}

@@ -40,14 +40,16 @@ type queryState struct {
 	limit, offset       int
 	limitSet, offsetSet bool
 
-	forUpdate bool
-	final     bool
-	trashed   trashMode
-	allRows   bool
+	lock     lockMode
+	lockOpt  LockOption
+	distinct bool
+	final    bool
+	trashed  trashMode
+	allRows  bool
 
 	withs    []preloadSpec
 	hasConds []hasCond
-	counts   []string
+	counts   []countSpec
 
 	// orderKeys is the structured ordering for cursor pagination; after is
 	// the position to resume past.
@@ -59,7 +61,7 @@ type queryState struct {
 type hasCond struct {
 	path      string
 	isNegated bool
-	opts      []RelOption
+	rq        relQuery
 }
 
 // Query is an immutable, connection-free query description safe for
@@ -138,11 +140,42 @@ func (q Query[T]) Offset(n int) Query[T] {
 	return q
 }
 
-// ForUpdate renders SELECT ... FOR UPDATE. A no-op on SQLite; rejected on
-// ClickHouse.
-func (q Query[T]) ForUpdate() Query[T] {
+// LockOption refines a row lock: what happens when a row is already locked.
+type LockOption uint8
+
+const (
+	// NoWait fails immediately instead of waiting for a locked row.
+	NoWait LockOption = iota + 1
+	// SkipLocked leaves out rows another transaction holds locked.
+	SkipLocked
+)
+
+type lockMode uint8
+
+const (
+	lockNone lockMode = iota
+	lockUpdate
+	lockShare
+)
+
+// ForUpdate renders SELECT ... FOR UPDATE, with at most one LockOption. A
+// no-op on SQLite; rejected on ClickHouse.
+func (q Query[T]) ForUpdate(opts ...LockOption) Query[T] {
+	return q.withLock(lockUpdate, opts)
+}
+
+// ForShare renders SELECT ... FOR SHARE, with at most one LockOption. A no-op
+// on SQLite; rejected on ClickHouse.
+func (q Query[T]) ForShare(opts ...LockOption) Query[T] {
+	return q.withLock(lockShare, opts)
+}
+
+func (q Query[T]) withLock(mode lockMode, opts []LockOption) Query[T] {
 	q.cache = nil
-	q.s.forUpdate = true
+	q.s.lock, q.s.lockOpt = mode, 0
+	for _, o := range opts {
+		q.s.lockOpt = o
+	}
 	return q
 }
 
@@ -187,30 +220,31 @@ func (q Query[T]) Scope(fns ...func(Query[T]) Query[T]) Query[T] {
 // nest EXISTS predicates, and RelWithTrashed applies to the leaf relation.
 func (q Query[T]) WhereHas(path string, opts ...RelOption) Query[T] {
 	q.cache = nil
-	q.s.hasConds = appendOne(q.s.hasConds, hasCond{path: path, opts: opts})
+	q.s.hasConds = appendOne(q.s.hasConds, hasCond{path: path, rq: relOptions(opts)})
 	return q
 }
 
 // WhereHasNot keeps rows whose relation path has no matching row.
 func (q Query[T]) WhereHasNot(path string, opts ...RelOption) Query[T] {
 	q.cache = nil
-	q.s.hasConds = appendOne(q.s.hasConds, hasCond{path: path, isNegated: true, opts: opts})
+	q.s.hasConds = appendOne(q.s.hasConds, hasCond{path: path, isNegated: true, rq: relOptions(opts)})
 	return q
 }
 
 // WithCount fills the tagged int64 count target for a HasMany or ManyToMany
-// relation using one GROUP BY query.
-func (q Query[T]) WithCount(relation string) Query[T] {
+// relation using one GROUP BY query. RelWhere and RelWithTrashed narrow what
+// is counted; a filtered count never reuses a preloaded relation.
+func (q Query[T]) WithCount(relation string, opts ...RelOption) Query[T] {
 	q.cache = nil
-	q.s.counts = appendOne(q.s.counts, relation)
+	q.s.counts = appendOne(q.s.counts, countSpec{relation: relation, rq: relOptions(opts)})
 	return q
 }
 
-// With preloads a relation with a separate IN query. Dot-separated paths
+// With preloads a relation with a separate query. Dot-separated paths
 // preload nested relations; options apply to the leaf.
 func (q Query[T]) With(path string, opts ...RelOption) Query[T] {
 	q.cache = nil
-	q.s.withs = appendOne(q.s.withs, preloadSpec{path: path, opts: opts})
+	q.s.withs = appendOne(q.s.withs, preloadSpec{path: path, rq: relOptions(opts)})
 	return q
 }
 
@@ -641,7 +675,7 @@ func loadQueryRelations[T any](
 	p *plan,
 	rows []T,
 	withs []preloadSpec,
-	counts []string,
+	counts []countSpec,
 ) error {
 	if len(rows) == 0 || (len(withs) == 0 && len(counts) == 0) {
 		return nil
@@ -701,15 +735,33 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 
 	switch shape {
 	case selectCount:
-		b = append(b, "SELECT count(*) FROM "...)
+		if s.distinct {
+			if len(p.pks) != 1 {
+				return "", nil, fmt.Errorf("rio: Count with Distinct needs a single-column primary key on %s", p.structName)
+			}
+			b = append(b, "SELECT count(DISTINCT "...)
+			b = d.quote(b, table)
+			b = append(b, '.')
+			b = d.quote(b, p.pks[0].column)
+			b = append(b, ") FROM "...)
+		} else {
+			b = append(b, "SELECT count(*) FROM "...)
+		}
 		b = d.quote(b, table)
 	case selectExists:
 		b = append(b, "SELECT 1 FROM "...)
 		b = d.quote(b, table)
 	default:
-		head, err := g.cachedSQL(p, "selecthead", 0, 0, upsertCacheKey{}, func() (string, error) {
+		op := "selecthead"
+		if s.distinct {
+			op = "selectdistinct"
+		}
+		head, err := g.cachedSQL(p, op, 0, 0, upsertCacheKey{}, func() (string, error) {
 			hb := make([]byte, 0, 128)
 			hb = append(hb, "SELECT "...)
+			if s.distinct {
+				hb = append(hb, "DISTINCT "...)
+			}
 			for i, f := range p.fields {
 				if i > 0 {
 					hb = append(hb, ", "...)
@@ -792,9 +844,9 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 		}
 	}
 	// PostgreSQL rejects row locks on aggregate counts.
-	if s.forUpdate && shape != selectCount {
+	if s.lock != lockNone && shape != selectCount {
 		var err error
-		if b, err = appendForUpdate(b, d); err != nil {
+		if b, err = appendLock(b, d, s); err != nil {
 			return "", nil, err
 		}
 	}
@@ -802,18 +854,29 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 	return finishSQL(d, b, args)
 }
 
-// appendForUpdate renders, elides, or rejects the lock by dialect capability.
-func appendForUpdate(b []byte, d Dialect) ([]byte, error) {
+// appendLock renders, elides, or rejects the row lock by dialect capability.
+func appendLock(b []byte, d Dialect, s *queryState) ([]byte, error) {
 	switch d.caps().forUpdate {
-	case forUpdateRender:
-		return append(b, " FOR UPDATE"...), nil
 	case forUpdateReject:
 		return nil, unsupportedf(
-			"rio: ForUpdate is not supported on %s (no row locks); remove it — reads there are lock-free snapshots",
+			"rio: row locks are not supported on %s; remove ForUpdate/ForShare — reads there are lock-free snapshots",
 			d.name(),
 		)
+	case forUpdateElide:
+		return b, nil
 	}
-	return b, nil // forUpdateElide
+	if s.lock == lockShare {
+		b = append(b, " FOR SHARE"...)
+	} else {
+		b = append(b, " FOR UPDATE"...)
+	}
+	switch s.lockOpt {
+	case NoWait:
+		b = append(b, " NOWAIT"...)
+	case SkipLocked:
+		b = append(b, " SKIP LOCKED"...)
+	}
+	return b, nil
 }
 
 // checkFinal rejects Final() on dialects without the FINAL table modifier.
@@ -899,12 +962,8 @@ func renderWhere(
 		if hc.isNegated {
 			b = append(b, "NOT "...)
 		}
-		var rq relQuery
-		for _, opt := range hc.opts {
-			opt(&rq)
-		}
 		var err error
-		b, args, err = renderExists(b, args, g, p, table, hc.path, &rq, 1)
+		b, args, err = renderExists(b, args, g, p, table, hc.path, &hc.rq, 1)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1151,6 +1210,9 @@ func renderPluck(g *grammar, p *plan, f *field, s *queryState) (string, []any, e
 	}
 	b := make([]byte, 0, 128)
 	b = append(b, "SELECT "...)
+	if s.distinct {
+		b = append(b, "DISTINCT "...)
+	}
 	b = d.quote(b, table)
 	b = append(b, '.')
 	b = d.quote(b, f.column)
@@ -1183,8 +1245,8 @@ func renderPluck(g *grammar, p *plan, f *field, s *queryState) (string, []any, e
 	if err != nil {
 		return "", nil, err
 	}
-	if s.forUpdate {
-		b, err = appendForUpdate(b, d)
+	if s.lock != lockNone {
+		b, err = appendLock(b, d, s)
 		if err != nil {
 			return "", nil, err
 		}
