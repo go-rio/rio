@@ -35,13 +35,21 @@ func validateQueryState(p *plan, s *queryState) error {
 	if err := checkNoArgClauses(p, s); err != nil {
 		return err
 	}
-	if len(s.orderKeys) > 0 || s.after != nil {
+	if len(s.orderKeys) > 0 || s.after != nil || s.before != nil {
 		keys, err := resolveSortKeys(p, s)
 		if err != nil {
 			return err
 		}
+		if s.after != nil && s.before != nil {
+			return fmt.Errorf("rio: After and Before cannot combine; a page has one edge")
+		}
 		if s.after != nil {
-			if err := s.after.check(keys); err != nil {
+			if err := s.after.check("After", keys); err != nil {
+				return err
+			}
+		}
+		if s.before != nil {
+			if err := s.before.check("Before", keys); err != nil {
 				return err
 			}
 		}

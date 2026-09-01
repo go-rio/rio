@@ -458,6 +458,9 @@ func upsertUpdateSet(p *plan, spec *upsertSpec, skipped []*field) ([]*field, err
 			if f.isPK || f.isVersion || f.isSoftDelete || f.isCreated || f.isUpdated {
 				return nil, fmt.Errorf("rio: DoUpdate: column %q is maintained by rio and cannot be listed", c)
 			}
+			if f.readOnly {
+				return nil, fmt.Errorf("rio: DoUpdate: column %q is readonly", c)
+			}
 			if fieldIn(skipped, f) {
 				return nil, fmt.Errorf(
 					"rio: DoUpdate: column %q is tagged omitzero and %s.%s is zero, "+
@@ -481,7 +484,7 @@ func upsertUpdateSet(p *plan, spec *upsertSpec, skipped []*field) ([]*field, err
 	hasOmitted := false
 	for _, f := range p.fields {
 		isMaintained := f.isPK || f.isVersion || f.isSoftDelete ||
-			f.isCreated || f.isUpdated || f.isAutoIncr
+			f.isCreated || f.isUpdated || f.isAutoIncr || f.readOnly
 		if isMaintained || slices.Contains(spec.conflict, f.column) {
 			continue
 		}

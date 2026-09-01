@@ -254,7 +254,7 @@ func batchColumns[T any](p *plan, rows []T) (cols []*field, backfill bool, err e
 	if backfill {
 		return p.insCols, true, nil
 	}
-	return p.fields, false, nil
+	return p.insAll, false, nil
 }
 
 func insertChunk[T any](

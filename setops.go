@@ -143,6 +143,9 @@ func (q Query[T]) updateAll(
 		if !ok {
 			return 0, fmt.Errorf("rio: UpdateAll: %s has no column %q", p.structName, k)
 		}
+		if f.readOnly {
+			return 0, fmt.Errorf("rio: UpdateAll: column %q is readonly", k)
+		}
 		b = d.quote(b, k)
 		b = append(b, " = "...)
 		v, given := set[k]
@@ -240,8 +243,8 @@ func checkSetOpShape(op string, s *queryState) error {
 	if len(s.orders) > 0 {
 		return fmt.Errorf("rio: %s cannot honor OrderBy (a set-based write has no row order); drop it", op)
 	}
-	if len(s.orderKeys) > 0 || s.after != nil {
-		return fmt.Errorf("rio: %s cannot honor OrderKeys/After (a set-based write has no row order); drop them", op)
+	if len(s.orderKeys) > 0 || s.after != nil || s.before != nil {
+		return fmt.Errorf("rio: %s cannot honor OrderKeys/After/Before (a set-based write has no row order); drop them", op)
 	}
 	if len(s.withs) > 0 || len(s.counts) > 0 {
 		return fmt.Errorf("rio: %s cannot honor With/WithCount (a set-based write returns no entities to load into); drop them", op)

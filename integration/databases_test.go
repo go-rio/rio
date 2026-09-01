@@ -298,9 +298,9 @@ func TestSQLiteCursorPaginationWalk(t *testing.T) {
 		for _, r := range rows {
 			walked = append(walked, r.ID)
 		}
-		cur, err := page.CursorAfter(&rows[len(rows)-1])
+		cur, err := page.CursorAt(&rows[len(rows)-1])
 		if err != nil {
-			t.Fatalf("CursorAfter: %v", err)
+			t.Fatalf("CursorAt: %v", err)
 		}
 		token = cur.String()
 		if len(rows) < 9 {

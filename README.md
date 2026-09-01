@@ -146,9 +146,15 @@ q := rio.From[Post]().OrderKeys(
 ) // + "id" appended automatically
 
 page, err := q.Limit(20).All(ctx, db)
-cur, err := q.CursorAfter(&page[len(page)-1])
+cur, err := q.CursorAt(&page[len(page)-1])
 next, err := q.After(cur).Limit(20).All(ctx, db)
+prev, err := q.Before(first).Limit(20).All(ctx, db) // first = CursorAt(&page[0])
 ```
+
+`Before` runs the reversed query and turns the page around, so it always
+reads in `OrderKeys` order. `Chunk(ctx, db, 500)` walks the whole result in
+keyset pages (`iter.Seq2[[]T, error]`), releasing the connection between
+pages and applying `With`/`WithCount` per page.
 
 `Cursor.String`/`rio.ParseCursor` round-trip a URL-safe token. Tokens carry
 values (bound as parameters) plus an ordering fingerprint — a forged token

@@ -730,6 +730,71 @@ func TestForUpdateCapability(t *testing.T) {
 	}
 }
 
+type Sku struct {
+	ID   int64
+	Name string
+	Slug string `rio:",readonly"` // GENERATED ALWAYS AS (lower(name)) STORED
+}
+
+// A readonly column is scanned and loaded back after inserts, never written.
+func TestReadonlyColumn(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+
+	f.queueRows([]string{"id", "slug"}, []driver.Value{int64(1), "widget"})
+	s := &Sku{Name: "Widget"}
+	if err := Insert(ctx, db, s); err != nil {
+		t.Fatal(err)
+	}
+	ins := f.loggedContaining("INSERT")[0]
+	if ins.sql != `INSERT INTO "skus" ("name") VALUES ($1) RETURNING "id", "slug"` || s.ID != 1 || s.Slug != "widget" {
+		t.Fatalf("insert: %s %+v", ins.sql, s)
+	}
+
+	f.queueExec(0, 1)
+	if err := Update(ctx, db, s); err != nil {
+		t.Fatal(err)
+	}
+	if upd := f.loggedContaining("UPDATE")[0]; upd.sql != `UPDATE "skus" SET "name" = $1 WHERE "id" = $2` {
+		t.Fatalf("update: %s", upd.sql)
+	}
+	for name, err := range map[string]error{
+		"Update":    Update(ctx, db, s, "slug"),
+		"UpdateAll": func() error { _, e := From[Sku]().Where("id = ?", 1).UpdateAll(ctx, db, Set{"slug": "x"}); return e }(),
+		"DoUpdate":  Upsert(ctx, db, s, OnConflict("id"), DoUpdate("slug")),
+	} {
+		if err == nil || !strings.Contains(err.Error(), "readonly") {
+			t.Fatalf("%s must reject a readonly column: %v", name, err)
+		}
+	}
+
+	f.queueRows([]string{"id", "name", "slug"}, []driver.Value{int64(1), "Widget", "widget"})
+	if err := Upsert(ctx, db, s, OnConflict("id")); err != nil {
+		t.Fatal(err)
+	}
+	up := f.loggedContaining("ON CONFLICT")[0]
+	if !strings.HasPrefix(up.sql, `INSERT INTO "skus" ("id", "name") VALUES ($1, $2) ON CONFLICT ("id") DO UPDATE SET "name" = excluded."name" RETURNING`) {
+		t.Fatalf("upsert: %s", up.sql)
+	}
+
+	f.queueExec(0, 2)
+	if err := InsertAll(ctx, db, []Sku{{ID: 5, Name: "a"}, {ID: 6, Name: "b"}}); err != nil {
+		t.Fatal(err)
+	}
+	if batch := f.loggedContaining("($3, $4)")[0]; !strings.HasPrefix(batch.sql, `INSERT INTO "skus" ("id", "name") VALUES`) {
+		t.Fatalf("batch: %s", batch.sql)
+	}
+
+	type bad struct {
+		ID int64
+		At time.Time `rio:",readonly,softdelete"`
+	}
+	if _, err := planOf[bad](); err == nil || !strings.Contains(err.Error(), "readonly cannot combine") {
+		t.Fatalf("role clash: %v", err)
+	}
+}
+
 type Grant struct {
 	UserID int64  `rio:",pk"`
 	Scope  string `rio:",pk"`
@@ -4058,7 +4123,7 @@ type pagedItem struct {
 }
 
 // The keyset predicate expands per direction, with the primary key appended as the tie-breaker.
-func TestCursorAfterRendersExpandedKeysetPredicate(t *testing.T) {
+func TestCursorAtRendersExpandedKeysetPredicate(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
 	db := f.open()
@@ -4068,9 +4133,9 @@ func TestCursorAfterRendersExpandedKeysetPredicate(t *testing.T) {
 		SortKey{Column: "name"},
 	)
 	last := pagedItem{ID: 7, Score: 90, Name: "m"}
-	cur, err := q.CursorAfter(&last)
+	cur, err := q.CursorAt(&last)
 	if err != nil {
-		t.Fatalf("CursorAfter: %v", err)
+		t.Fatalf("CursorAt: %v", err)
 	}
 
 	f.queueRows([]string{"id", "score", "name"})
@@ -4100,9 +4165,9 @@ func TestCursorAfterRendersExpandedKeysetPredicate(t *testing.T) {
 // The token round-trips exactly and pins the ordering it was issued under.
 func TestCursorTokenRoundTripAndFingerprint(t *testing.T) {
 	q := From[pagedItem]().OrderKeys(SortKey{Column: "score", Desc: true})
-	cur, err := q.CursorAfter(&pagedItem{ID: 3, Score: -12, Name: "x"})
+	cur, err := q.CursorAt(&pagedItem{ID: 3, Score: -12, Name: "x"})
 	if err != nil {
-		t.Fatalf("CursorAfter: %v", err)
+		t.Fatalf("CursorAt: %v", err)
 	}
 	parsed, err := ParseCursor(cur.String())
 	if err != nil {
@@ -4147,7 +4212,7 @@ func TestOrderKeysValidation(t *testing.T) {
 		!strings.Contains(err.Error(), "declared twice") {
 		t.Fatalf("duplicate key: %v", err)
 	}
-	_, err := From[pagedItem]().CursorAfter(&pagedItem{})
+	_, err := From[pagedItem]().CursorAt(&pagedItem{})
 	if err == nil || !strings.Contains(err.Error(), "needs OrderKeys") {
 		t.Fatalf("cursor without OrderKeys: %v", err)
 	}
@@ -4164,9 +4229,9 @@ func TestCursorPaginationOnPluck(t *testing.T) {
 	db := f.open()
 
 	q := From[pagedItem]().OrderKeys(SortKey{Column: "score", Desc: true})
-	cur, err := q.CursorAfter(&pagedItem{ID: 7, Score: 90})
+	cur, err := q.CursorAt(&pagedItem{ID: 7, Score: 90})
 	if err != nil {
-		t.Fatalf("CursorAfter: %v", err)
+		t.Fatalf("CursorAt: %v", err)
 	}
 	f.queueRows([]string{"name"})
 	if _, err := q.After(cur).Pluck[string](ctx, db, "name"); err != nil {
@@ -4187,12 +4252,89 @@ func TestValidateCatchesCursorMisuse(t *testing.T) {
 		!strings.Contains(err.Error(), "zero Cursor") {
 		t.Fatalf("Validate must catch the zero cursor: %v", err)
 	}
-	other, err := From[pagedItem]().OrderKeys(SortKey{Column: "name"}).CursorAfter(&pagedItem{ID: 1, Name: "x"})
+	other, err := From[pagedItem]().OrderKeys(SortKey{Column: "name"}).CursorAt(&pagedItem{ID: 1, Name: "x"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := From[pagedItem]().OrderKeys(SortKey{Column: "score"}).After(other).Validate(); err == nil ||
 		!strings.Contains(err.Error(), "different ordering") {
 		t.Fatalf("Validate must catch the ordering mismatch: %v", err)
+	}
+}
+
+// Before flips the predicate and the ORDER BY, then turns the page around so
+// it reads in OrderKeys order.
+func TestBeforeReversesQueryAndPage(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	q := From[pagedItem]().OrderKeys(SortKey{Column: "score", Desc: true})
+	cur, err := q.CursorAt(&pagedItem{ID: 7, Score: 90})
+	if err != nil {
+		t.Fatalf("CursorAt: %v", err)
+	}
+	f.queueRows([]string{"id", "score", "name"},
+		[]driver.Value{int64(8), int64(91), "b"},
+		[]driver.Value{int64(9), int64(95), "a"},
+	)
+	page, err := q.Before(cur).Limit(2).All(ctx, db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	got := f.loggedContaining("SELECT")[0]
+	wantPred := `(("paged_items"."score" > $1) OR ("paged_items"."score" = $2 AND "paged_items"."id" > $3))`
+	if !strings.Contains(got.sql, wantPred) || !strings.HasSuffix(got.sql, `ORDER BY "paged_items"."score", "paged_items"."id" LIMIT 2`) {
+		t.Fatalf("reversed query: %s", got.sql)
+	}
+	if len(page) != 2 || page[0].ID != 9 || page[1].ID != 8 {
+		t.Fatalf("page must read in OrderKeys order: %+v", page)
+	}
+
+	for _, err := range q.Before(cur).Rows(ctx, db) {
+		if err == nil || !strings.Contains(err.Error(), "cannot stream Before") {
+			t.Fatalf("Rows with Before: %v", err)
+		}
+		break
+	}
+	if err := q.After(cur).Before(cur).Validate(); err == nil || !strings.Contains(err.Error(), "cannot combine") {
+		t.Fatalf("After with Before: %v", err)
+	}
+}
+
+// Chunk walks the result in keyset pages, defaulting to primary-key order,
+// and stops at the first short page.
+func TestChunkWalksKeysetPages(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	row := func(id int64) []driver.Value { return []driver.Value{id, int64(10), "n"} }
+	f.queueRows([]string{"id", "score", "name"}, row(1), row(2))
+	f.queueRows([]string{"id", "score", "name"}, row(3))
+
+	var seen []int64
+	for page, err := range From[pagedItem]().Where("score > ?").Chunk(ctx, db, 2, 0) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, it := range page {
+			seen = append(seen, it.ID)
+		}
+	}
+	if len(seen) != 3 || seen[0] != 1 || seen[2] != 3 {
+		t.Fatalf("seen = %v", seen)
+	}
+	stmts := f.loggedContaining("SELECT")
+	if len(stmts) != 2 || !strings.HasSuffix(stmts[0].sql, `ORDER BY "paged_items"."id" LIMIT 2`) {
+		t.Fatalf("first page: %+v", stmts)
+	}
+	if !strings.Contains(stmts[1].sql, `"paged_items"."id" > $2`) || stmts[1].args[0] != int64(0) || stmts[1].args[1] != int64(2) {
+		t.Fatalf("second page must resume after id 2: %s %#v", stmts[1].sql, stmts[1].args)
+	}
+
+	for _, err := range From[pagedItem]().Limit(1).Chunk(ctx, db, 2) {
+		if err == nil || !strings.Contains(err.Error(), "Chunk owns") {
+			t.Fatalf("Chunk with Limit: %v", err)
+		}
+		break
 	}
 }

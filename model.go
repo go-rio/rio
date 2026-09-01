@@ -32,13 +32,14 @@ type plan struct {
 	created   *field
 	updated   *field
 
-	// Precomputed insert partitions: every column (allBits), or every column
-	// but the auto-increment PK (insCols/insBack/insBits).
-	insCols     []*field
-	insBack     []*field
-	allBits     uint64
-	insBits     uint64
-	hasOmitZero bool
+	// Precomputed insert partitions: every writable column (insAll), or every
+	// writable column but the auto-increment PK (insCols); the back lists are
+	// what RETURNING loads.
+	insAll, insAllBack []*field
+	insCols, insBack   []*field
+	insAllBits         uint64
+	insBits            uint64
+	hasOmitZero        bool
 
 	rels     map[string]*relField
 	relNames []string
@@ -63,7 +64,7 @@ type field struct {
 	isPK, isAutoIncr, omitZero, jsonCol bool
 	isVersion, isSoftDelete             bool
 	isCreated, isUpdated                bool
-	noAutoIncr                          bool
+	noAutoIncr, readOnly                bool
 
 	code fieldCodec // scan/bind strategy, decided once at plan time
 }
@@ -106,6 +107,7 @@ type tagOpts struct {
 	softDelete bool
 	noStamp    bool
 	noAutoIncr bool
+	readOnly   bool
 	fk, ref    string
 	join       string
 	countOf    string
@@ -242,9 +244,14 @@ func (p *plan) addFields(t reflect.Type) error {
 			isPK:     opts.pk,
 			omitZero: opts.omitZero,
 			jsonCol:  opts.json,
+			readOnly: opts.readOnly,
 		}
 		if f.column == "" {
 			f.column = snakeCase(sf.Name)
+		}
+		if opts.readOnly && (opts.omitZero || opts.version || opts.softDelete) {
+			errs = append(errs, fmt.Errorf("field %s: readonly cannot combine with omitzero, version, or softdelete", sf.Name))
+			continue
 		}
 		if opts.version {
 			f.isVersion = true
@@ -252,7 +259,7 @@ func (p *plan) addFields(t reflect.Type) error {
 		if opts.softDelete {
 			f.isSoftDelete = true
 		}
-		if !opts.noStamp && !opts.softDelete && !opts.version &&
+		if !opts.noStamp && !opts.softDelete && !opts.version && !opts.readOnly &&
 			(sf.Type == timeType || sf.Type == timePtrType) {
 			// The CreatedAt/UpdatedAt convention is name-based; an explicit
 			// role tag wins. *time.Time is stamped too.
@@ -352,7 +359,7 @@ func (p *plan) classify() []error {
 		errs = append(errs, errors.New("the version column cannot be part of the primary key"))
 	}
 	for _, f := range p.fields {
-		if f.isPK || f.isCreated || f.isVersion || f.isSoftDelete {
+		if f.isPK || f.isCreated || f.isVersion || f.isSoftDelete || f.readOnly {
 			// Softdelete stays out of updatable: a full-column Update would
 			// write deleted_at back to NULL and resurrect the row.
 			continue
@@ -363,16 +370,22 @@ func (p *plan) classify() []error {
 		if f.omitZero {
 			p.hasOmitZero = true
 		}
+		if f.readOnly {
+			p.insAllBack = append(p.insAllBack, f)
+			continue
+		}
+		p.insAll = append(p.insAll, f)
 		if f.ordinal < 64 {
-			p.allBits |= 1 << uint(f.ordinal)
+			p.insAllBits |= 1 << uint(f.ordinal)
 		}
 		if f != p.autoIncr {
 			p.insCols = append(p.insCols, f)
 		}
 	}
-	p.insBits = p.allBits
+	p.insBits = p.insAllBits
+	p.insBack = p.insAllBack
 	if p.autoIncr != nil {
-		p.insBack = []*field{p.autoIncr}
+		p.insBack = append([]*field{p.autoIncr}, p.insAllBack...)
 		if p.autoIncr.ordinal < 64 {
 			p.insBits &^= 1 << uint(p.autoIncr.ordinal)
 		}
@@ -489,6 +502,8 @@ func roleOptName(o tagOpts) string {
 		return "nostamp"
 	case o.noAutoIncr:
 		return "noautoincr"
+	case o.readOnly:
+		return "readonly"
 	case o.fk != "":
 		return "fk"
 	case o.ref != "":
@@ -527,6 +542,8 @@ func parseTag(sf reflect.StructField) (column string, opts tagOpts, err error) {
 			opts.noStamp = true
 		case part == "noautoincr":
 			opts.noAutoIncr = true
+		case part == "readonly":
+			opts.readOnly = true
 		case strings.HasPrefix(part, "fk:"):
 			opts.fk = part[len("fk:"):]
 		case strings.HasPrefix(part, "ref:"):

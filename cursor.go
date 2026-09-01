@@ -235,22 +235,23 @@ func cursorValue(f *field, rv reflect.Value) (any, error) {
 }
 
 // check verifies the cursor against the query's resolved ordering.
-func (c *Cursor) check(keys []resolvedKey) error {
+func (c *Cursor) check(clause string, keys []resolvedKey) error {
 	if c.IsZero() {
-		return fmt.Errorf("rio: After: the zero Cursor marks no position; omit After for the first page")
+		return fmt.Errorf("rio: %s: the zero Cursor marks no position; omit %s for the first page", clause, clause)
 	}
 	if c.fp != sortKeyFingerprint(keys) {
-		return fmt.Errorf("rio: After: the cursor was issued for a different ordering than this query's OrderKeys")
+		return fmt.Errorf("rio: %s: the cursor was issued for a different ordering than this query's OrderKeys", clause)
 	}
 	if len(c.values) != len(keys) {
-		return fmt.Errorf("rio: After: the cursor carries %d value(s) for %d sort key(s)", len(c.values), len(keys))
+		return fmt.Errorf("rio: %s: the cursor carries %d value(s) for %d sort key(s)", clause, len(c.values), len(keys))
 	}
 	return nil
 }
 
-// renderAfter appends the expanded keyset predicate, ((k0 > ?) OR (k0 = ? AND
+// renderKeyset appends the expanded keyset predicate, ((k0 > ?) OR (k0 = ? AND
 // k1 > ?) OR ...): row-value syntax is neither portable nor mixed-direction.
-func renderAfter(b []byte, args []any, d Dialect, table string, keys []resolvedKey, c *Cursor) ([]byte, []any) {
+// reverse flips every comparison for Before.
+func renderKeyset(b []byte, args []any, d Dialect, table string, keys []resolvedKey, c *Cursor, reverse bool) ([]byte, []any) {
 	b = append(b, '(')
 	for i, k := range keys {
 		if i > 0 {
@@ -267,7 +268,7 @@ func renderAfter(b []byte, args []any, d Dialect, table string, keys []resolvedK
 		b = d.quote(b, table)
 		b = append(b, '.')
 		b = d.quote(b, k.f.column)
-		if k.desc {
+		if k.desc != reverse {
 			b = append(b, " < ?"...)
 		} else {
 			b = append(b, " > ?"...)
@@ -279,8 +280,9 @@ func renderAfter(b []byte, args []any, d Dialect, table string, keys []resolvedK
 	return b, args
 }
 
-// appendOrderKeys renders the resolved structured ordering.
-func appendOrderKeys(b []byte, d Dialect, table string, keys []resolvedKey) []byte {
+// appendOrderKeys renders the resolved structured ordering; reverse flips
+// every direction for Before.
+func appendOrderKeys(b []byte, d Dialect, table string, keys []resolvedKey, reverse bool) []byte {
 	if len(keys) == 0 {
 		return b
 	}
@@ -292,7 +294,7 @@ func appendOrderKeys(b []byte, d Dialect, table string, keys []resolvedKey) []by
 		b = d.quote(b, table)
 		b = append(b, '.')
 		b = d.quote(b, k.f.column)
-		if k.desc {
+		if k.desc != reverse {
 			b = append(b, " DESC"...)
 		}
 	}
@@ -310,19 +312,28 @@ func (q Query[T]) OrderKeys(keys ...SortKey) Query[T] {
 }
 
 // After resumes past the position c marks: rows strictly after it in the
-// OrderKeys ordering. c must come from CursorAfter under the same OrderKeys;
-// a different ordering fails loudly. For backward paging, flip every key's
-// direction and resume After the first row of the page.
+// OrderKeys ordering. c must come from CursorAt under the same OrderKeys; a
+// different ordering fails loudly.
 func (q Query[T]) After(c Cursor) Query[T] {
 	q.cache = nil
 	q.s.after = &c
 	return q
 }
 
-// CursorAfter issues the cursor marking row's position under the query's
-// OrderKeys. The row must hold the values the database stores (any row rio
-// scanned does).
-func (q Query[T]) CursorAfter(row *T) (Cursor, error) {
+// Before selects the page ending at the position c marks: the rows strictly
+// before it, still in OrderKeys order. It runs the reversed query and turns
+// the page around, so Rows cannot stream it.
+func (q Query[T]) Before(c Cursor) Query[T] {
+	q.cache = nil
+	q.s.before = &c
+	return q
+}
+
+// CursorAt issues the cursor marking row's position under the query's
+// OrderKeys: After the last row of a page for the next page, Before the first
+// row for the previous one. The row must hold the values the database stores
+// (any row rio scanned does).
+func (q Query[T]) CursorAt(row *T) (Cursor, error) {
 	p, err := planOf[T]()
 	if err != nil {
 		return Cursor{}, err

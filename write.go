@@ -443,6 +443,9 @@ func updateSet(p *plan, cols []string) ([]*field, error) {
 		if f.isPK || f.isVersion || f.isCreated {
 			return nil, fmt.Errorf("rio: Update: column %q is maintained by rio and cannot be listed", c)
 		}
+		if f.readOnly {
+			return nil, fmt.Errorf("rio: Update: column %q is readonly", c)
+		}
 		if f.isSoftDelete {
 			return nil, fmt.Errorf("rio: Update: column %q is the softdelete column; use Delete, Restore, or ForceDelete", c)
 		}
@@ -535,7 +538,7 @@ func insertColumns(
 	cacheable = len(p.fields) <= 64
 	base := rv.Addr().UnsafePointer()
 	if !p.hasOmitZero {
-		cols, bits = p.fields, p.allBits
+		cols, back, bits = p.insAll, p.insAllBack, p.insAllBits
 		if p.autoIncr != nil && fieldIsZero(p.autoIncr, base, rv) {
 			cols, back, bits = p.insCols, p.insBack, p.insBits
 		}
@@ -555,7 +558,7 @@ func insertColumns(
 	nb := len(buf)
 	args = make([]any, 0, len(p.fields))
 	for i, f := range p.fields {
-		if (f.isAutoIncr || f.omitZero) && fieldIsZero(f, base, rv) {
+		if f.readOnly || ((f.isAutoIncr || f.omitZero) && fieldIsZero(f, base, rv)) {
 			nb--
 			buf[nb] = f
 			continue

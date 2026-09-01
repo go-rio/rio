@@ -149,7 +149,7 @@ func newCachedQuery(
 	sqlText string,
 	args []any,
 ) (*cachedQuery, bool) {
-	if s.after != nil {
+	if s.after != nil || s.before != nil {
 		// The cursor's values change every page; the shape is not stable.
 		return nil, false
 	}

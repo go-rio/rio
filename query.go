@@ -8,6 +8,7 @@ import (
 	"iter"
 	"math"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -51,10 +52,10 @@ type queryState struct {
 	hasConds []hasCond
 	counts   []countSpec
 
-	// orderKeys is the structured ordering for cursor pagination; after is
-	// the position to resume past.
-	orderKeys []SortKey
-	after     *Cursor
+	// orderKeys is the structured ordering for cursor pagination; after and
+	// before are the page edges.
+	orderKeys     []SortKey
+	after, before *Cursor
 }
 
 // hasCond describes one WhereHas or WhereHasNot EXISTS predicate.
@@ -436,6 +437,10 @@ func (q Query[T]) Rows(ctx context.Context, db Queryer, args ...any) iter.Seq2[T
 			yield(zero, errors.New("rio: Rows cannot stream With/WithCount (preloading needs the full result); use All"))
 			return
 		}
+		if q.s.before != nil {
+			yield(zero, errors.New("rio: Rows cannot stream Before (the page is read backwards and turned around); use All"))
+			return
+		}
 		g := db.gram()
 		key := queryCacheKey{grammar: g.weakSelf, op: queryCacheRows}
 		p, _, sqlText, bound, err := prepareCachedSelect[T](
@@ -516,6 +521,9 @@ func (q Query[T]) Pluck[V any](ctx context.Context, db Queryer, column string, a
 	}
 	out, err := scanScalarsCap[V](rows, 0, queryCapacity(q.s.limit, q.s.limitSet))
 	finishQuery(finish, err, int64(len(out)))
+	if err == nil && q.s.before != nil {
+		slices.Reverse(out)
+	}
 	return out, err
 }
 
@@ -623,10 +631,63 @@ func (q Query[T]) all(ctx context.Context, db Queryer, op queryCacheOp, args []a
 	if err != nil {
 		return nil, err
 	}
+	if state.before != nil {
+		slices.Reverse(out) // the reversed query read the page backwards
+	}
 	if err := loadQueryRelations(ctx, db, p, out, state.withs, state.counts); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// Chunk yields the matching rows in keyset pages of size rows: one bounded
+// query per page, the connection released between pages, With and WithCount
+// applied per page. Pages follow OrderKeys, defaulting to the primary key;
+// Limit, Offset, After, and Before are refused.
+func (q Query[T]) Chunk(ctx context.Context, db Queryer, size int, args ...any) iter.Seq2[[]T, error] {
+	execArgs := copyArgs(args)
+	return func(yield func([]T, error) bool) {
+		if size <= 0 {
+			yield(nil, fmt.Errorf("rio: Chunk requires a positive size, got %d", size))
+			return
+		}
+		if q.s.limitSet || q.s.offsetSet || q.s.after != nil || q.s.before != nil {
+			yield(nil, errors.New("rio: Chunk owns Limit, Offset, After, and Before; drop them"))
+			return
+		}
+		page := q
+		page.cache = nil
+		if len(page.s.orderKeys) == 0 {
+			p, err := planOf[T]()
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			for _, pk := range p.pks {
+				page.s.orderKeys = append(page.s.orderKeys, SortKey{Column: pk.column})
+			}
+		}
+		page.s.limit, page.s.limitSet = size, true
+		for {
+			rows, err := page.All(ctx, db, execArgs...)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			if len(rows) == 0 {
+				return
+			}
+			if !yield(rows, nil) || len(rows) < size {
+				return
+			}
+			cur, err := page.CursorAt(&rows[len(rows)-1])
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			page.s.after = &cur
+		}
+	}
 }
 
 // noteCondArity records an inline-argument mismatch per fragment. Deferred and
@@ -724,7 +785,7 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 	}
 	table := g.table(p)
 	var sortKeys []resolvedKey
-	if len(s.orderKeys) > 0 || s.after != nil {
+	if len(s.orderKeys) > 0 || s.after != nil || s.before != nil {
 		var err error
 		if sortKeys, err = resolveSortKeys(p, s); err != nil {
 			return "", nil, err
@@ -823,7 +884,7 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 		}
 	}
 	if shape == selectRows {
-		b = appendOrderKeys(b, d, table, sortKeys)
+		b = appendOrderKeys(b, d, table, sortKeys, s.before != nil)
 	}
 	switch shape {
 	case selectRows:
@@ -948,11 +1009,12 @@ func renderWhere(
 		args = append(args, w.args...)
 	}
 	if s.after != nil {
-		if p == nil {
-			return nil, nil, fmt.Errorf("rio: After needs an entity query")
-		}
 		and()
-		b, args = renderAfter(b, args, d, table, sortKeys, s.after)
+		b, args = renderKeyset(b, args, d, table, sortKeys, s.after, false)
+	}
+	if s.before != nil {
+		and()
+		b, args = renderKeyset(b, args, d, table, sortKeys, s.before, true)
 	}
 	for _, hc := range s.hasConds {
 		if p == nil {
@@ -1202,7 +1264,7 @@ func renderPluck(g *grammar, p *plan, f *field, s *queryState) (string, []any, e
 	}
 	table := g.table(p)
 	var sortKeys []resolvedKey
-	if len(s.orderKeys) > 0 || s.after != nil {
+	if len(s.orderKeys) > 0 || s.after != nil || s.before != nil {
 		var kerr error
 		if sortKeys, kerr = resolveSortKeys(p, s); kerr != nil {
 			return "", nil, kerr
@@ -1240,7 +1302,7 @@ func renderPluck(g *grammar, p *plan, f *field, s *queryState) (string, []any, e
 			b = append(b, order...)
 		}
 	}
-	b = appendOrderKeys(b, d, table, sortKeys)
+	b = appendOrderKeys(b, d, table, sortKeys, s.before != nil)
 	b, err = appendLimitOffset(b, d, s)
 	if err != nil {
 		return "", nil, err
