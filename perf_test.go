@@ -512,7 +512,7 @@ func TestCRUDAllocBudget(t *testing.T) {
 		"find/clickhouse":   1, // same read path; caps checks are branch-only
 		"insert/sqlite":     1, // exec + LastInsertId path
 		"insert/mysql":      1, // exec + LastInsertId path
-		"insert/clickhouse": 1, // exec path; chTimeFormat binds text like sqlite's
+		"insert/clickhouse": 1, // exec path; stamps bind as time.Time
 		"update/pg":         2,
 		"delete/pg":         1,
 		"upsert/pg":         2,
@@ -743,7 +743,7 @@ func allocMeasurements(ctx context.Context) map[string]allocPair {
 		}
 	}
 
-	{ // Insert, ClickHouse exec path: explicit ID, stamps bound as chTimeFormat text.
+	{ // Insert, ClickHouse exec path: explicit ID, stamps bound as time.Time.
 		l := &loopDB{}
 		db, raw := l.open(ClickHouse), l.raw()
 		u := &perfUser{ID: 1, Email: "u@example.com", Age: 30}
@@ -755,8 +755,7 @@ func allocMeasurements(ctx context.Context) map[string]allocPair {
 			},
 			std: func() {
 				now := time.Now().UTC().Truncate(time.Microsecond)
-				ts := now.Format(chTimeFormat)
-				res, err := raw.ExecContext(ctx, q, int64(1), "u@example.com", int64(30), ts, ts)
+				res, err := raw.ExecContext(ctx, q, int64(1), "u@example.com", int64(30), now, now)
 				fatal(err)
 				_ = res
 			},

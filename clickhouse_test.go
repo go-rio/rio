@@ -14,8 +14,7 @@ import (
 // This file freezes the ClickHouse dialect's public behavior: golden SQL for
 // the supported surface, exact rejection messages with proof no SQL was sent.
 
-// chTS is testNow under chTimeFormat — what every stamped column binds.
-const chTS = "2026-07-09 12:00:00.000000+00:00"
+
 
 // --- supported surface: golden SQL ---
 
@@ -88,9 +87,12 @@ func TestClickHouseInsertGolden(t *testing.T) {
 	if u.Version != 1 || !u.CreatedAt.Equal(normalizeTime(testNow)) {
 		t.Fatalf("client-side stamps still apply: %+v", u)
 	}
-	// Time columns bind rio's fixed-format text, offset included.
-	if stmt.args[6] != chTS || stmt.args[7] != chTS {
-		t.Fatalf("time args must bind chTimeFormat text: %#v", stmt.args)
+	// Time columns pass through as time.Time; the driver renders them.
+	for _, i := range []int{6, 7} {
+		ts, ok := stmt.args[i].(time.Time)
+		if !ok || !ts.Equal(normalizeTime(testNow)) {
+			t.Fatalf("time args must bind as time.Time: %#v", stmt.args)
+		}
 	}
 }
 
@@ -723,24 +725,17 @@ func TestClickHouseQuoteEscapesBackticksAndBackslashes(t *testing.T) {
 
 // --- time binding ---
 
-func TestClickHouseTimeFormatRoundTrip(t *testing.T) {
+// Times pass through untouched so the driver renders them; normalization
+// still folds zoned inputs onto the same UTC instant.
+func TestClickHouseTimeBindsPassThrough(t *testing.T) {
 	at := time.Date(2024, 1, 2, 3, 4, 5, 123456789, time.UTC)
-	bound := ClickHouse.bindTime(normalizeTime(at)).(string)
-	if bound != "2024-01-02 03:04:05.123456+00:00" {
-		t.Fatalf("bindTime: %s", bound)
+	bound := ClickHouse.bindTime(normalizeTime(at)).(time.Time)
+	if !bound.Equal(at.Truncate(time.Microsecond)) {
+		t.Fatalf("bindTime drifted: %v", bound)
 	}
-	// The emitted text parses back to the same instant through rio's own scan formats.
-	parsed, err := parseTime(bound, &field{column: "at"})
-	if err != nil {
-		t.Fatalf("parse back: %v", err)
-	}
-	if !parsed.Equal(at.Truncate(time.Microsecond)) {
-		t.Fatalf("round trip drifted: %v != %v", parsed, at)
-	}
-	// Zoned inputs normalize to the same UTC text.
 	zoned := at.In(time.FixedZone("CST", 8*3600))
-	if got := ClickHouse.bindTime(normalizeTime(zoned)).(string); got != bound {
-		t.Fatalf("zoned input must bind identical text: %s", got)
+	if got := ClickHouse.bindTime(normalizeTime(zoned)).(time.Time); !got.Equal(bound) {
+		t.Fatalf("zoned input must bind the same instant: %v", got)
 	}
 }
 

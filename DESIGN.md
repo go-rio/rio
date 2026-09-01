@@ -207,15 +207,15 @@ ClickHouse supports analytical reads and append-oriented writes. APIs whose
 contracts depend on row locks, synchronous mutations, affected-row counts, or
 unique constraints return an error instead of a weaker approximation.
 
-- Server floor **26.x**: rio's offset-carrying time encoding, correlated
-  EXISTS, pre-1970 fractional timestamps.
+- Server floor **26.x**: correlated EXISTS, pre-1970 fractional timestamps.
 - Reads: full builder, relations, `WithCount`, `RelLimit`, `WhereHas`,
   soft-delete filters, Raw, Query templates, `Query.Final`.
 - Writes: `Insert`, `InsertAll`, explicit `Exec`. UPDATE/DELETE/Upsert,
   transactions, `ForUpdate`, and the statement cache are rejected.
-- The ClickHouse channel interpolates client-side, so rio binds time as
-  offset-carrying microsecond text, rejects values the server would clamp,
-  and binds `[]byte` as String (`Array(UInt8)` corrupts).
+- The ClickHouse channel interpolates client-side. rio passes times through
+  for the driver to render as epoch-microsecond expressions — the only form
+  the primary-key range analyzer accepts — rejects values the server would
+  clamp, and binds `[]byte` as String (`Array(UInt8)` corrupts).
 - The lexer follows ClickHouse quoting and comment rules; `??` produces the
   driver's literal escape; unparseable regions reject argument-carrying
   statements.

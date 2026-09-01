@@ -159,12 +159,7 @@ func (sqliteDialect) translate(err error) error {
 
 // --- ClickHouse ---
 
-// chTimeFormat is rio's canonical ClickHouse time encoding: text, because
-// the channel interpolates client-side; the explicit UTC
-// offset overrides the column's timezone attribute during parsing.
-const chTimeFormat = "2006-01-02 15:04:05.000000+00:00"
-
-// ClickHouse's DateTime64(6) text-binding range.
+// ClickHouse's DateTime64(6) binding range.
 var (
 	chTimeMin = time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
 	chTimeMax = time.Date(9999, 12, 31, 23, 59, 59, 999999000, time.UTC)
@@ -176,7 +171,10 @@ func (clickhouseDialect) name() string      { return "clickhouse" }
 func (clickhouseDialect) lexer() lexProfile { return chLex }
 func (clickhouseDialect) style() bindStyle  { return bindQuestionEsc }
 
-func (clickhouseDialect) bindTime(t time.Time) any { return t.Format(chTimeFormat) }
+// Times pass through: the driver renders them as epoch-microsecond function
+// expressions, which — unlike offset-carrying text — the primary-key range
+// analyzer accepts.
+func (clickhouseDialect) bindTime(t time.Time) any { return t }
 
 func (clickhouseDialect) caps() dialectCaps {
 	// Append-only OLAP: mutations are asynchronous with no affected-row
