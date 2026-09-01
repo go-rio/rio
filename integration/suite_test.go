@@ -446,7 +446,7 @@ func runV03Sync(t *testing.T, db *rio.DB, dialect string) {
 	if err != nil || len(topics) < 2 {
 		t.Fatalf("topics: %v %d", err, len(topics))
 	}
-	if err := rio.SyncRelation(ctx, db, author, "Topics", []int64{topics[1].ID}); err != nil {
+	if err := rio.SyncRelation(ctx, db, author, "Topics", topics[1].ID); err != nil {
 		t.Fatalf("SyncRelation: %v", err)
 	}
 	synced, err := rio.From[Author]().Where("id = ?", author.ID).With("Topics").All(ctx, db)
@@ -456,7 +456,7 @@ func runV03Sync(t *testing.T, db *rio.DB, dialect string) {
 	if got := synced[0].Topics.Rows(); len(got) != 1 || got[0].ID != topics[1].ID {
 		t.Fatalf("synced set: %+v", got)
 	}
-	if err := rio.SyncRelation(ctx, db, author, "Topics", []int64{}); err != nil {
+	if err := rio.ClearRelation(ctx, db, author, "Topics"); err != nil {
 		t.Fatalf("SyncRelation empty: %v", err)
 	}
 	n, err := rio.From[Author]().WhereHas("Topics").Count(ctx, db)
