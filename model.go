@@ -400,7 +400,7 @@ func buildPlan(t reflect.Type) (*plan, error) {
 	p := &plan{
 		typ:          t,
 		structName:   t.Name(),
-		defaultTable: tableName(t.Name()),
+		defaultTable: TableName(t.Name()),
 		byColumn:     make(map[string]*field),
 		rels:         make(map[string]*relField),
 		counts:       make(map[string][]int),

@@ -152,8 +152,8 @@ func TestTableName(t *testing.T) {
 		{"IPv4Address", "i_pv4_addresses"},
 	}
 	for _, g := range golden {
-		if got := tableName(g.in); got != g.want {
-			t.Errorf("tableName(%q) = %q, want %q", g.in, got, g.want)
+		if got := TableName(g.in); got != g.want {
+			t.Errorf("TableName(%q) = %q, want %q", g.in, got, g.want)
 		}
 	}
 }

@@ -162,8 +162,9 @@ var esOPlural = map[string]bool{
 	"veto":   true,
 }
 
-// tableName derives the conventional table name for a struct type:
-// User → users, APIKey → api_keys, Person → people.
-func tableName(structName string) string {
+// TableName derives the conventional table name for a struct type name:
+// User → users, APIKey → api_keys, Person → people. It is the default when
+// no custom table namer is configured.
+func TableName(structName string) string {
 	return pluralize(snakeCase(structName))
 }
