@@ -36,11 +36,13 @@ Four layers inside `github.com/go-rio/rio`:
    callers configure the `database/sql` or pgx pool they construct.
 2. **SQL layer** — per-statement renderers, dialect grammars, the `?`
    placeholder rebinder with per-dialect lexer profiles, `IN (?)` slice
-   expansion (expand first, renumber second). Dialects are an *opaque*
-   interface built into the core (`rio.Postgres`, `rio.MySQL`, `rio.SQLite`,
-   `rio.ClickHouse`); capability flags replace type switches: returning,
-   conflict target, max bind params, FOR UPDATE render/elide/reject, mutations,
-   transactions, unique keys, generated PKs, statement prepare, FINAL.
+   expansion (expand first, renumber second), and subquery splicing (a
+   `Query.Sub` argument renders in place, its placeholders numbered after the
+   ones already emitted). Dialects are an *opaque* interface built into the
+   core (`rio.Postgres`, `rio.MySQL`, `rio.SQLite`, `rio.ClickHouse`);
+   capability flags replace type switches: returning, conflict target, max
+   bind params, row locks render/elide/reject, mutations, transactions, unique
+   keys, generated PKs, statement prepare, FINAL, array binding, native uint64.
    The dialect interface stays internal so capabilities can evolve freely.
 3. **Mapping layer** — reflection-based struct↔table plans, computed once per
    type and cached forever (plans are immutable once published). Scanning has a
@@ -87,18 +89,24 @@ Three mechanisms cover structure, rendering, and preparation:
      across fragments. Missing and excess arguments fail before the driver and
      hooks. Slices expand in `IN (?)` on every terminal path.
    - `WhereHas` and `With` conditions stay inline: nested EXISTS and preloads
-     do not share the main query's argument order.
+     do not share the main query's argument order. Relation options are
+     evaluated when `With`/`WhereHas`/`WithCount` are called, so they are part
+     of the immutable value and of the cached shape.
    - SQL renders under the executing handle's grammar; one Query runs across
      DBs, transactions, dialects, and namers. Stable scalar shapes reuse a
-     cached render; slices and function-valued options bypass it. Cache
-     entries key handles weakly and die with the grammar.
+     cached render; slices, subqueries, and cursors bypass it. Cache entries
+     key handles weakly and die with the grammar.
    - Limit/Offset are ints, not parameters; rebuild paged queries per page.
-3. **`rio.WithStmtCache()`** (opt-in, **default off**) caches `*sql.Stmt` per
-   SQL text on the `*rio.DB` and within each transaction. Both caches are
-   LRU-bounded because each expanded slice length creates a distinct statement.
-   Schema-change errors evict and propagate without an automatic retry. It is
-   off by default for transaction-pooler compatibility and independent of Query
-   reuse. The native channel uses pgx's query execution mode instead.
+   - `Query.Find` is the keyed variant of `First`: the primary-key predicate
+     renders first and binds the leading arguments, so `Must` caches it.
+3. **`rio.WithStmtCache()`** caches `*sql.Stmt` per SQL text on the `*rio.DB`
+   and within each transaction. Both caches are LRU-bounded because each
+   expanded slice length creates a distinct statement. Schema-change errors
+   evict and propagate without an automatic retry. The core leaves it off
+   (transaction-mode poolers cannot hold prepared statements); the sqlite and
+   mysql modules turn it on by default because their drivers re-prepare every
+   statement otherwise, and `WithoutStmtCache` opts out. The native channel
+   uses pgx's query execution mode instead.
 
 ## Model mapping
 
@@ -137,6 +145,10 @@ type User struct {
   error (the statement inserts no value to reference). `UpsertAll` binds every
   column (one statement, one column list), so batch zeros are written on both
   branches. Every other column writes its zero value by default.
+- `rio:",readonly"`: the database computes the column (generated, trigger).
+  It is scanned, loaded back by RETURNING after `Insert` and `Upsert`, and
+  never bound; `Update`, `UpdateAll`, `DoUpdate`, and `DoUpdateSet` reject it
+  by name. It cannot combine with omitzero, version, or softdelete.
 - Composite primary keys: tag multiple fields `rio:",pk"`. `Find` takes all
   parts in field-declaration order. Models without a PK return
   `ErrNoPrimaryKey` from Find/Update/Delete.
@@ -160,11 +172,16 @@ many-to-many relation, `fk:` and `ref:` name the join table columns. Resolution
 is lazy to allow mutually referencing models. A self-referential many-to-many
 relation must name both join columns explicitly.
 
-Preloading uses per-relation `WHERE fk IN (...)` queries, avoiding cartesian
-products and preserving parent pagination. Keys are deduplicated and chunked
-by the dialect's bind limit. Nested paths and relation options are explicit.
-After preloading, containers are resolved to loaded-empty or loaded-nil when no
-row matches. Many-to-many relations across composite keys are unsupported.
+Preloading uses per-relation key-set queries, avoiding cartesian products and
+preserving parent pagination. Keys are deduplicated; where the dialect binds
+arrays (PostgreSQL) the typed key slice is one parameter (`fk = ANY(?)`) and
+the statement text never varies with the key count, elsewhere the keys expand
+into an `IN` list chunked by the bind limit. Loaded rows regroup once into a
+single slab through the container's own type, and every owner receives a
+capped sub-slice (HasOne and BelongsTo owners get their own copies). Nested
+paths and relation options are explicit. After preloading, containers are
+resolved to loaded-empty or loaded-nil when no row matches. Many-to-many
+relations across composite keys are unsupported.
 
 ## Operation semantics
 
@@ -175,6 +192,12 @@ row matches. Many-to-many relations across composite keys are unsupported.
 | `Sole` with 2+ rows | `rio.ErrMultipleRows` |
 | `Update/Delete` with `version` mismatch | `rio.ErrStaleObject` (0 rows affected) |
 | `UpdateAll/DeleteAll` without WHERE | `rio.ErrMissingWhere`; `.AllRows()` opts in explicitly |
+| `UpdateAllReturning/DeleteAllReturning` | the affected rows as stored (a soft delete returns the trashed state); rejected without `RETURNING` (MySQL) |
+| `Upsert` with `DoUpdateSet` | assignments render in canonical column order after `DoUpdate`'s; `Expr` verbatim, other values bound after the row values; the shape keys the SQL cache |
+| `Query.Find` | primary-key lookup under the query's clauses: `WithTrashed` lifts the soft-delete filter, `With` preloads, inline `Where` narrows |
+| `Before(cursor)` | the reversed keyset query, page turned around; `Rows` refuses it |
+| `Chunk(size)` | keyset pages in OrderKeys or primary-key order, stopping at the first short page |
+| Aggregates over no rows | `Sum/Min/Max/Avg` return V's zero value; `sql.Null[V]` reports the NULL |
 | Set-based write with `Limit/Offset/GroupBy/Having` | refused — silently ignoring a Limit would turn "delete ten" into "delete all matching" |
 | Idempotent `Update/Restore` (values already identical) | succeeds everywhere — MySQL counts changed rows, so the ambiguous zero-affected path gets one PK probe |
 | `UpdateAll` affected count | the driver's number, undoctored: MySQL counts changed rows, PostgreSQL/SQLite count matched |
@@ -213,9 +236,10 @@ unique constraints return an error instead of a weaker approximation.
 - Writes: `Insert`, `InsertAll`, explicit `Exec`. UPDATE/DELETE/Upsert,
   transactions, `ForUpdate`, and the statement cache are rejected.
 - The ClickHouse channel interpolates client-side. rio passes times through
-  for the driver to render as epoch-microsecond expressions — the only form
-  the primary-key range analyzer accepts — rejects values the server would
-  clamp, and binds `[]byte` as String (`Array(UInt8)` corrupts).
+  for the driver to render as `toDateTime64` literals — the form every time
+  column's VALUES cast accepts and the primary-key range analyzer folds —
+  rejects values the server would clamp, binds `uint64` as-is, and binds
+  `[]byte` as String (`Array(UInt8)` corrupts).
 - The lexer follows ClickHouse quoting and comment rules; `??` produces the
   driver's literal escape; unparseable regions reject argument-carrying
   statements.
@@ -301,13 +325,16 @@ Each of these is a decision, not a gap:
 
 ## Shipped scope
 
-The core ships mapping, immutable queries, entity and set writes, upsert and
-batch paths, four relation types, nested preloading and counts, optimistic
-locking, soft delete, timestamps, Raw/Exec, reusable validated Query templates,
-cursor pagination (`OrderKeys`/`After`/`CursorAfter`: keyset predicates with
-an automatic primary-key tie-breaker and fingerprinted value-only tokens),
-column generation,
-opt-in statement caching, transactions/savepoints, hooks, error translation,
-and composite keys. ClickHouse implements the read-and-append subset plus
-`Query.Final`. The `lint` subpackage reports decidable drift between models and the live
-schema (PostgreSQL, MySQL, SQLite); unknown types stay silent.
+The core ships mapping, immutable queries, entity and set writes (with
+`RETURNING` variants), upsert and batch paths (`DoUpdate`, `DoUpdateSet`,
+`DoNothing`), four relation types, nested preloading and filtered counts,
+optimistic locking, soft delete, timestamps, readonly columns, row locks with
+`NoWait`/`SkipLocked`, `Distinct` and aggregates, Raw/Exec, subquery
+arguments, reusable validated Query templates, cursor pagination
+(`OrderKeys`/`After`/`Before`/`CursorAt`/`Chunk`: keyset predicates with an
+automatic primary-key tie-breaker and fingerprinted value-only tokens),
+column generation, statement caching, transactions/savepoints, hooks, error
+translation, and composite keys. ClickHouse implements the read-and-append
+subset plus `Query.Final`. The `lint` subpackage reports decidable drift
+between models and the live schema (PostgreSQL, MySQL, SQLite); unknown types
+stay silent.

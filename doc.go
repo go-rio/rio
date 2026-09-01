@@ -11,7 +11,8 @@
 //
 // Queryer is implemented by DB and Tx, so the same query can run inside or
 // outside a transaction. Use ? placeholders for every dialect; slice arguments
-// in IN (?) expressions are expanded at execution time.
+// in IN (?) expressions are expanded at execution time, and a Query.Sub
+// argument splices a subquery in place.
 //
 // Models are ordinary structs. The rio tag configures column names, primary
 // keys, optimistic locking, soft deletion, JSON, timestamp maintenance,

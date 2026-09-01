@@ -90,14 +90,14 @@ Schema migrations live in [go-rio/migrate](https://github.com/go-rio/migrate).
 
 | Area | API |
 |---|---|
-| Query construction | `From[T]`, `Where`, `Having`, `Join`, `OrderBy`, `GroupBy`, `Limit`, `Offset`, `Scope` |
-| Query modifiers | `ForUpdate`, `Final`, `WithTrashed`, `OnlyTrashed`, `AllRows` |
-| Query execution | `All`, `First`, `Sole`, `Rows`, `Count`, `Exists`, `Query[T].Pluck[V]` |
-| Direct lookup and SQL | `Find[T]`, `Raw[T]`, `Exec` |
+| Query construction | `From[T]`, `Where`, `Having`, `Join`, `OrderBy`, `GroupBy`, `Distinct`, `Limit`, `Offset`, `Scope` |
+| Query modifiers | `ForUpdate`, `ForShare`, `Final`, `WithTrashed`, `OnlyTrashed`, `AllRows` |
+| Query execution | `All`, `First`, `Sole`, `Find`, `Rows`, `Chunk`, `Count`, `Exists`, `Pluck[V]`, `Sum/Min/Max/Avg[V]`, `SQL` |
+| Direct lookup and SQL | `Find[T]`, `Raw[T]`, `Exec`, `Query.Sub` |
 | Entity writes | `Insert`, `Update`, `Delete`, `ForceDelete`, `Restore`, `Upsert`, `FirstOrCreate`, `CreateOrFirst` |
-| Batch and set writes | `InsertAll`, `UpsertAll`, `UpdateAll`, `DeleteAll`, `ForceDeleteAll`, `RestoreAll` |
-| Relations | `With`, `WithCount`, `WhereHas`, `WhereHasNot`, `Attach`, `Detach`, `SyncRelation` |
-| Validation and reuse | `Query.Validate`, `Query.Must`, `WithStmtCache` |
+| Batch and set writes | `InsertAll`, `UpsertAll`, `UpdateAll`, `UpdateAllReturning`, `DeleteAll`, `DeleteAllReturning`, `ForceDeleteAll`, `RestoreAll` |
+| Relations | `With`, `WithCount`, `WhereHas`, `WhereHasNot`, `Attach`, `Detach`, `SyncRelation`, `ClearRelation` |
+| Validation and reuse | `Query.Validate`, `Query.Must`, `WithStmtCache`, `WithoutStmtCache` |
 
 ## Queries
 
@@ -113,10 +113,17 @@ var adults = rio.From[User]().
 
 users, err := adults.All(ctx, db, 18)
 emails, err := adults.Pluck[string](ctx, db, "email", 18)
+total, err := adults.Sum[int64](ctx, db, "age", 18)
+user, err := adults.With("Posts").Find(ctx, db, 42) // by primary key, under the query's clauses
 ```
 
 `Validate` returns structural errors; `Must` panics instead and returns the
-query, for package variables. Neither touches the database.
+query, for package variables. Neither touches the database. `SQL(db, args...)`
+renders the statement `All` would run.
+
+`Sum`, `Min`, `Max`, and `Avg` aggregate a mapped column and return the zero
+value over no rows (`sql.Null[V]` tells the two apart). `Distinct` applies to
+entity rows, `Pluck`, `Count` (distinct primary keys), `Sum`, and `Avg`.
 
 Parameters per fragment:
 
@@ -124,14 +131,17 @@ Parameters per fragment:
 - `Where("age >= ?")` — deferred, consumes terminal arguments in SQL order.
 - `Where("active")` — no placeholders.
 
-Slices expand inside `IN (?)`; an empty slice is an error. Missing or excess
-arguments fail before the driver sees the query. `??` emits a literal `?`.
+Slices expand inside `IN (?)`; an empty slice is an error. A one-column
+query embeds the same way: `Where("id IN (?)", banned.Sub("user_id"))` splices
+the subquery and its arguments in place. Missing or excess arguments fail
+before the driver sees the query. `??` emits a literal `?`.
 `Join`/`OrderBy`/`GroupBy` take no placeholders, and `RelWhere` arguments are
 always inline.
 
 `Rows` streams without materializing the slice; it rejects `With`/`WithCount`.
-`WithStmtCache` (off by default) caches prepared statements per DB and per
-transaction — don't use it behind transaction- or statement-mode poolers.
+`WithStmtCache` caches prepared statements per DB and per transaction; the
+sqlite and mysql modules turn it on by default, and `WithoutStmtCache` opts
+out behind transaction- or statement-mode poolers.
 
 ### Cursor pagination
 
@@ -194,6 +204,10 @@ Error rolls back, `nil` commits, `Tx` on a `*Tx` opens a savepoint. Batch
 operations never start hidden transactions — wrap them in `DB.Tx` when all
 chunks must land together.
 
+`ForUpdate` and `ForShare` take `rio.NoWait` or `rio.SkipLocked`; the
+queue-worker idiom is `Where("state = ?", "queued").ForUpdate(rio.SkipLocked).Limit(1)`.
+SQLite elides row locks, ClickHouse rejects them.
+
 ## Models and relations
 
 | Declaration | Meaning |
@@ -206,6 +220,7 @@ chunks must land together.
 | `rio:",softdelete"` | deletion timestamp driving soft-delete operations |
 | `rio:",json"` | encode and scan as JSON |
 | `rio:",omitzero"` | skip zero value on single-row insert so defaults apply |
+| `rio:",readonly"` | database-computed column: scanned and loaded back after `Insert`/`Upsert`, never written |
 | `rio:",countof:Posts"` | `int64` target for `WithCount("Posts")` |
 | `rio:",nostamp"` | opt out of `CreatedAt`/`UpdatedAt` maintenance |
 | `rio:"-"` | ignored field |
@@ -214,15 +229,20 @@ chunks must land together.
 Relations are `HasMany[T]`, `HasOne[T]`, `BelongsTo[T]`, `ManyToMany[T]`;
 `fk:`/`ref:`/`join:` tags override conventions. Relation APIs take Go field
 names (`With("Posts.Comments")`), column APIs take column names. Preloads run
-as separate `IN` queries, never JOINs, and never lazily.
+as separate key-set queries (one array parameter on PostgreSQL, an `IN` list
+elsewhere), never JOINs, and never lazily. `WithCount` takes `RelWhere` and
+`RelWithTrashed` to count a subset.
 
 ## Writes and errors
 
 `Update` writes every eligible field — zero values included — unless given a
-column whitelist. Set-based writes require a condition (`AllRows()` opts out).
-`Upsert` supports conflict targets, update whitelists, `DoNothing`, and
-`KeepTrashed`. `InsertAll`/`UpsertAll` chunk at the dialect bind limit; batch
-writes share one column list, so `omitzero` doesn't apply.
+column whitelist. Set-based writes require a condition (`AllRows()` opts out);
+`UpdateAllReturning` and `DeleteAllReturning` hand the affected rows back
+where the dialect has `RETURNING`. `Upsert` supports conflict targets, update
+whitelists, `DoUpdateSet` for expressions (`rio.Expr("hits + excluded.hits")`)
+or bound values, `DoNothing`, and `KeepTrashed`. `InsertAll`/`UpsertAll`
+chunk at the dialect bind limit; batch writes share one column list, so
+`omitzero` doesn't apply.
 
 | Condition | Result |
 |---|---|
@@ -240,9 +260,9 @@ Times are normalized to UTC, microsecond precision.
 
 | Dialect | Behavior |
 |---|---|
-| PostgreSQL | `RETURNING` everywhere, including `InsertAll` backfill; row locks. The driver module adds a pgx-native channel: batched preload round trips and `COPY`-backed bulk inserts. |
-| MySQL | `Insert` backfills via `LastInsertId`; batch inserts don't backfill. `DoUpdate` needs MySQL 8.0.19+ (no MariaDB); `DoNothing` works everywhere. |
-| SQLite | Pure-Go driver. `RETURNING` where backfill needs it; `ForUpdate` is a no-op (no row locks). |
+| PostgreSQL | `RETURNING` everywhere, including `InsertAll` backfill; row locks with `NoWait`/`SkipLocked`; preload key sets bind as one array (`= ANY`). The driver module adds a pgx-native channel: batched preload round trips and `COPY`-backed bulk inserts. |
+| MySQL | `Insert` backfills via `LastInsertId`; batch inserts don't backfill; no `RETURNING`. `DoUpdate` needs MySQL 8.0.19+ (no MariaDB); `DoNothing` works everywhere. Statement cache on by default. |
+| SQLite | Pure-Go driver. `RETURNING` where backfill needs it; row locks are no-ops. Statement cache, UTC time binding, and `BEGIN IMMEDIATE` on by default. |
 | ClickHouse | Reads, preloads, `Insert`, `InsertAll`. Rejects row locks, transactions, statement caching, synchronous update/delete, and conflict upserts — use `ReplacingMergeTree` + `Final`. No backfill; supply IDs yourself. |
 
 ## Security
@@ -251,7 +271,7 @@ Values always bind as parameters. SQL fragments do not:
 
 | Input | APIs | Rule |
 |---|---|---|
-| Mapped columns | `Update` columns, `Set` keys, `Pluck`, `OnConflict`, `DoUpdate` | validated against the model, quoted as identifiers |
+| Mapped columns | `Update` columns, `Set` keys, `Pluck`, aggregates, `Sub`, `OnConflict`, `DoUpdate`, `DoUpdateSet` | validated against the model, quoted as identifiers |
 | Relation paths | `With`, `WithCount`, `WhereHas`, relation writes | validated against the model's relations |
 | SQL text | `Where`, `Having`, `Join`, `OrderBy`, `GroupBy`, `RelWhere`, `Expr`, `Raw`, `Exec` | rendered verbatim — constants only, never untrusted input |
 
