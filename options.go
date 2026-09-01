@@ -70,10 +70,10 @@ func WithoutArgs() Option {
 }
 
 // WithStmtCache enables bounded prepared-statement caches; the DB and each
-// transaction own separate caches. Off by default; unsuitable for
-// transaction/statement-mode poolers. Schema-change errors evict entries and
-// are not retried. New panics if used with ClickHouse, which cannot prepare
-// general queries.
+// transaction own separate caches. The sqlite and mysql modules enable it by
+// default; WithoutStmtCache opts out for transaction/statement-mode poolers.
+// Schema-change errors evict entries and are not retried. New panics if used
+// with ClickHouse, which cannot prepare general queries.
 func WithStmtCache(capacity ...int) Option {
 	return func(c *config) {
 		c.stmtCache = true
@@ -81,6 +81,12 @@ func WithStmtCache(capacity ...int) Option {
 			c.stmtCap = capacity[0]
 		}
 	}
+}
+
+// WithoutStmtCache disables the prepared-statement caches, overriding a driver
+// module's default.
+func WithoutStmtCache() Option {
+	return func(c *config) { c.stmtCache = false }
 }
 
 // grammar isolates SQL caches by dialect and rendering options.
