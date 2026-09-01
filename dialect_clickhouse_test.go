@@ -452,7 +452,7 @@ func TestClickHouseRejectionMatrix(t *testing.T) {
 			"rio: Detach is not supported on clickhouse (join-table DELETE is an asynchronous mutation); use rio.Exec",
 		},
 		"SyncRelation": {
-			func(db *DB) error { return SyncRelation(ctx, db, acc, "Tags", []int64{1}) },
+			func(db *DB) error { return SyncRelation(ctx, db, acc, "Tags", int64(1)) },
 			"rio: SyncRelation is not supported on clickhouse (needs a transaction and row locks)",
 		},
 		"InsertZeroID": {
@@ -487,7 +487,7 @@ func TestCapabilityRejectionsAreErrUnsupported(t *testing.T) {
 		"Tx":           func(db *DB) error { return db.Tx(ctx, func(tx *Tx) error { return nil }) },
 		"ForUpdate":    func(db *DB) error { _, err := From[User]().ForUpdate().All(ctx, db); return err },
 		"Attach":       func(db *DB) error { return Attach(ctx, db, acc, "Tags", 1) },
-		"SyncRelation": func(db *DB) error { return SyncRelation(ctx, db, acc, "Tags", []int64{1}) },
+		"SyncRelation": func(db *DB) error { return SyncRelation(ctx, db, acc, "Tags", int64(1)) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := call(newFakeDB().open(ClickHouse))

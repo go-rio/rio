@@ -94,8 +94,8 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 		opt(&spec)
 	}
 	spec.normalize()
-	if spec.doNothing && len(spec.update) > 0 {
-		return errors.New("rio: UpsertAll cannot combine DoNothing with DoUpdate")
+	if spec.doNothing && (len(spec.update) > 0 || len(spec.sets) > 0) {
+		return errors.New("rio: UpsertAll cannot combine DoNothing with DoUpdate/DoUpdateSet")
 	}
 	p, err := planOf[T]()
 	if err != nil {
@@ -130,12 +130,16 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 	if err != nil {
 		return err
 	}
+	setArgs, err := spec.appendSetArgs(nil, p, d)
+	if err != nil {
+		return err
+	}
 
-	chunk := max(d.caps().maxBindParams/len(cols), 1)
+	chunk := max((d.caps().maxBindParams-len(setArgs))/len(cols), 1)
 	table := g.table(p)
 	bits, cacheable := setBits(p, cols)
 	bn := binder{d: d, now: now}
-	args := make([]any, 0, min(chunk, len(rows))*len(cols))
+	args := make([]any, 0, min(chunk, len(rows))*len(cols)+len(setArgs))
 	for start := 0; start < len(rows); start += chunk {
 		end := min(start+chunk, len(rows))
 		part := rows[start:end]
@@ -165,6 +169,7 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 		if err != nil {
 			return err
 		}
+		args = append(args, setArgs...)
 		if _, err := run(
 			ctx,
 			db,

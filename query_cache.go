@@ -23,6 +23,7 @@ const (
 	queryCacheExists
 	queryCachePluck
 	queryCacheAggregate
+	queryCacheFind
 )
 
 // queryCacheKey identifies one rendered shape. The grammar is held weakly so
@@ -157,6 +158,15 @@ func newCachedQuery(
 	var missing []cachedDeferred
 	execIndex := 0
 	argIndex := 0
+	if s.keyed {
+		// The primary-key predicate renders first and binds the leading
+		// execution arguments.
+		for range p.pks {
+			positions[execIndex] = argIndex
+			execIndex++
+			argIndex++
+		}
+	}
 
 	staticArgs := func(values []any) bool {
 		for _, value := range values {

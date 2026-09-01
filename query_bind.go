@@ -11,17 +11,22 @@ func prepareQueryState[T any](d Dialect, s *queryState, execArgs []any) (*plan, 
 	if err := validateQueryState(p, s); err != nil {
 		return nil, queryState{}, err
 	}
-	bound, err := bindQueryState(d, s, execArgs)
+	bound, err := bindQueryState(d, p, s, execArgs)
 	if err != nil {
 		return nil, queryState{}, err
 	}
 	return p, bound, nil
 }
 
-// bindQueryState returns an execution-local state without mutating s or execArgs.
-func bindQueryState(d Dialect, s *queryState, execArgs []any) (queryState, error) {
+// bindQueryState returns an execution-local state without mutating s or
+// execArgs. A keyed state consumes the primary-key values first.
+func bindQueryState(d Dialect, p *plan, s *queryState, execArgs []any) (queryState, error) {
 	out := *s
 	argIndex := 0
+	if s.keyed {
+		argIndex = len(p.pks)
+		out.keyArgs = execArgs[:argIndex:argIndex]
+	}
 
 	bind := func(clause string, src []cond) ([]cond, error) {
 		dst := src

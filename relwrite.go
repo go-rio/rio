@@ -52,8 +52,8 @@ func Detach[T any, K any](ctx context.Context, db Queryer, row *T, relation stri
 }
 
 // SyncRelation makes a ManyToMany relation match ids exactly in a transaction.
-// An empty ids slice explicitly clears the relation.
-func SyncRelation[T any, K any](ctx context.Context, db Queryer, row *T, relation string, ids []K) error {
+// No ids clears the relation.
+func SyncRelation[T any, K any](ctx context.Context, db Queryer, row *T, relation string, ids ...K) error {
 	p, _, res, ownerKey, err := joinWriteTarget("SyncRelation", db, row, relation)
 	if err != nil {
 		return err
@@ -129,6 +129,11 @@ func SyncRelation[T any, K any](ctx context.Context, db Queryer, row *T, relatio
 		}
 		return insertJoinRows(ctx, tx, p, res, ownerKey, toInsert)
 	})
+}
+
+// ClearRelation unlinks every row of a ManyToMany relation.
+func ClearRelation[T any](ctx context.Context, db Queryer, row *T, relation string) error {
+	return SyncRelation[T, int64](ctx, db, row, relation)
 }
 
 // insertJoinRows writes join rows in dialect-sized chunks.

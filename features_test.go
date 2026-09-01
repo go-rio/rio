@@ -679,7 +679,7 @@ func TestNilRowsReturnErrors(t *testing.T) {
 		"Upsert":       Upsert(ctx, db, user, OnConflict("email")),
 		"Attach":       Attach[Account, int64](ctx, db, account, "Tags", 1),
 		"Detach":       Detach[Account, int64](ctx, db, account, "Tags", 1),
-		"SyncRelation": SyncRelation[Account, int64](ctx, db, account, "Tags", []int64{1}),
+		"SyncRelation": SyncRelation[Account, int64](ctx, db, account, "Tags", int64(1)),
 	} {
 		if err == nil || !strings.Contains(err.Error(), "nil") {
 			t.Fatalf("%s must return a nil-row error, got %v", name, err)
@@ -792,6 +792,131 @@ func TestReadonlyColumn(t *testing.T) {
 	}
 	if _, err := planOf[bad](); err == nil || !strings.Contains(err.Error(), "readonly cannot combine") {
 		t.Fatalf("role clash: %v", err)
+	}
+}
+
+func TestSetOpsReturning(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+
+	f.queueRows(userCols, userRow(1, "a@x"), userRow(2, "b@x"))
+	rows, err := From[User]().Where("age > ?", 18).UpdateAllReturning(ctx, db, Set{"email": "new@x"})
+	if err != nil || len(rows) != 2 || rows[1].ID != 2 {
+		t.Fatalf("UpdateAllReturning: %v %+v", err, rows)
+	}
+	want := `UPDATE "users" SET "email" = $1, "updated_at" = $2 WHERE (age > $3) AND "users"."deleted_at" IS NULL RETURNING "users"."id", "users"."email"`
+	if got := f.loggedContaining("UPDATE")[0].sql; !strings.HasPrefix(got, want) {
+		t.Fatalf("update returning:\n got: %s\nwant prefix: %s", got, want)
+	}
+
+	f.queueRows(userCols, userRow(1, "a@x"))
+	gone, err := From[User]().Where("id = ?", 1).DeleteAllReturning(ctx, db)
+	if err != nil || len(gone) != 1 {
+		t.Fatalf("soft DeleteAllReturning: %v %+v", err, gone)
+	}
+	if got := f.loggedContaining(`SET "deleted_at"`)[0].sql; !strings.Contains(got, `AND "users"."deleted_at" IS NULL RETURNING "users"."id"`) {
+		t.Fatalf("soft delete returning: %s", got)
+	}
+
+	f.queueRows(orgCols, []driver.Value{int64(7), "acme"})
+	orgs, err := From[Org]().Where("id = ?", 7).DeleteAllReturning(ctx, db)
+	if err != nil || len(orgs) != 1 || orgs[0].Name != "acme" {
+		t.Fatalf("DeleteAllReturning: %v %+v", err, orgs)
+	}
+	if got := f.loggedContaining("DELETE")[0].sql; got != `DELETE FROM "orgs" WHERE (id = $1) RETURNING "orgs"."id", "orgs"."name"` {
+		t.Fatalf("delete returning: %s", got)
+	}
+
+	my := newFakeDB().open(MySQL)
+	if _, err := From[Org]().Where("id = ?", 7).DeleteAllReturning(ctx, my); err == nil || !strings.Contains(err.Error(), "not supported on mysql") {
+		t.Fatalf("mysql: %v", err)
+	}
+}
+
+func TestDoUpdateSet(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	o := &Org{ID: 1, Name: "acme"}
+
+	f.queueRows(orgCols, []driver.Value{int64(1), "acme!"})
+	if err := Upsert(ctx, db, o, OnConflict("id"), DoUpdateSet(Set{"name": Expr("excluded.name || '!'")})); err != nil {
+		t.Fatal(err)
+	}
+	want := `INSERT INTO "orgs" ("id", "name") VALUES ($1, $2) ON CONFLICT ("id") DO UPDATE SET "name" = excluded.name || '!' RETURNING "orgs"."id", "orgs"."name"`
+	if got := f.loggedContaining("ON CONFLICT")[0]; got.sql != want || len(got.args) != 2 {
+		t.Fatalf("expr set:\n got: %s %v\nwant: %s", got.sql, got.args, want)
+	}
+
+	f.queueRows(orgCols, []driver.Value{int64(1), "x"})
+	if err := Upsert(ctx, db, o, OnConflict("id"), DoUpdateSet(Set{"name": "x"})); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.loggedContaining("ON CONFLICT")[1]; !strings.Contains(got.sql, `DO UPDATE SET "name" = $3 RETURNING`) || got.args[2] != "x" {
+		t.Fatalf("bound set: %s %v", got.sql, got.args)
+	}
+
+	fm := newFakeDB()
+	my := fm.open(MySQL)
+	fm.queueExec(0, 2)
+	if err := Upsert(ctx, my, o, DoUpdateSet(Set{"name": "y"})); err != nil {
+		t.Fatal(err)
+	}
+	if got := fm.loggedContaining("ON DUPLICATE")[0]; !strings.HasSuffix(got.sql, "ON DUPLICATE KEY UPDATE `name` = ?") || got.args[2] != "y" {
+		t.Fatalf("mysql set: %s %v", got.sql, got.args)
+	}
+
+	f.queueExec(0, 2)
+	if err := UpsertAll(ctx, db, []Org{{ID: 1, Name: "a"}, {ID: 2, Name: "b"}}, OnConflict("id"), DoUpdateSet(Set{"name": "z"})); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.loggedContaining("($3, $4)")[0]; !strings.HasSuffix(got.sql, `DO UPDATE SET "name" = $5`) || len(got.args) != 5 || got.args[4] != "z" {
+		t.Fatalf("batch set: %s %v", got.sql, got.args)
+	}
+
+	for name, err := range map[string]error{
+		"DoNothing":  Upsert(ctx, db, o, OnConflict("id"), DoNothing(), DoUpdateSet(Set{"name": "x"})),
+		"maintained": Upsert(ctx, db, o, OnConflict("id"), DoUpdateSet(Set{"id": 9})),
+		"duplicate":  Upsert(ctx, db, o, OnConflict("id"), DoUpdate("name"), DoUpdateSet(Set{"name": "x"})),
+		"unknown":    Upsert(ctx, db, o, OnConflict("id"), DoUpdateSet(Set{"nope": 1})),
+	} {
+		if err == nil {
+			t.Fatalf("%s must be rejected", name)
+		}
+	}
+}
+
+func TestQueryFind(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	q := From[User]().WithTrashed().With("Posts").Must()
+	for _, id := range []int64{1, 2} {
+		f.queueRows(userCols, userRow(id, "a@x"))
+		f.queueRows(postCols)
+		u, err := q.Find(ctx, db, id)
+		if err != nil || u.ID != id || !u.Posts.Loaded() {
+			t.Fatalf("Find(%d): %v %+v", id, err, u)
+		}
+	}
+	mains := f.loggedContaining(`FROM "users"`)
+	if len(mains) != 2 || mains[0].sql != mains[1].sql || mains[1].args[0] != int64(2) {
+		t.Fatalf("cached find: %+v", mains)
+	}
+	if got := mains[0].sql; !strings.Contains(got, `WHERE "users"."id" = $1`) || strings.Contains(got, `"deleted_at" IS NULL`) || !strings.HasSuffix(got, "LIMIT 1") {
+		t.Fatalf("find sql: %s", got)
+	}
+	entries := 0
+	q.cache.entries.Range(func(_, _ any) bool { entries++; return true })
+	if entries != 1 {
+		t.Fatalf("cache entries = %d", entries)
+	}
+	if _, err := From[Grant]().Find(ctx, db, 1); err == nil || !strings.Contains(err.Error(), "2 key part(s)") {
+		t.Fatalf("composite arity: %v", err)
+	}
+	if _, err := From[User]().Where("age > ?").Find(ctx, db, 1); err == nil {
+		t.Fatal("a deferred Where has no argument channel through Find")
 	}
 }
 
@@ -1632,7 +1757,7 @@ func TestAttachDetach(t *testing.T) {
 	if err := Attach(ctx, db, &User{ID: 1}, "Posts", 1); err == nil || !strings.Contains(err.Error(), "ManyToMany") {
 		t.Fatalf("HasMany attach must refuse: %v", err)
 	}
-	if err := SyncRelation(ctx, db, &User{ID: 1}, "Posts", []int64{1}); err == nil || !strings.Contains(err.Error(), "SyncRelation handles ManyToMany") {
+	if err := SyncRelation(ctx, db, &User{ID: 1}, "Posts", int64(1)); err == nil || !strings.Contains(err.Error(), "SyncRelation handles ManyToMany") {
 		t.Fatalf("SyncRelation errors must name the operation: %v", err)
 	}
 }
@@ -1765,7 +1890,7 @@ func TestSyncRelation(t *testing.T) {
 		[]driver.Value{int64(1)}, []driver.Value{int64(2)}, []driver.Value{int64(3)})
 	f.queueExec(0, 1) // delete stale
 	f.queueExec(0, 1) // insert missing
-	if err := SyncRelation(ctx, db, acc, "Tags", []int64{2, 3, 4}); err != nil {
+	if err := SyncRelation(ctx, db, acc, "Tags", int64(2), int64(3), int64(4)); err != nil {
 		t.Fatalf("SyncRelation: %v", err)
 	}
 	logs := f.logged()
@@ -1798,7 +1923,7 @@ func TestSyncRelation(t *testing.T) {
 	db1 := f1.open()
 	f1.queueRows([]string{"id"}, []driver.Value{int64(7)})
 	f1.queueRows([]string{"tag_id"}, []driver.Value{int64(2)})
-	if err := SyncRelation(ctx, db1, acc, "Tags", []int64{2}); err != nil {
+	if err := SyncRelation(ctx, db1, acc, "Tags", int64(2)); err != nil {
 		t.Fatalf("SyncRelation no-op: %v", err)
 	}
 	if got := strings.Join(f1.logged(), " | "); strings.Contains(got, "DELETE") || strings.Contains(got, "INSERT") {
@@ -1809,7 +1934,7 @@ func TestSyncRelation(t *testing.T) {
 	f2 := newFakeDB()
 	db2 := f2.open()
 	f2.queueExec(0, 3)
-	if err := SyncRelation(ctx, db2, acc, "Tags", []int64{}); err != nil {
+	if err := ClearRelation(ctx, db2, acc, "Tags"); err != nil {
 		t.Fatalf("SyncRelation empty: %v", err)
 	}
 	if !strings.Contains(strings.Join(f2.logged(), " | "), `DELETE FROM "account_tags" WHERE "account_id" = $1 |`) {
@@ -2079,7 +2204,7 @@ func TestSyncRelationLocksOwner(t *testing.T) {
 	f.queueExec(0, 1)
 	f.queueExec(0, 1)
 
-	if err := SyncRelation(ctx, db, &Account{ID: 7}, "Tags", []int64{100}); err != nil {
+	if err := SyncRelation(ctx, db, &Account{ID: 7}, "Tags", int64(100)); err != nil {
 		t.Fatalf("SyncRelation: %v", err)
 	}
 	joined := strings.Join(f.logged(), " | ")
@@ -2101,7 +2226,7 @@ func TestSyncRelationLocksOwner(t *testing.T) {
 	db2 := f2.open(SQLite)
 	f2.queueRows([]string{"tag_id"})
 	f2.queueExec(0, 1)
-	if err := SyncRelation(ctx, db2, &Account{ID: 7}, "Tags", []int64{100}); err != nil {
+	if err := SyncRelation(ctx, db2, &Account{ID: 7}, "Tags", int64(100)); err != nil {
 		t.Fatalf("sqlite sync: %v", err)
 	}
 	if strings.Contains(strings.Join(f2.logged(), " "), "FOR UPDATE") {
@@ -2683,7 +2808,7 @@ func TestSyncRelationChunksDeletes(t *testing.T) {
 	f.queueExec(0, 998)
 	f.queueExec(0, 201)
 
-	if err := SyncRelation(ctx, db, &Account{ID: 7}, "Tags", []int64{1}); err != nil {
+	if err := SyncRelation(ctx, db, &Account{ID: 7}, "Tags", int64(1)); err != nil {
 		t.Fatalf("SyncRelation: %v", err)
 	}
 	deletes := f.loggedContaining("DELETE FROM")

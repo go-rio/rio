@@ -56,6 +56,11 @@ type queryState struct {
 	// before are the page edges.
 	orderKeys     []SortKey
 	after, before *Cursor
+
+	// keyed renders the primary-key predicate first (Query.Find); keyArgs
+	// holds its bound values in an execution-local state.
+	keyed   bool
+	keyArgs []any
 }
 
 // hasCond describes one WhereHas or WhereHasNot EXISTS predicate.
@@ -258,12 +263,36 @@ func (q Query[T]) All(ctx context.Context, db Queryer, args ...any) ([]T, error)
 // First returns the first matching row or ErrNotFound. It adds LIMIT 1 only
 // when no limit was set and never adds an order.
 func (q Query[T]) First(ctx context.Context, db Queryer, args ...any) (*T, error) {
+	return q.first(ctx, db, queryCacheFirst, args)
+}
+
+// Find fetches a row by primary key under the query's clauses: WithTrashed,
+// With, WithCount, and inline Where all apply, and Must caches the shape.
+// Composite key parts follow struct-field declaration order; the package
+// Find is the plain cached lookup.
+func (q Query[T]) Find(ctx context.Context, db Queryer, key ...any) (*T, error) {
+	p, err := planOf[T]()
+	if err != nil {
+		return nil, err
+	}
+	if len(p.pks) == 0 {
+		return nil, fmt.Errorf("%w: %s", ErrNoPrimaryKey, p.structName)
+	}
+	if len(key) != len(p.pks) {
+		return nil, fmt.Errorf("rio: Find[%s] needs %d key part(s) (%s), got %d",
+			p.structName, len(p.pks), pkColumns(p), len(key))
+	}
+	q.s.keyed = true
+	return q.first(ctx, db, queryCacheFind, key)
+}
+
+func (q Query[T]) first(ctx context.Context, db Queryer, op queryCacheOp, args []any) (*T, error) {
 	one := q
 	if !one.s.limitSet {
 		one.s.limit, one.s.limitSet = 1, true
 	}
 	g := db.gram()
-	key := queryCacheKey{grammar: g.weakSelf, op: queryCacheFirst}
+	key := queryCacheKey{grammar: g.weakSelf, op: op}
 	p, state, sqlText, bound, err := prepareCachedSelect[T](
 		one.cache,
 		key,
@@ -999,6 +1028,16 @@ func renderWhere(
 			first = false
 		} else {
 			b = append(b, " AND "...)
+		}
+	}
+	if s.keyed {
+		for i, pk := range p.pks {
+			and()
+			b = d.quote(b, table)
+			b = append(b, '.')
+			b = d.quote(b, pk.column)
+			b = append(b, " = ?"...)
+			args = append(args, s.keyArgs[i])
 		}
 	}
 	for _, w := range s.wheres {
