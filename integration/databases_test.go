@@ -13,6 +13,7 @@ import (
 	"github.com/go-rio/postgres"
 	"github.com/go-rio/rio"
 	"github.com/go-rio/rio/lint"
+	"github.com/go-rio/sqlite"
 	"github.com/go-sql-driver/mysql"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -37,6 +38,21 @@ func TestSQLiteSuite(t *testing.T) {
 
 func TestSQLiteV02Suite(t *testing.T) {
 	db := sqliteDB(t)
+	runV02Suite(t, db, "sqlite")
+	runV03Sync(t, db, "sqlite")
+	runHardening(t, db, "sqlite")
+	runHardDelete(t, db, "sqlite")
+}
+
+// The full SQLite suite must hold identically on the sqlite module's native
+// channel.
+func TestSQLiteNativeSuite(t *testing.T) {
+	db, err := sqlite.Open("file:rio_it_native?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	runSuite(t, db, "sqlite")
 	runV02Suite(t, db, "sqlite")
 	runV03Sync(t, db, "sqlite")
 	runHardening(t, db, "sqlite")
