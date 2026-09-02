@@ -359,9 +359,10 @@ statement cache and the pool.
 | `WithStmtCache(cap)` / `WithoutStmtCache()` | prepared-statement caches (see Queries) |
 
 `NewNative` builds a handle on a driver-native channel (`NativeDB`,
-`NativeTx`, `NativeRows`, with optional `NativeBatcher` and `NativeCopier`
-capabilities discovered by type assertion). It is driver-module SPI;
-applications construct through the driver module (`postgres.OpenNative`).
+`NativeTx`, `NativeRows`, with optional `NativeBatcher`, `NativeCopier`, and
+`NativeLastInserter` capabilities discovered by type assertion). It is
+driver-module SPI; applications construct through the driver module
+(`postgres.OpenNative`, `sqlite.Open`, `clickhouse.Open`).
 
 ### Security
 

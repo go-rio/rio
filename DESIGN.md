@@ -264,10 +264,11 @@ Performance follows a few enforceable rules:
 - Native drivers extend past the frozen `NativeDB`/`NativeTx`/`NativeRows` trio
   through optional interfaces, discovered by type assertion the way
   `database/sql/driver` grows: a `NativeBatcher` collapses each preload layer's
-  statements into one round trip, and a `NativeCopier` streams explicit-key
-  `InsertAll` batches through the driver's bulk-load protocol. Channels without
-  a capability keep the per-statement path; hook events fire per statement
-  either way.
+  statements into one round trip, a `NativeCopier` streams explicit-key
+  `InsertAll` batches through the driver's bulk-load protocol, and a
+  `NativeLastInserter` reports the last inserted row id so SQLite backfills a
+  lone auto-increment key without `RETURNING`. Channels without a capability
+  keep the per-statement path; hook events fire per statement either way.
 - Deterministic fake-driver allocation budgets guard rio's own overhead. Real
   SQLite, MySQL, PostgreSQL, and native pgx benchmarks measure end-to-end cost
   under the documented [benchmark methodology](bench/README.md). Benchmark

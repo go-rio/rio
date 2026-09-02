@@ -142,9 +142,9 @@ func NewNative(nc NativeConfig, dialect Dialect, opts ...Option) *DB {
 	if cfg.stmtCache {
 		panic(
 			"rio: WithStmtCache is not supported on the native channel " +
-				"(no database/sql prepared statements exist here); statement caching belongs to the driver — " +
-				"with pgx, tune the DSN parameter default_query_exec_mode " +
-				"(cache_statement is already its default)",
+				"(no database/sql prepared statements exist here); statement caching belongs to the driver module: " +
+				"pgx caches through the DSN parameter default_query_exec_mode (cache_statement by default), " +
+				"sqlite on every connection",
 		)
 	}
 	handle := nc.Handle
@@ -198,6 +198,40 @@ type NativeCopier interface {
 	CopyIn(ctx context.Context, table []string, columns []string, next func() ([]any, error)) (int64, error)
 }
 
+// NativeLastInserter is an optional capability of a NativeDB or NativeTx:
+// Exec that also reports the last inserted row id, which the SQLite dialect
+// uses to backfill a lone auto-increment key. rio prefers it over Exec.
+type NativeLastInserter interface {
+	ExecLastInsert(ctx context.Context, sql string, args []any) (rowsAffected, lastInsertID int64, err error)
+}
+
+// nativeResult is the sql.Result of a NativeLastInserter exec.
+type nativeResult struct {
+	rows, id int64
+}
+
+func (r nativeResult) LastInsertId() (int64, error) { return r.id, nil }
+func (r nativeResult) RowsAffected() (int64, error) { return r.rows, nil }
+
+// nativeExec runs sqlText through the driver's ExecLastInsert when it has
+// one, plain Exec otherwise.
+func nativeExec(ctx context.Context, nd interface {
+	Exec(ctx context.Context, sql string, args []any) (int64, error)
+}, sqlText string, args []any) (sql.Result, error) {
+	if li, ok := nd.(NativeLastInserter); ok {
+		n, id, err := li.ExecLastInsert(ctx, sqlText, args)
+		if err != nil {
+			return nil, err
+		}
+		return nativeResult{rows: n, id: id}, nil
+	}
+	n, err := nd.Exec(ctx, sqlText, args)
+	if err != nil {
+		return nil, err
+	}
+	return driver.RowsAffected(n), nil
+}
+
 // batchEngine is the internal seam preload probes for round-trip batching.
 type batchEngine interface {
 	batcher() (NativeBatcher, bool)
@@ -231,11 +265,7 @@ type nativeEngine struct {
 }
 
 func (e *nativeEngine) exec(ctx context.Context, sqlText string, args []any) (sql.Result, error) {
-	n, err := e.nd.Exec(ctx, sqlText, args)
-	if err != nil {
-		return nil, err
-	}
-	return driver.RowsAffected(n), nil
+	return nativeExec(ctx, e.nd, sqlText, args)
 }
 
 func (e *nativeEngine) query(ctx context.Context, sqlText string, args []any) (rows, error) {
@@ -274,11 +304,7 @@ type nativeTxEngine struct {
 }
 
 func (e nativeTxEngine) exec(ctx context.Context, sqlText string, args []any) (sql.Result, error) {
-	n, err := e.nt.Exec(ctx, sqlText, args)
-	if err != nil {
-		return nil, err
-	}
-	return driver.RowsAffected(n), nil
+	return nativeExec(ctx, e.nt, sqlText, args)
 }
 
 func (e nativeTxEngine) query(ctx context.Context, sqlText string, args []any) (rows, error) {

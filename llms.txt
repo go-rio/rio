@@ -94,7 +94,7 @@ func main() {
 - `SortKey`, `Cursor`, `Subquery`, `LockOption`, `UpsertOption`, `Option`.
 - `QueryHook`, `QueryEvent` - observation of every statement (`Op`, `Model`, `Query`, `Args`, `Err`, `Duration`, `RowsAffected`, `RowsReturned`, `Phase`).
 - `Dialect` - opaque; `Postgres`, `MySQL`, `SQLite`, `ClickHouse`.
-- `NativeDB`, `NativeTx`, `NativeRows`, `NativeCell`, `NativeBatcher`, `NativeCopier`, `NativeConfig` - driver-module SPI for native execution channels.
+- `NativeDB`, `NativeTx`, `NativeRows`, `NativeCell`, `NativeBatcher`, `NativeCopier`, `NativeLastInserter`, `NativeConfig` - driver-module SPI for native execution channels.
 - `TableSchema`, `ColumnSchema` - model mapping as `DescribeModel` reports it; consumed by the `lint` subpackage (`lint.Check(ctx, db, models...)`).
 
 ### Options

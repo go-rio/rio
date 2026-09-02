@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-02
+
+### Added
+
+- `NativeLastInserter`, an optional native-channel capability: `ExecLastInsert` also reports the last inserted row id, which the SQLite dialect uses to backfill a lone auto-increment key. rio prefers it over `Exec`; the sqlite module's native channel implements it.
+
+### Changed
+
+- The `rio.WithStmtCache` panic on the native channel names both driver modules' caching (pgx's `default_query_exec_mode`, sqlite's per-connection cache).
+
 ## [0.16.1] - 2026-09-02
 
 ### Added
@@ -201,7 +211,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial release.
 
-[Unreleased]: https://github.com/go-rio/rio/compare/v0.16.1...HEAD
+[Unreleased]: https://github.com/go-rio/rio/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/go-rio/rio/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/go-rio/rio/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/go-rio/rio/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/go-rio/rio/compare/v0.14.0...v0.15.0
