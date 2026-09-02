@@ -3,7 +3,7 @@ module github.com/go-rio/rio/integration
 go 1.27.0
 
 require (
-	github.com/go-rio/clickhouse v0.9.2
+	github.com/go-rio/clickhouse v0.9.3
 	github.com/go-rio/postgres v0.8.2
 	github.com/go-rio/rio v0.17.0
 	github.com/go-rio/sqlite v0.6.0
