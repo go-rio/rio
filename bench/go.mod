@@ -3,10 +3,10 @@ module github.com/go-rio/rio/bench
 go 1.27.0
 
 require (
-	github.com/go-rio/mysql v0.5.2
-	github.com/go-rio/postgres v0.8.2
-	github.com/go-rio/rio v0.17.0
-	github.com/go-rio/sqlite v0.6.0
+	github.com/go-rio/mysql v0.5.3
+	github.com/go-rio/postgres v0.8.3
+	github.com/go-rio/rio v0.18.0
+	github.com/go-rio/sqlite v0.6.1
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/libtnb/sqlite v1.2.2
