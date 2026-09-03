@@ -16,6 +16,7 @@ type config struct {
 	stmtCache    bool
 	stmtCap      int
 	driverHandle any
+	noStamps     bool // WithoutStamps: CreatedAt/UpdatedAt belong to the caller
 }
 
 func defaultConfig() *config {

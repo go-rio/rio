@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-02
+
+### Added
+
+- `DB.WithoutStamps` and `Tx.WithoutStamps`: handles whose writes leave `CreatedAt`/`UpdatedAt` to the caller. Inserts bind the struct's values as they are; `Update`, `UpdateAll`, `Delete`, `Restore`, and the conflict branch of `Upsert` drop the `UpdatedAt` assignment. Versions and softdelete stamps are unaffected, and the handle shares its parent's pool and caches.
+
 ## [0.17.0] - 2026-09-02
 
 ### Added
@@ -211,7 +217,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial release.
 
-[Unreleased]: https://github.com/go-rio/rio/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/go-rio/rio/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/go-rio/rio/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/go-rio/rio/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/go-rio/rio/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/go-rio/rio/compare/v0.15.0...v0.16.0

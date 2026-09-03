@@ -29,15 +29,16 @@ type plan struct {
 	tableOverride string // from TableName(), "" otherwise
 	defaultTable  string // convention-derived
 
-	fields    []*field
-	byColumn  map[string]*field
-	pks       []*field
-	updatable []*field // full-column Update set, in field order
-	autoIncr  *field
-	version   *field
-	softDel   *field
-	created   *field
-	updated   *field
+	fields     []*field
+	byColumn   map[string]*field
+	pks        []*field
+	updatable  []*field // full-column Update set, in field order
+	updNoStamp []*field // updatable minus UpdatedAt, for WithoutStamps
+	autoIncr   *field
+	version    *field
+	softDel    *field
+	created    *field
+	updated    *field
 
 	// Insert partitions: every writable column (insAll) or all but the
 	// auto-increment PK (insCols); the back lists are what RETURNING loads.
@@ -361,6 +362,9 @@ func (p *plan) classify() []error {
 			continue
 		}
 		p.updatable = append(p.updatable, f)
+		if !f.isUpdated {
+			p.updNoStamp = append(p.updNoStamp, f)
+		}
 	}
 	for _, f := range p.fields {
 		if f.omitZero {

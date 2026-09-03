@@ -43,7 +43,7 @@ func InsertAll[T any](ctx context.Context, db Queryer, rows []T) error {
 		}
 	}
 	for i := range rows {
-		stampForInsert(p, reflect.ValueOf(&rows[i]).Elem(), now)
+		stampForInsert(p, reflect.ValueOf(&rows[i]).Elem(), now, !db.conf().noStamps)
 	}
 
 	cols, backfill, err := batchColumns(p, rows)
@@ -111,6 +111,7 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 	if needsConflictTarget && len(spec.conflict) == 0 {
 		return errors.New("rio: UpsertAll with DoUpdate needs OnConflict(columns...) naming the unique index")
 	}
+	spec.noStamps = db.conf().noStamps
 	now := normalizeTime(db.conf().clock())
 	for i := range rows {
 		prepareUpsertRow(

@@ -61,6 +61,7 @@ type upsertSpec struct {
 	setKeys     []string // sets in canonical order, after normalize
 	doNothing   bool
 	keepTrashed bool
+	noStamps    bool // the handle's WithoutStamps
 	conflictBuf [1]string
 	updateBuf   [1]string
 }
@@ -136,6 +137,9 @@ func upsertSpecKey(spec *upsertSpec, update []*field) upsertCacheKey {
 	if spec.keepTrashed {
 		key.flags |= 2
 	}
+	if spec.noStamps {
+		key.flags |= 4
+	}
 	for _, f := range update {
 		key.update |= 1 << uint(f.ordinal)
 	}
@@ -208,6 +212,7 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 	if err != nil {
 		return err
 	}
+	spec.noStamps = db.conf().noStamps
 	now := normalizeTime(db.conf().clock())
 	prepareUpsertRow(
 		p,
@@ -521,8 +526,8 @@ func appendMySQLUpsertAlias(b []byte) []byte {
 }
 
 func prepareUpsertRow(p *plan, rv reflect.Value, spec *upsertSpec, now time.Time) {
-	stampForInsert(p, rv, now)
-	if p.updated != nil && !spec.doNothing {
+	stampForInsert(p, rv, now, !spec.noStamps)
+	if p.updated != nil && !spec.doNothing && !spec.noStamps {
 		// The conflict branch reads UpdatedAt from the would-be inserted row.
 		setTime(p.updated, rv, now)
 	}
@@ -588,7 +593,7 @@ func upsertUpdateSet(p *plan, spec *upsertSpec, skipped []*field) ([]*field, err
 		}
 		out = append(out, f)
 	}
-	hasNoAssignments := len(out) == 0 && p.updated == nil && p.version == nil &&
+	hasNoAssignments := len(out) == 0 && (p.updated == nil || spec.noStamps) && p.version == nil &&
 		(p.softDel == nil || spec.keepTrashed)
 	if hasNoAssignments {
 		// Every dialect requires at least one update assignment.
@@ -669,7 +674,7 @@ func appendConflictSets(
 			b = append(b, '?')
 		}
 	}
-	if p.updated != nil {
+	if p.updated != nil && !spec.noStamps {
 		sep()
 		b = d.quote(b, p.updated.column)
 		b = append(b, " = "...)

@@ -4536,3 +4536,190 @@ func TestChunkWalksKeysetPages(t *testing.T) {
 		break
 	}
 }
+
+// WithoutStamps writes the struct's CreatedAt/UpdatedAt as they are.
+func TestWithoutStampsInsert(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite).WithoutStamps()
+
+	u := &User{Email: "a@x"}
+	if err := Insert(ctx, db, u); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if !u.CreatedAt.IsZero() || !u.UpdatedAt.IsZero() {
+		t.Fatalf("stamps written: %+v", u)
+	}
+	if u.Version != 1 {
+		t.Fatalf("version must still initialize: %d", u.Version)
+	}
+	args := f.loggedContaining("INSERT")[0].args
+	zero := driver.Value(normalizeTime(time.Time{}).Format("2006-01-02 15:04:05.999999+00:00"))
+	if args[len(args)-1] != zero || args[len(args)-2] != zero {
+		t.Fatalf("zero times should bind as the zero instant, got %v", args)
+	}
+}
+
+func TestWithoutStampsUpdatePaths(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name string
+		run  func(*testing.T, Queryer) error
+		want string
+	}{
+		{
+			name: "Update",
+			run:  func(_ *testing.T, db Queryer) error { return Update(ctx, db, &User{ID: 1, Email: "a@x", Version: 2}) },
+			want: `UPDATE "users" SET "email" = ?, "age" = ?, "bio" = ?, "version" = "version" + 1 WHERE "id" = ? AND "version" = ?`,
+		},
+		{
+			name: "Update whitelist",
+			run: func(_ *testing.T, db Queryer) error {
+				return Update(ctx, db, &User{ID: 1, Email: "a@x", Version: 2}, "email")
+			},
+			want: `UPDATE "users" SET "email" = ?, "version" = "version" + 1 WHERE "id" = ? AND "version" = ?`,
+		},
+		{
+			name: "Delete",
+			run:  func(_ *testing.T, db Queryer) error { return Delete(ctx, db, &User{ID: 1, Version: 2}) },
+			want: `UPDATE "users" SET "deleted_at" = ?, "version" = "version" + 1 WHERE "id" = ? AND "version" = ? AND "deleted_at" IS NULL`,
+		},
+		{
+			name: "Restore",
+			run: func(_ *testing.T, db Queryer) error {
+				del := testNow
+				return Restore(ctx, db, &User{ID: 1, Version: 2, DeletedAt: &del})
+			},
+			want: `UPDATE "users" SET "deleted_at" = NULL, "version" = "version" + 1 WHERE "id" = ? AND "version" = ? AND "deleted_at" IS NOT NULL`,
+		},
+		{
+			name: "UpdateAll",
+			run: func(_ *testing.T, db Queryer) error {
+				_, err := From[User]().Where("age > ?", 18).UpdateAll(ctx, db, Set{"email": "a@x"})
+				return err
+			},
+			want: `UPDATE "users" SET "email" = ? WHERE (age > ?) AND "users"."deleted_at" IS NULL`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeDB()
+			db := f.open(SQLite)
+			f.queueExec(0, 1)
+			if err := tc.run(t, db.WithoutStamps()); err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if got := f.logged()[0]; got != tc.want {
+				t.Fatalf("sql:\n got: %s\nwant: %s", got, tc.want)
+			}
+			if strings.Contains(f.logged()[0], "updated_at") {
+				t.Fatal("updated_at must not be assigned")
+			}
+		})
+	}
+}
+
+// The stamped and unstamped shapes of one model must not share a cache entry.
+func TestWithoutStampsSeparateSQLCache(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueExec(0, 1)
+	f.queueExec(0, 1)
+	f.queueExec(0, 1)
+
+	if err := Delete(ctx, db, &User{ID: 1, Version: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Delete(ctx, db.WithoutStamps(), &User{ID: 2, Version: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Delete(ctx, db, &User{ID: 3, Version: 2}); err != nil {
+		t.Fatal(err)
+	}
+	got := f.logged()
+	if !strings.Contains(got[0], "updated_at") || strings.Contains(got[1], "updated_at") || !strings.Contains(got[2], "updated_at") {
+		t.Fatalf("cache leaked a shape across handles:\n%s", strings.Join(got, "\n"))
+	}
+}
+
+func TestWithoutStampsUpsert(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	// DoUpdate backfills the whole row; zero times keep the struct unstamped.
+	stored := []driver.Value{int64(9), "a@x", int64(30), nil, int64(1), nil, time.Time{}, time.Time{}}
+	f.queueRows(userCols, stored)
+	f.queueRows(userCols, stored)
+
+	u := &User{Email: "a@x"}
+	if err := Upsert(ctx, db.WithoutStamps(), u, OnConflict("email")); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if strings.Contains(f.logged()[0], `"updated_at" = `) {
+		t.Fatalf("conflict branch stamped: %s", f.logged()[0])
+	}
+	if !u.UpdatedAt.IsZero() {
+		t.Fatalf("struct stamped: %v", u.UpdatedAt)
+	}
+	if err := Upsert(ctx, db, &User{Email: "b@x"}, OnConflict("email")); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if !strings.Contains(f.logged()[1], `"updated_at" = `) {
+		t.Fatalf("the stamped handle lost its assignment: %s", f.logged()[1])
+	}
+}
+
+// A transaction inherits the parent handle's setting, and Tx.WithoutStamps
+// applies it to one transaction.
+func TestWithoutStampsTransaction(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueExec(0, 1)
+	f.queueExec(0, 1)
+
+	err := db.WithoutStamps().Tx(ctx, func(tx *Tx) error {
+		return Delete(ctx, tx, &User{ID: 1, Version: 2})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = db.Tx(ctx, func(tx *Tx) error {
+		return Delete(ctx, tx.WithoutStamps(), &User{ID: 2, Version: 2})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, got := range f.loggedContaining("UPDATE") {
+		if strings.Contains(got.sql, "updated_at") {
+			t.Fatalf("transaction stamped: %s", got.sql)
+		}
+	}
+}
+
+// InsertAll and UpsertAll follow the handle too.
+func TestWithoutStampsBatch(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite).WithoutStamps()
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)}, []driver.Value{int64(2)})
+
+	rows := []User{{Email: "a@x"}, {Email: "b@x"}}
+	if err := InsertAll(ctx, db, rows); err != nil {
+		t.Fatalf("InsertAll: %v", err)
+	}
+	for i, r := range rows {
+		if !r.CreatedAt.IsZero() || !r.UpdatedAt.IsZero() {
+			t.Fatalf("row %d stamped: %+v", i, r)
+		}
+	}
+
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
+	if err := UpsertAll(ctx, db, rows[:1], OnConflict("email")); err != nil {
+		t.Fatalf("UpsertAll: %v", err)
+	}
+	if strings.Contains(f.logged()[1], `"updated_at" = `) {
+		t.Fatalf("conflict branch stamped: %s", f.logged()[1])
+	}
+}

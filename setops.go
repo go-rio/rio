@@ -127,7 +127,7 @@ func (q Query[T]) updateAll(
 	for k := range set {
 		keys = append(keys, k)
 	}
-	if p.updated != nil {
+	if p.updated != nil && !db.conf().noStamps {
 		if _, overridden := set[p.updated.column]; !overridden {
 			keys = append(keys, p.updated.column)
 		}

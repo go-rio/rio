@@ -121,7 +121,7 @@ type User struct {
     Version   int64     `rio:",version"`          // opt-in optimistic locking (insert writes 1)
     DeletedAt time.Time `rio:",softdelete"`       // opt-in soft delete (NULL↔zero-time exception)
     CreatedAt time.Time // maintained on insert
-    UpdatedAt time.Time // maintained on every write path, including UpdateAll
+    UpdatedAt time.Time // maintained on every write path, including UpdateAll; WithoutStamps handles opt out
 
     Posts   rio.HasMany[Post]      // relations are typed containers, not bare slices
     Org     rio.BelongsTo[Org]     `rio:",fk:org_id"`

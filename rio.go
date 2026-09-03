@@ -69,6 +69,19 @@ func (d *DB) Native() any { return d.native }
 // WithDriverHandle or NativeConfig.Handle, or nil when none was attached.
 func (d *DB) DriverHandle() any { return d.handle }
 
+// WithoutStamps returns a handle whose writes leave CreatedAt and UpdatedAt
+// to the caller: inserts bind the struct's values as they are, zero included,
+// and updates neither add nor bump UpdatedAt. Versions and softdelete stamps
+// are unaffected. The handle shares its parent's pool and caches, and
+// transactions it begins inherit the setting.
+func (d *DB) WithoutStamps() *DB {
+	cfg := *d.cfg
+	cfg.noStamps = true
+	c := *d
+	c.cfg = &cfg
+	return &c
+}
+
 // Close closes the prepared-statement cache (if enabled) and the underlying
 // *sql.DB.
 func (d *DB) Close() error { return d.e.close() }
@@ -160,6 +173,16 @@ func (t *Tx) NativeTx() any {
 		return ne.nt
 	}
 	return nil
+}
+
+// WithoutStamps returns a view of this transaction that leaves CreatedAt and
+// UpdatedAt to the caller; see DB.WithoutStamps.
+func (t *Tx) WithoutStamps() *Tx {
+	cfg := *t.cfg
+	cfg.noStamps = true
+	c := *t
+	c.cfg = &cfg
+	return &c
 }
 
 // Tx runs fn inside a savepoint: released when fn returns nil, rolled back

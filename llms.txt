@@ -87,7 +87,7 @@ func main() {
 ### Core Types
 
 - `Query[T]` - immutable, connection-free query description.
-- `DB`, `Tx`, `Queryer` - execution handles; `DB.Tx`, `DB.TxWith(ctx, *sql.TxOptions, fn)`, `Tx.Tx` (savepoint), `DB.Unwrap`, `DB.Dialect`, `DB.DescribeModel`, `DB.Close`.
+- `DB`, `Tx`, `Queryer` - execution handles; `DB.Tx`, `DB.TxWith(ctx, *sql.TxOptions, fn)`, `Tx.Tx` (savepoint), `DB.Unwrap`, `DB.Dialect`, `DB.DescribeModel`, `DB.Close`; `DB.WithoutStamps` and `Tx.WithoutStamps` return handles whose writes leave `CreatedAt`/`UpdatedAt` to the caller.
 - `HasMany[T]`, `HasOne[T]`, `BelongsTo[T]`, `ManyToMany[T]` - relation containers with `Loaded`, `Rows`/`Row`, `Set`, JSON `null` when unloaded.
 - `RelOption` - `RelWhere`, `RelOrderBy`, `RelLimit` (per parent), `RelWithTrashed`.
 - `Set`, `Expr` - `UpdateAll`/`DoUpdateSet` assignments; `Expr` is verbatim SQL.

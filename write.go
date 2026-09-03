@@ -48,7 +48,7 @@ func Insert[T any](ctx context.Context, db Queryer, row *T) error {
 		return err
 	}
 	now := normalizeTime(db.conf().clock())
-	stampForInsert(p, rv, now)
+	stampForInsert(p, rv, now, !db.conf().noStamps)
 
 	bn := binder{d: d, now: now}
 	cols, back, args, bits, cacheable, err := insertColumns(p, rv, &bn)
@@ -120,12 +120,13 @@ func Update[T any](ctx context.Context, db Queryer, row *T, cols ...string) erro
 		return err
 	}
 	now := normalizeTime(db.conf().clock())
+	stamps := !db.conf().noStamps
 
-	set, err := updateSet(p, cols)
+	set, err := updateSet(p, cols, stamps)
 	if err != nil {
 		return err
 	}
-	if p.updated != nil {
+	if p.updated != nil && stamps {
 		setTime(p.updated, rv, now)
 	}
 
@@ -223,15 +224,16 @@ func Restore[T any](ctx context.Context, db Queryer, row *T) error {
 		return err
 	}
 	now := normalizeTime(db.conf().clock())
+	stamped := p.updated != nil && !db.conf().noStamps
 
-	sqlText, err := crudSQL(g, p, "restore", 0, true, func() []byte {
+	sqlText, err := crudSQL(g, p, stampOp("restore", "restore-nostamp", p, stamped), 0, true, func() []byte {
 		b := make([]byte, 0, 128)
 		b = append(b, "UPDATE "...)
 		b = d.quote(b, g.table(p))
 		b = append(b, " SET "...)
 		b = d.quote(b, p.softDel.column)
 		b = append(b, " = NULL"...)
-		if p.updated != nil {
+		if stamped {
 			b = append(b, ", "...)
 			b = d.quote(b, p.updated.column)
 			b = append(b, " = ?"...)
@@ -249,7 +251,7 @@ func Restore[T any](ctx context.Context, db Queryer, row *T) error {
 	}
 	bn := binder{d: d, now: now}
 	args := make([]any, 0, 1+len(p.pks)+1) // updated_at + PKs + version
-	if p.updated != nil {
+	if stamped {
 		args = append(args, bn.time(now))
 	}
 	if args, err = appendKeyArgs(args, p, rv, &bn); err != nil {
@@ -264,7 +266,7 @@ func Restore[T any](ctx context.Context, db Queryer, row *T) error {
 		return resolveSoftNoop(ctx, db, p, rv, false)
 	}
 	clearTime(p.softDel, rv)
-	if p.updated != nil {
+	if stamped {
 		setTime(p.updated, rv, now)
 	}
 	if p.version != nil {
@@ -287,15 +289,16 @@ func softDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 		return err
 	}
 	now := normalizeTime(db.conf().clock())
+	stamped := p.updated != nil && !db.conf().noStamps
 
-	sqlText, err := crudSQL(g, p, "softdelete", 0, true, func() []byte {
+	sqlText, err := crudSQL(g, p, stampOp("softdelete", "softdelete-nostamp", p, stamped), 0, true, func() []byte {
 		b := make([]byte, 0, 128)
 		b = append(b, "UPDATE "...)
 		b = d.quote(b, g.table(p))
 		b = append(b, " SET "...)
 		b = d.quote(b, p.softDel.column)
 		b = append(b, " = ?"...)
-		if p.updated != nil {
+		if stamped {
 			b = append(b, ", "...)
 			b = d.quote(b, p.updated.column)
 			b = append(b, " = ?"...)
@@ -314,7 +317,7 @@ func softDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 	bn := binder{d: d, now: now}
 	args := make([]any, 0, 2+len(p.pks)+1) // deleted_at + updated_at + PKs + version
 	args = append(args, bn.time(now))
-	if p.updated != nil {
+	if stamped {
 		args = append(args, bn.time(now))
 	}
 	if args, err = appendKeyArgs(args, p, rv, &bn); err != nil {
@@ -329,7 +332,7 @@ func softDelete[T any](ctx context.Context, db Queryer, p *plan, row *T) error {
 		return resolveSoftNoop(ctx, db, p, rv, true)
 	}
 	setTime(p.softDel, rv, now)
-	if p.updated != nil {
+	if stamped {
 		setTime(p.updated, rv, now)
 	}
 	if p.version != nil {
@@ -449,12 +452,16 @@ func checkGeneratedID(
 }
 
 // updateSet resolves the explicit or default Update columns in plan order.
-func updateSet(p *plan, cols []string) ([]*field, error) {
+func updateSet(p *plan, cols []string, stamps bool) ([]*field, error) {
 	if len(cols) == 0 {
-		if len(p.updatable) == 0 {
+		out := p.updatable
+		if !stamps {
+			out = p.updNoStamp
+		}
+		if len(out) == 0 {
 			return nil, fmt.Errorf("rio: %s has no updatable columns", p.structName)
 		}
-		return p.updatable, nil // precomputed at plan time; callers only read
+		return out, nil // precomputed at plan time; callers only read
 	}
 	seen := make(map[string]bool, len(cols)+1)
 	out := make([]*field, 0, len(cols)+1)
@@ -479,7 +486,7 @@ func updateSet(p *plan, cols []string) ([]*field, error) {
 		seen[c] = true
 		out = append(out, f)
 	}
-	if p.updated != nil && !seen[p.updated.column] {
+	if p.updated != nil && stamps && !seen[p.updated.column] {
 		out = append(out, p.updated)
 	}
 	// Canonical order must match the order-free SQL-cache key.
@@ -487,13 +494,23 @@ func updateSet(p *plan, cols []string) ([]*field, error) {
 	return out, nil
 }
 
-// stampForInsert fills zero timestamps and a zero version before binding.
-func stampForInsert(p *plan, rv reflect.Value, now time.Time) {
+// stampOp picks the SQL-cache op of the two UpdatedAt shapes; they never
+// share an entry. Both names are literals, so no key is built per call.
+func stampOp(stamped, unstamped string, p *plan, isStamped bool) string {
+	if p.updated == nil || isStamped {
+		return stamped
+	}
+	return unstamped
+}
+
+// stampForInsert fills zero timestamps, unless stamps is off, and a zero
+// version before binding.
+func stampForInsert(p *plan, rv reflect.Value, now time.Time, stamps bool) {
 	base := rv.Addr().UnsafePointer()
-	if p.created != nil && stampFieldIsZero(p.created, base, rv) {
+	if stamps && p.created != nil && stampFieldIsZero(p.created, base, rv) {
 		setTime(p.created, rv, now)
 	}
-	if p.updated != nil && stampFieldIsZero(p.updated, base, rv) {
+	if stamps && p.updated != nil && stampFieldIsZero(p.updated, base, rv) {
 		setTime(p.updated, rv, now)
 	}
 	if p.version != nil {
