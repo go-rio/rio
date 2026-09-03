@@ -69,11 +69,12 @@ func (d *DB) Native() any { return d.native }
 // WithDriverHandle or NativeConfig.Handle, or nil when none was attached.
 func (d *DB) DriverHandle() any { return d.handle }
 
-// WithoutStamps returns a handle whose writes leave CreatedAt and UpdatedAt
-// to the caller: inserts bind the struct's values as they are, zero included,
-// and updates neither add nor bump UpdatedAt. Versions and softdelete stamps
-// are unaffected. The handle shares its parent's pool and caches, and
-// transactions it begins inherit the setting.
+// WithoutStamps returns a handle that generates no CreatedAt or UpdatedAt
+// value. Statements carrying the caller's row (Insert, InsertAll, full-column
+// Update, both Upsert branches) bind the struct's values as they are; the
+// ones rio composes itself (column-list Update, UpdateAll, Delete, Restore)
+// drop the assignment. Versions and softdelete stamps are unaffected. The
+// handle shares its parent's pool and caches; its transactions inherit it.
 func (d *DB) WithoutStamps() *DB {
 	cfg := *d.cfg
 	cfg.noStamps = true

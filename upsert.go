@@ -137,9 +137,6 @@ func upsertSpecKey(spec *upsertSpec, update []*field) upsertCacheKey {
 	if spec.keepTrashed {
 		key.flags |= 2
 	}
-	if spec.noStamps {
-		key.flags |= 4
-	}
 	for _, f := range update {
 		key.update |= 1 << uint(f.ordinal)
 	}
@@ -593,7 +590,7 @@ func upsertUpdateSet(p *plan, spec *upsertSpec, skipped []*field) ([]*field, err
 		}
 		out = append(out, f)
 	}
-	hasNoAssignments := len(out) == 0 && (p.updated == nil || spec.noStamps) && p.version == nil &&
+	hasNoAssignments := len(out) == 0 && p.updated == nil && p.version == nil &&
 		(p.softDel == nil || spec.keepTrashed)
 	if hasNoAssignments {
 		// Every dialect requires at least one update assignment.
@@ -674,7 +671,7 @@ func appendConflictSets(
 			b = append(b, '?')
 		}
 	}
-	if p.updated != nil && !spec.noStamps {
+	if p.updated != nil {
 		sep()
 		b = d.quote(b, p.updated.column)
 		b = append(b, " = "...)

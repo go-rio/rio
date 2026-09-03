@@ -6,11 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-09-02
+
+### Fixed
+
+- Under `WithoutStamps`, a full-column `Update` and the conflict branch of `Upsert` dropped the `UpdatedAt` assignment, so the row kept whatever stale value the database held — neither the caller's nor a fresh one, and at odds with the insert branch of the same `Upsert`. Both now bind the struct's value. Statements rio composes without a caller row (a column-list `Update`, `UpdateAll`, `Delete`, `Restore`) still drop it.
+
 ## [0.18.0] - 2026-09-02
 
 ### Added
 
-- `DB.WithoutStamps` and `Tx.WithoutStamps`: handles whose writes leave `CreatedAt`/`UpdatedAt` to the caller. Inserts bind the struct's values as they are; `Update`, `UpdateAll`, `Delete`, `Restore`, and the conflict branch of `Upsert` drop the `UpdatedAt` assignment. Versions and softdelete stamps are unaffected, and the handle shares its parent's pool and caches.
+- `DB.WithoutStamps` and `Tx.WithoutStamps`: handles that generate no `CreatedAt`/`UpdatedAt` value. Statements carrying the caller's row bind the struct's values as they are; the ones rio composes itself drop the assignment. Versions and softdelete stamps are unaffected, and the handle shares its parent's pool and caches.
 
 ## [0.17.0] - 2026-09-02
 
@@ -217,7 +223,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial release.
 
-[Unreleased]: https://github.com/go-rio/rio/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/go-rio/rio/compare/v0.18.1...HEAD
+[0.18.1]: https://github.com/go-rio/rio/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/go-rio/rio/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/go-rio/rio/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/go-rio/rio/compare/v0.16.0...v0.16.1

@@ -4537,6 +4537,31 @@ func TestChunkWalksKeysetPages(t *testing.T) {
 	}
 }
 
+// A full-column Update still writes UpdatedAt, from the struct.
+func TestWithoutStampsUpdateWritesStructValue(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open(SQLite)
+	f.queueExec(0, 1)
+
+	mine := normalizeTime(time.Date(2020, 3, 4, 5, 6, 7, 0, time.UTC))
+	u := &User{ID: 1, Email: "a@x", Version: 2, UpdatedAt: mine}
+	if err := Update(ctx, db.WithoutStamps(), u); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	want := `UPDATE "users" SET "email" = ?, "age" = ?, "bio" = ?, "updated_at" = ?, "version" = "version" + 1 WHERE "id" = ? AND "version" = ?`
+	if got := f.logged()[0]; got != want {
+		t.Fatalf("sql:\n got: %s\nwant: %s", got, want)
+	}
+	args := f.loggedContaining("UPDATE")[0].args
+	if got := args[3]; got != driver.Value(mine.Format("2006-01-02 15:04:05.999999+00:00")) {
+		t.Fatalf("updated_at bound %v, want the struct's %v", got, mine)
+	}
+	if !u.UpdatedAt.Equal(mine) {
+		t.Fatalf("struct refreshed: %v", u.UpdatedAt)
+	}
+}
+
 // WithoutStamps writes the struct's CreatedAt/UpdatedAt as they are.
 func TestWithoutStampsInsert(t *testing.T) {
 	ctx := context.Background()
@@ -4567,11 +4592,6 @@ func TestWithoutStampsUpdatePaths(t *testing.T) {
 		run  func(*testing.T, Queryer) error
 		want string
 	}{
-		{
-			name: "Update",
-			run:  func(_ *testing.T, db Queryer) error { return Update(ctx, db, &User{ID: 1, Email: "a@x", Version: 2}) },
-			want: `UPDATE "users" SET "email" = ?, "age" = ?, "bio" = ?, "version" = "version" + 1 WHERE "id" = ? AND "version" = ?`,
-		},
 		{
 			name: "Update whitelist",
 			run: func(_ *testing.T, db Queryer) error {
@@ -4647,31 +4667,27 @@ func TestWithoutStampsUpsert(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
 	db := f.open()
-	// DoUpdate backfills the whole row; zero times keep the struct unstamped.
-	stored := []driver.Value{int64(9), "a@x", int64(30), nil, int64(1), nil, time.Time{}, time.Time{}}
-	f.queueRows(userCols, stored)
-	f.queueRows(userCols, stored)
+	mine := normalizeTime(time.Date(2020, 3, 4, 5, 6, 7, 0, time.UTC))
+	f.queueRows(userCols, []driver.Value{int64(9), "a@x", int64(30), nil, int64(1), nil, mine, mine})
 
-	u := &User{Email: "a@x"}
+	u := &User{Email: "a@x", UpdatedAt: mine}
 	if err := Upsert(ctx, db.WithoutStamps(), u, OnConflict("email")); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
-	if strings.Contains(f.logged()[0], `"updated_at" = `) {
-		t.Fatalf("conflict branch stamped: %s", f.logged()[0])
+	// Dropping the assignment would leave the stored row's stale value.
+	if !strings.Contains(f.logged()[0], `"updated_at" = excluded."updated_at"`) {
+		t.Fatalf("conflict branch dropped the assignment: %s", f.logged()[0])
 	}
-	if !u.UpdatedAt.IsZero() {
-		t.Fatalf("struct stamped: %v", u.UpdatedAt)
+	args := f.loggedContaining("INSERT")[0].args
+	if got, ok := args[len(args)-1].(time.Time); !ok || !got.Equal(mine) {
+		t.Fatalf("excluded row carries %v, want the struct's %v", args[len(args)-1], mine)
 	}
-	if err := Upsert(ctx, db, &User{Email: "b@x"}, OnConflict("email")); err != nil {
-		t.Fatalf("Upsert: %v", err)
-	}
-	if !strings.Contains(f.logged()[1], `"updated_at" = `) {
-		t.Fatalf("the stamped handle lost its assignment: %s", f.logged()[1])
+	if !u.UpdatedAt.Equal(mine) {
+		t.Fatalf("struct refreshed: %v", u.UpdatedAt)
 	}
 }
 
-// A transaction inherits the parent handle's setting, and Tx.WithoutStamps
-// applies it to one transaction.
+// A transaction inherits the handle's setting; Tx.WithoutStamps sets it.
 func TestWithoutStampsTransaction(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
@@ -4719,7 +4735,9 @@ func TestWithoutStampsBatch(t *testing.T) {
 	if err := UpsertAll(ctx, db, rows[:1], OnConflict("email")); err != nil {
 		t.Fatalf("UpsertAll: %v", err)
 	}
-	if strings.Contains(f.logged()[1], `"updated_at" = `) {
-		t.Fatalf("conflict branch stamped: %s", f.logged()[1])
+	args := f.loggedContaining("ON CONFLICT")[0].args
+	zero := driver.Value(normalizeTime(time.Time{}).Format("2006-01-02 15:04:05.999999+00:00"))
+	if args[len(args)-1] != zero {
+		t.Fatalf("the excluded row should carry the struct's zero time, got %v", args)
 	}
 }

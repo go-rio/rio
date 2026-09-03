@@ -291,8 +291,10 @@ ids exactly inside a transaction, and `ClearRelation` unlinks every row.
 `CreatedAt`/`UpdatedAt` and a zero `version` before execution. `Update` writes
 every eligible field — zero values included — unless given a column
 whitelist, and checks the version column. `db.WithoutStamps()` and
-`tx.WithoutStamps()` hand both timestamps back to the caller: inserts bind
-the struct's values as they are, updates drop the `UpdatedAt` assignment. `Delete` becomes an `UPDATE` of the
+`tx.WithoutStamps()` stop generating both timestamps: a statement that writes
+the caller's row binds the struct's values as they are, and one rio composes
+itself (a column-list `Update`, `UpdateAll`, `Delete`, `Restore`) drops the
+`UpdatedAt` assignment rather than inventing a value. `Delete` becomes an `UPDATE` of the
 `softdelete` stamp on soft-delete models, `ForceDelete` deletes, `Restore`
 clears the stamp; queries hide trashed rows unless `WithTrashed` or
 `OnlyTrashed`. `FirstOrCreate`/`CreateOrFirst` re-read after `ErrDuplicateKey`.

@@ -454,14 +454,11 @@ func checkGeneratedID(
 // updateSet resolves the explicit or default Update columns in plan order.
 func updateSet(p *plan, cols []string, stamps bool) ([]*field, error) {
 	if len(cols) == 0 {
-		out := p.updatable
-		if !stamps {
-			out = p.updNoStamp
-		}
-		if len(out) == 0 {
+		if len(p.updatable) == 0 {
 			return nil, fmt.Errorf("rio: %s has no updatable columns", p.structName)
 		}
-		return out, nil // precomputed at plan time; callers only read
+		// UpdatedAt is in here, bound from the struct like any other column.
+		return p.updatable, nil // precomputed at plan time; callers only read
 	}
 	seen := make(map[string]bool, len(cols)+1)
 	out := make([]*field, 0, len(cols)+1)
@@ -494,8 +491,7 @@ func updateSet(p *plan, cols []string, stamps bool) ([]*field, error) {
 	return out, nil
 }
 
-// stampOp picks the SQL-cache op of the two UpdatedAt shapes; they never
-// share an entry. Both names are literals, so no key is built per call.
+// stampOp keeps the two UpdatedAt shapes in separate SQL-cache entries.
 func stampOp(stamped, unstamped string, p *plan, isStamped bool) string {
 	if p.updated == nil || isStamped {
 		return stamped
