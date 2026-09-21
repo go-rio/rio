@@ -330,7 +330,8 @@ handle whose stamps read `t`, for writes that share one business time.
 `tx.WithoutStamps()` stop generating both timestamps: a statement that writes
 the caller's row binds the struct's values as they are, and one rio composes
 itself (a column-list `Update`, `UpdateAll`, `Delete`, `Restore`) drops the
-`UpdatedAt` assignment rather than inventing a value. `Delete` becomes an `UPDATE` of the
+`UpdatedAt` assignment rather than inventing a value, and `Update`, `DoUpdate`,
+and `DoUpdateSet` may then name the `CreatedAt` column. `Delete` becomes an `UPDATE` of the
 `softdelete` stamp on soft-delete models, `ForceDelete` deletes, `Restore`
 clears the stamp; queries hide trashed rows unless `WithTrashed` or
 `OnlyTrashed`. `FirstOrCreate`/`CreateOrFirst` re-read after `ErrDuplicateKey`.

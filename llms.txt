@@ -90,7 +90,7 @@ func main() {
 ### Core Types
 
 - `Query[T]` - immutable, connection-free query description.
-- `DB`, `Tx`, `Queryer` - execution handles; `DB.Tx`, `DB.TxWith(ctx, *sql.TxOptions, fn)`, `Tx.Tx` (savepoint), `DB.Unwrap`, `DB.Dialect`, `DB.DescribeModel`, `DB.Close`; `DB.WithoutStamps` and `Tx.WithoutStamps` return handles whose writes leave `CreatedAt`/`UpdatedAt` to the caller; `DB.At(t)` and `Tx.At(t)` return handles whose stamps read `t`.
+- `DB`, `Tx`, `Queryer` - execution handles; `DB.Tx`, `DB.TxWith(ctx, *sql.TxOptions, fn)`, `Tx.Tx` (savepoint), `DB.Unwrap`, `DB.Dialect`, `DB.DescribeModel`, `DB.Close`; `DB.WithoutStamps` and `Tx.WithoutStamps` return handles whose writes leave `CreatedAt`/`UpdatedAt` to the caller (and let `Update`, `DoUpdate`, and `DoUpdateSet` name `CreatedAt`); `DB.At(t)` and `Tx.At(t)` return handles whose stamps read `t`.
 - `RawQuery[T]` - immutable raw projection query built by `Raw`.
 - `HasMany[T]`, `HasOne[T]`, `BelongsTo[T]`, `ManyToMany[T]` - relation containers with `Loaded`, `Rows`/`Row`, `Set`, JSON `null` when unloaded.
 - `RelOption` - `RelWhere`, `RelOrderBy`, `RelLimit` (per parent), `RelWithTrashed`.

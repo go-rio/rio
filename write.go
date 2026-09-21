@@ -472,7 +472,7 @@ func updateSet(p *plan, cols []string, stamps bool) ([]*field, bool, error) {
 		if !ok {
 			return nil, false, fmt.Errorf("rio: Update: %s has no column %q (column names, not Go field names)", p.structName, c)
 		}
-		isMaintained := f.isPK || f.isVersion || f.isCreated
+		isMaintained := f.isPK || f.isVersion || (f.isCreated && stamps)
 		if isMaintained {
 			return nil, false, fmt.Errorf("rio: Update: column %q is maintained by rio and cannot be listed", c)
 		}

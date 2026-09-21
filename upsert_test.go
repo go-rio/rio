@@ -91,6 +91,34 @@ func TestUpsertConflictPredicatesRejected(t *testing.T) {
 	}
 }
 
+func TestWithoutStampsUpsertMayAssignCreatedAt(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	u := &User{ID: 1, Email: "a@x", CreatedAt: testNow, UpdatedAt: testNow}
+
+	err := Upsert(ctx, db, u, OnConflict("id"), DoUpdate("email", "created_at"))
+	if err == nil || !strings.Contains(err.Error(), `"created_at" is maintained by rio`) {
+		t.Fatalf("stamped handle: %v", err)
+	}
+
+	f.queueRows(userCols, userRow(1, "a@x"))
+	err = Upsert(ctx, db.WithoutStamps(), u, OnConflict("id"), DoUpdate("email", "created_at"))
+	if err != nil {
+		t.Fatalf("WithoutStamps: %v", err)
+	}
+	got := f.loggedContaining("ON CONFLICT")[0].sql
+	if !strings.Contains(got, `DO UPDATE SET "email" = excluded."email", "created_at" = excluded."created_at", "updated_at" = excluded."updated_at"`) {
+		t.Fatalf("created_at belongs to the caller: %s", got)
+	}
+
+	f.queueRows(userCols, userRow(1, "a@x"))
+	err = Upsert(ctx, db.WithoutStamps(), u, OnConflict("id"), DoUpdateSet(Set{"created_at": Expr("excluded.created_at")}))
+	if err != nil {
+		t.Fatalf("DoUpdateSet: %v", err)
+	}
+}
+
 func TestUpsertAllBindsWhereArgsAfterRows(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()

@@ -203,6 +203,7 @@ relations across composite keys are unsupported.
 | `Update/Delete` with `version` mismatch | `rio.ErrStaleObject` (0 rows affected) |
 | `Upsert` conflict update rejected by `DoUpdateWhere` | `rio.ErrStaleObject`; the row is untouched, the struct keeps this call's stamps |
 | `Update` whitelist naming the `UpdatedAt` column | binds the struct's value; an unlisted `UpdatedAt` takes the clock |
+| `CreatedAt` in `Update`, `DoUpdate`, or `DoUpdateSet` | rejected, except under `WithoutStamps`, where both stamps are the caller's |
 | Row lock strengths | `ForNoKeyUpdate`/`ForKeyShare` render on PostgreSQL; MySQL takes the next stronger lock; SQLite elides; ClickHouse rejects |
 | `Raw.Count` / `Raw.Exists` | `count(*)` or a `LIMIT 1` probe over the statement as a derived table; `Raw.First`/`Sole` never add LIMIT |
 | `UpdateAll/DeleteAll` without WHERE | `rio.ErrMissingWhere`; `.AllRows()` opts in explicitly |

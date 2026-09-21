@@ -431,7 +431,7 @@ func checkUpsertSets(p *plan, spec *upsertSpec, update []*field) error {
 		if !ok {
 			return fmt.Errorf("rio: DoUpdateSet: %s has no column %q", p.structName, k)
 		}
-		isMaintained := f.isPK || f.isVersion || f.isSoftDelete || f.isCreated || f.isUpdated
+		isMaintained := f.isPK || f.isVersion || f.isSoftDelete || f.isUpdated || (f.isCreated && !spec.noStamps)
 		if isMaintained {
 			return fmt.Errorf("rio: DoUpdateSet: column %q is maintained by rio and cannot be assigned", k)
 		}
@@ -609,7 +609,7 @@ func upsertUpdateSet(p *plan, spec *upsertSpec, skipped []*field) ([]*field, err
 			if !ok {
 				return nil, fmt.Errorf("rio: DoUpdate: %s has no column %q", p.structName, c)
 			}
-			isMaintained := f.isPK || f.isVersion || f.isSoftDelete || f.isCreated || f.isUpdated
+			isMaintained := f.isPK || f.isVersion || f.isSoftDelete || f.isUpdated || (f.isCreated && !spec.noStamps)
 			if isMaintained {
 				return nil, fmt.Errorf("rio: DoUpdate: column %q is maintained by rio and cannot be listed", c)
 			}
