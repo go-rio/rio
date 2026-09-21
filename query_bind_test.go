@@ -34,7 +34,7 @@ func TestQueryDeferredArgs(t *testing.T) {
 	if logs[0] != logs[1] {
 		t.Fatalf("fixed Query SQL must be identical across runs:\n%s\n%s", logs[0], logs[1])
 	}
-	if !strings.Contains(logs[0], "(age > $1)") || !strings.Contains(logs[0], "LIMIT 10") {
+	if !strings.Contains(logs[0], "(age > $1)") || !strings.Contains(logs[0], "LIMIT $2") {
 		t.Fatalf("sql: %s", logs[0])
 	}
 	stmt := f.loggedContaining("age >")[0]
@@ -236,7 +236,7 @@ func TestQueryDeferredSliceArgs(t *testing.T) {
 		if len(stmt.args) == 1 {
 			continue
 		}
-		if !strings.Contains(stmt.sql, "IN ($1, $2)") || len(stmt.args) != 2 {
+		if !strings.Contains(stmt.sql, "IN ($1, $2)") || stmt.args[0] != int64(1) || stmt.args[1] != int64(2) {
 			t.Fatalf("slice did not expand: %s %#v", stmt.sql, stmt.args)
 		}
 	}

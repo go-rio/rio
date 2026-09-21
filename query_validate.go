@@ -32,7 +32,7 @@ func validateQueryState(p *plan, s *queryState) error {
 	if s.offsetSet && s.offset < 0 {
 		return fmt.Errorf("rio: Offset requires a non-negative value, got %d", s.offset)
 	}
-	if err := checkNoArgClauses(p, s); err != nil {
+	if err := checkNoArgClauses(p.structName, s); err != nil {
 		return err
 	}
 	hasSortKeys := len(s.orderKeys) > 0 || s.after != nil || s.before != nil
@@ -68,7 +68,7 @@ func validateQueryState(p *plan, s *queryState) error {
 }
 
 // checkNoArgClauses rejects a placeholder recognized by any supported lexer.
-func checkNoArgClauses(p *plan, s *queryState) error {
+func checkNoArgClauses(structName string, s *queryState) error {
 	check := func(clause, expr string) error {
 		holes := maxPlaceholderCount(expr)
 		if holes == 0 {
@@ -77,7 +77,7 @@ func checkNoArgClauses(p *plan, s *queryState) error {
 		return fmt.Errorf(
 			"rio: Validate[%s]: %s(%q) contains %d placeholder(s), but %s has no argument channel; "+
 				"put parameterized conditions in Where/Having or inline the value",
-			p.structName,
+			structName,
 			clause,
 			expr,
 			holes,

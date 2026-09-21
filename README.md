@@ -102,15 +102,15 @@ table, and what rio deliberately leaves out.
 | Area | API |
 |---|---|
 | Query construction | `From[T]`, `Where`, `Having`, `Join`, `OrderBy`, `GroupBy`, `Distinct`, `Limit`, `Offset`, `Scope` |
-| Query modifiers | `ForUpdate`, `ForShare`, `Final`, `WithTrashed`, `OnlyTrashed`, `AllRows` |
+| Query modifiers | `ForUpdate`, `ForNoKeyUpdate`, `ForShare`, `ForKeyShare`, `LockOf`, `Final`, `WithTrashed`, `OnlyTrashed`, `AllRows` |
 | Query execution | `All`, `First`, `Sole`, `Find`, `Rows`, `Chunk`, `Count`, `Exists`, `Pluck[V]`, `Sum/Min/Max/Avg[V]`, `SQL` |
 | Cursor pagination | `OrderKeys`, `After`, `Before`, `CursorAt`, `Cursor.String`, `ParseCursor` |
-| Direct lookup and SQL | `Find[T]`, `Raw[T]`, `Exec`, `Query.Sub` |
-| Entity writes | `Insert`, `Update`, `Delete`, `ForceDelete`, `Restore`, `Upsert`, `FirstOrCreate`, `CreateOrFirst` |
+| Direct lookup and SQL | `Find[T]`, `Raw[T]` (`Where`, `GroupBy`, `Having`, `OrderBy`, `Limit`, `Offset`, `Must`, `All`, `First`, `Sole`, `Value`, `Rows`, `Count`, `Exists`, `SQL`), `Exec`, `Query.Sub` |
+| Entity writes | `Insert`, `Update`, `Delete`, `ForceDelete`, `Restore`, `Upsert` (`OnConflict`, `OnConflictWhere`, `DoUpdate`, `DoUpdateSet`, `DoUpdateWhere`, `DoNothing`, `KeepTrashed`), `FirstOrCreate`, `CreateOrFirst` |
 | Batch and set writes | `InsertAll`, `UpsertAll`, `UpdateAll`, `UpdateAllReturning`, `DeleteAll`, `DeleteAllReturning`, `ForceDeleteAll`, `RestoreAll` |
 | Relations | `With`, `WithCount`, `WhereHas`, `WhereHasNot`, `Attach`, `Detach`, `SyncRelation`, `ClearRelation` |
 | Validation and reuse | `Query.Validate`, `Query.Must`, `WithStmtCache`, `WithoutStmtCache` |
-| Handles and options | `New`, `NewNative`, `DB.Tx`, `DB.TxWith`, `Tx.Tx`, `WithQueryHook`, `WithoutArgs`, `WithClock`, `WithErrorTranslator`, `WithTableNamer`, `WithDriverHandle`, `DB.DescribeModel`, `DB.Dialect`, `WriteColumns` |
+| Handles and options | `New`, `NewNative`, `DB.Tx`, `DB.TxWith`, `Tx.Tx`, `DB.At`, `DB.WithoutStamps`, `WithQueryHook`, `WithoutArgs`, `WithClock`, `WithErrorTranslator`, `WithTableNamer`, `WithDriverHandle`, `DB.DescribeModel`, `DB.Dialect`, `WriteColumns` |
 
 ### Queries
 
@@ -138,8 +138,8 @@ executing it.
 `First` adds `LIMIT 1` only when no limit is set and never adds an order;
 `Sole` returns `ErrMultipleRows` past one row. `Query.Find` is the keyed
 `First`: `WithTrashed`, `With`, `WithCount`, and inline `Where` all apply, and
-composite key parts follow field declaration order. `Limit` and `Offset`
-render into the SQL, not as parameters.
+composite key parts follow field declaration order. `Limit` and `Offset` bind
+as parameters, so every page of a query runs one statement text.
 
 `Sum`, `Min`, `Max`, and `Avg` aggregate a mapped column and return the zero
 value over no rows (`sql.Null[V]` tells the two apart). `Distinct` applies to
@@ -170,6 +170,36 @@ per DB and per transaction (default 512 entries); the sqlite and mysql
 modules turn it on by default, and `WithoutStmtCache` opts out behind
 transaction- or statement-mode poolers. `New` panics on `WithStmtCache` with
 ClickHouse, which cannot prepare general queries.
+
+### Raw queries
+
+`Raw[T]` takes a hand-written SELECT head and appends the rest: `Where`,
+`GroupBy`, `Having`, `OrderBy`, and bound `Limit`/`Offset`. The head is
+written up to its FROM and JOIN clauses; its placeholders bind inline when
+arguments are given and defer to the terminal call otherwise, under the same
+rules as `Query`:
+
+```go
+var inventory = rio.Raw[InventoryRow](`SELECT i.*, w.code AS warehouse_code
+FROM inventory i JOIN warehouses w ON w.id = i.warehouse_id`).
+    Where("i.owner_id = ?").
+    OrderBy("i.id DESC").
+    Must()
+
+page, err := inventory.Limit(20).Offset(40).All(ctx, db, ownerID)
+total, err := inventory.Count(ctx, db, ownerID)
+open, err := rio.Raw[int64]("SELECT count(*) FROM inventory").
+    Where("owner_id = ? AND status = ?").
+    Value(ctx, db, ownerID, "OPEN")
+```
+
+`T` is any scannable shape: a DTO struct matched by column name, a scalar, or
+an entity. `Value` is `Sole` by value for single-cell reads; `First` and
+`Sole` append no `LIMIT` to the head. `Count` and `Exists` wrap the statement
+as a derived table, so `Count` counts groups under `GroupBy` and a head with
+its own `ORDER BY` or `LIMIT` still probes correctly. `Must` validates and
+caches stable shapes as it does for `Query`; `Exec` runs hand-written write
+statements through the same pipeline.
 
 ### Cursor pagination
 
@@ -239,7 +269,10 @@ them in `DB.Tx` when all chunks must land together.
 
 `ForUpdate` and `ForShare` take `rio.NoWait` or `rio.SkipLocked`; the
 queue-worker idiom is `Where("state = ?", "queued").ForUpdate(rio.SkipLocked).Limit(1)`.
-SQLite elides row locks, ClickHouse rejects them.
+`ForNoKeyUpdate` and `ForKeyShare` are PostgreSQL's weaker strengths, and
+`rio.LockOf("u")` restricts any lock to the named tables of a join
+(`FOR UPDATE OF u`). MySQL renders the next stronger lock for the key
+strengths, SQLite elides every row lock, ClickHouse rejects them.
 
 ### Models and relations
 
@@ -290,7 +323,10 @@ ids exactly inside a transaction, and `ClearRelation` unlinks every row.
 `Insert` backfills generated columns where the dialect can and stamps
 `CreatedAt`/`UpdatedAt` and a zero `version` before execution. `Update` writes
 every eligible field — zero values included — unless given a column
-whitelist, and checks the version column. `db.WithoutStamps()` and
+whitelist, and checks the version column; a whitelist naming the `UpdatedAt`
+column binds the struct's value instead of the clock. `db.At(t)` returns a
+handle whose stamps read `t`, for writes that share one business time.
+`db.WithoutStamps()` and
 `tx.WithoutStamps()` stop generating both timestamps: a statement that writes
 the caller's row binds the struct's values as they are, and one rio composes
 itself (a column-list `Update`, `UpdateAll`, `Delete`, `Restore`) drops the
@@ -301,17 +337,23 @@ clears the stamp; queries hide trashed rows unless `WithTrashed` or
 
 Set-based writes require a condition (`AllRows()` opts out) and refuse
 `Limit`/`Offset`, `GroupBy`/`Having`, `Join`, ordering, preloads, and row
-locks — select the target rows in `Where`. `UpdateAllReturning` and
-`DeleteAllReturning` hand the affected rows back where the dialect has
-`RETURNING` (a soft delete returns the trashed state); MySQL rejects them.
+locks — select the target rows in `Where`. `Set` values bind, or render verbatim
+through `rio.Expr("hits + ?", n)` with the expression's own arguments bound
+in place. `UpdateAllReturning` and `DeleteAllReturning` hand the affected
+rows back where the dialect has `RETURNING` (a soft delete returns the
+trashed state); MySQL rejects them.
 
-`Upsert` supports conflict targets (`OnConflict`), update whitelists
-(`DoUpdate`), `DoUpdateSet` for expressions (`rio.Expr("hits + excluded.hits")`)
-or bound values, `DoNothing`, and `KeepTrashed`. In `DoUpdateSet` the incoming
-row is `excluded` on PostgreSQL and SQLite and `_rio_new` on MySQL;
+`Upsert` supports conflict targets (`OnConflict`, plus `OnConflictWhere` for a
+partial unique index's predicate), update whitelists (`DoUpdate`),
+`DoUpdateSet` for expressions (`rio.Expr("hits + excluded.hits")`) or bound
+values, `DoUpdateWhere` to apply the conflict update conditionally,
+`DoNothing`, and `KeepTrashed`. In `DoUpdateSet` and `DoUpdateWhere` the
+incoming row is `excluded` on PostgreSQL and SQLite and `_rio_new` on MySQL;
 rio-maintained and `readonly` columns, and columns also named in `DoUpdate`,
-are rejected, and `DoNothing` cannot combine with either. A successful upsert
-leaves the row visible unless `KeepTrashed`.
+are rejected, and `DoNothing` cannot combine with any update option. A
+conflict update rejected by `DoUpdateWhere` returns `ErrStaleObject`; MySQL
+has no conflict predicate and rejects both `Where` options. A successful
+upsert leaves the row visible unless `KeepTrashed`.
 
 `InsertAll`/`UpsertAll` chunk at the dialect bind limit; batch writes share
 one column list, so `omitzero` doesn't apply, and a batch mixing zero and
@@ -324,7 +366,7 @@ never); `UpsertAll` never backfills.
 | `First`/`Find`/`Sole` miss | `ErrNotFound` (wraps `sql.ErrNoRows`) |
 | `All` finds nothing | empty slice, `nil` error |
 | `Sole` finds several | `ErrMultipleRows` |
-| optimistic-lock conflict | `ErrStaleObject` |
+| optimistic-lock conflict, or a `DoUpdateWhere` rejection | `ErrStaleObject` |
 | set write without condition | `ErrMissingWhere` |
 | keyed operation on a model without a primary key | `ErrNoPrimaryKey` |
 | unique / FK violation | `ErrDuplicateKey` / `ErrForeignKeyViolated`, driver error retained |
@@ -377,7 +419,7 @@ Values always bind as parameters. SQL fragments do not:
 | Mapped columns | `Update` columns, `Set` keys, `Pluck`, aggregates, `Sub`, `OrderKeys`, `DoUpdate`, `DoUpdateSet` | validated against the model, quoted as identifiers |
 | Conflict targets | `OnConflict` | quoted as identifiers |
 | Relation paths | `With`, `WithCount`, `WhereHas`, relation writes | validated against the model's relations |
-| SQL text | `Where`, `Having`, `Join`, `OrderBy`, `GroupBy`, `RelWhere`, `RelOrderBy`, `Expr`, `Raw`, `Exec` | rendered verbatim — constants only, never untrusted input |
+| SQL text | `Where`, `Having`, `Join`, `OrderBy`, `GroupBy`, `RelWhere`, `RelOrderBy`, `Expr`, `Raw`, `Exec`, `DoUpdateWhere`, `OnConflictWhere`, `LockOf` | rendered verbatim — constants only, never untrusted input |
 
 For runtime-selected identifiers, map external values onto generated
 constants: `rio.WriteColumns(os.Stdout, "models", User{}, Post{})` emits

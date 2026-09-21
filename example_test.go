@@ -2,6 +2,7 @@ package rio_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -110,12 +111,98 @@ func ExampleUpsert() {
 	err := rio.Upsert(ctx, db, &user,
 		rio.OnConflict("email"),
 		rio.DoUpdate("age", "active"),
-		rio.DoUpdateSet(rio.Set{"login_count": rio.Expr("users.login_count + 1")}),
+		rio.DoUpdateSet(rio.Set{"login_count": rio.Expr("users.login_count + ?", 1)}),
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println(user.ID)
+}
+
+// A conflict update guarded by DoUpdateWhere: the stored row survives when it
+// is newer, and Upsert reports that as ErrStaleObject.
+func ExampleDoUpdateWhere() {
+	ctx := context.Background()
+	user := User{Email: "alice@example.com", Age: 32}
+	err := rio.Upsert(ctx, db.WithoutStamps(), &user,
+		rio.OnConflict("email"),
+		rio.DoUpdate("age"),
+		rio.DoUpdateWhere("users.created_at < excluded.created_at"),
+	)
+	if errors.Is(err, rio.ErrStaleObject) {
+		fmt.Println("stored row is newer")
+	} else if err != nil {
+		log.Fatal(err)
+	}
+}
+
+// userPosts is a projection: Raw scans it by column name.
+type userPosts struct {
+	UserID int64 `rio:"user_id"`
+	Posts  int64
+}
+
+// A Raw template: the head stops at FROM, rio appends the rest, and Must
+// caches the shape like Query.Must.
+var postCounts = rio.Raw[userPosts]("SELECT user_id, count(*) AS posts FROM posts").
+	Where("published = ?").
+	GroupBy("user_id").
+	OrderBy("posts DESC").
+	Must()
+
+func ExampleRaw() {
+	ctx := context.Background()
+	rows, err := postCounts.Limit(10).All(ctx, db, true)
+	if err != nil {
+		log.Fatal(err)
+	}
+	authors, err := postCounts.Count(ctx, db, true)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(len(rows), authors)
+}
+
+func ExampleRawQuery_Value() {
+	ctx := context.Background()
+	n, err := rio.Raw[int64]("SELECT count(*) FROM users").
+		Where("age >= ?").
+		Value(ctx, db, 18)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(n)
+}
+
+// One business time for every row an operation writes.
+func ExampleDB_At() {
+	ctx := context.Background()
+	at := time.Now().UTC()
+	err := db.Tx(ctx, func(tx *rio.Tx) error {
+		user := User{Email: "bob@example.com"}
+		if err := rio.Insert(ctx, tx.At(at), &user); err != nil {
+			return err
+		}
+		return rio.Insert(ctx, tx.At(at), &Post{UserID: user.ID, Title: "hello"})
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+// LockOf restricts a lock to one side of a join; ForKeyShare only blocks
+// deletes and key changes.
+func ExampleLockOf() {
+	ctx := context.Background()
+	posts, err := rio.From[Post]().
+		Join("JOIN users u ON u.id = posts.user_id").
+		Where("u.active").
+		ForKeyShare(rio.LockOf("u")).
+		All(ctx, db)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(len(posts))
 }
 
 func ExampleQuery_OrderKeys() {

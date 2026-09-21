@@ -2,7 +2,6 @@ package rio
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -94,22 +93,14 @@ func UpsertAll[T any](ctx context.Context, db Queryer, rows []T, opts ...UpsertO
 		opt(&spec)
 	}
 	spec.normalize()
-	hasUpdate := len(spec.update) > 0 || len(spec.sets) > 0
-	if spec.doNothing && hasUpdate {
-		return errors.New("rio: UpsertAll cannot combine DoNothing with DoUpdate/DoUpdateSet")
-	}
 	p, err := planOf[T]()
 	if err != nil {
 		return err
 	}
 	g := db.gram()
 	d := g.d
-	if err := checkUpsertWrite(d, "UpsertAll"); err != nil {
+	if err := checkUpsertSpec(d, "UpsertAll", &spec); err != nil {
 		return err
-	}
-	needsConflictTarget := !spec.doNothing && d.caps().conflictTarget
-	if needsConflictTarget && len(spec.conflict) == 0 {
-		return errors.New("rio: UpsertAll with DoUpdate needs OnConflict(columns...) naming the unique index")
 	}
 	spec.noStamps = db.conf().noStamps
 	now := normalizeTime(db.conf().clock())

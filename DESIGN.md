@@ -41,8 +41,9 @@ Four layers inside `github.com/go-rio/rio`:
    ones already emitted). Dialects are an *opaque* interface built into the
    core (`rio.Postgres`, `rio.MySQL`, `rio.SQLite`, `rio.ClickHouse`);
    capability flags replace type switches: returning, conflict target, max
-   bind params, row locks render/elide/reject, mutations, transactions, unique
-   keys, generated PKs, statement prepare, FINAL, array binding, native uint64.
+   bind params, row locks render/elide/reject, key lock strengths, mutations,
+   transactions, unique keys, generated PKs, statement prepare, FINAL, array
+   binding, native uint64.
    The dialect interface stays internal so capabilities can evolve freely.
 3. **Mapping layer** — reflection-based struct↔table plans, computed once per
    type and cached forever (plans are immutable once published). Scanning has a
@@ -96,7 +97,7 @@ Three mechanisms cover structure, rendering, and preparation:
      DBs, transactions, dialects, and namers. Stable scalar shapes reuse a
      cached render; slices, subqueries, and cursors bypass it. Cache entries
      key handles weakly and die with the grammar.
-   - Limit/Offset are ints, not parameters; rebuild paged queries per page.
+   - Limit/Offset bind as parameters, so one cached shape serves every page.
    - `Query.Find` is the keyed variant of `First`: the primary-key predicate
      renders first and binds the leading arguments, so `Must` caches it.
 3. **`rio.WithStmtCache()`** caches `*sql.Stmt` per SQL text on the `*rio.DB`
@@ -107,6 +108,15 @@ Three mechanisms cover structure, rendering, and preparation:
    mysql modules turn it on by default because their drivers re-prepare every
    statement otherwise, and `WithoutStmtCache` opts out. The native channel
    uses pgx's query execution mode instead.
+
+## Raw queries
+
+`Raw[T]` is the projection builder: a hand-written SELECT head up to its FROM
+and JOIN clauses, plus the clauses rio appends (WHERE, GROUP BY, HAVING,
+ORDER BY, bound LIMIT/OFFSET) under `Query`'s argument and caching rules.
+Entity queries never prune columns; a projection is a `Raw[DTO]`. `Count` and
+`Exists` wrap the rendered statement as a derived table instead of parsing the
+head, and `First`/`Sole` append no LIMIT to it.
 
 ## Model mapping
 
@@ -191,6 +201,10 @@ relations across composite keys are unsupported.
 | `All` miss | empty slice, `nil` error |
 | `Sole` with 2+ rows | `rio.ErrMultipleRows` |
 | `Update/Delete` with `version` mismatch | `rio.ErrStaleObject` (0 rows affected) |
+| `Upsert` conflict update rejected by `DoUpdateWhere` | `rio.ErrStaleObject`; the row is untouched, the struct keeps this call's stamps |
+| `Update` whitelist naming the `UpdatedAt` column | binds the struct's value; an unlisted `UpdatedAt` takes the clock |
+| Row lock strengths | `ForNoKeyUpdate`/`ForKeyShare` render on PostgreSQL; MySQL takes the next stronger lock; SQLite elides; ClickHouse rejects |
+| `Raw.Count` / `Raw.Exists` | `count(*)` or a `LIMIT 1` probe over the statement as a derived table; `Raw.First`/`Sole` never add LIMIT |
 | `UpdateAll/DeleteAll` without WHERE | `rio.ErrMissingWhere`; `.AllRows()` opts in explicitly |
 | `UpdateAllReturning/DeleteAllReturning` | the affected rows as stored (a soft delete returns the trashed state); rejected without `RETURNING` (MySQL) |
 | `Upsert` with `DoUpdateSet` | assignments render in canonical column order after `DoUpdate`'s; `Expr` verbatim, other values bound after the row values; the shape keys the SQL cache |
@@ -328,10 +342,11 @@ Each of these is a decision, not a gap:
 
 The core ships mapping, immutable queries, entity and set writes (with
 `RETURNING` variants), upsert and batch paths (`DoUpdate`, `DoUpdateSet`,
-`DoNothing`), four relation types, nested preloading and filtered counts,
-optimistic locking, soft delete, timestamps, readonly columns, row locks with
-`NoWait`/`SkipLocked`, `Distinct` and aggregates, Raw/Exec, subquery
-arguments, reusable validated Query templates, cursor pagination
+`DoUpdateWhere`, `DoNothing`), four relation types, nested preloading and
+filtered counts, optimistic locking, soft delete, timestamps with per-handle
+clocks, readonly columns, row locks in four strengths with
+`NoWait`/`SkipLocked`/`LockOf`, `Distinct` and aggregates, the Raw projection
+builder and Exec, subquery arguments, reusable validated templates, cursor pagination
 (`OrderKeys`/`After`/`Before`/`CursorAt`/`Chunk`: keyset predicates with an
 automatic primary-key tie-breaker and fingerprinted value-only tokens),
 column generation, statement caching, transactions/savepoints, hooks, error

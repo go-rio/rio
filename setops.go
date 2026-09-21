@@ -9,13 +9,22 @@ import (
 	"sort"
 )
 
-// Set maps database column names to UpdateAll values. Expr values are inserted
-// verbatim; never construct them from untrusted input.
+// Set maps database column names to UpdateAll values. Expression values are
+// inserted verbatim; never construct them from untrusted input.
 type Set map[string]any
 
-// Expr is a verbatim UpdateAll value for database-side expressions; never
-// construct it from untrusted input.
-type Expr string
+// Expression is a verbatim SQL value for Set with the arguments its ?
+// placeholders bind; Expr builds one.
+type Expression struct {
+	sql  string
+	args []any
+}
+
+// Expr builds an Expression whose ? placeholders bind args in order; never
+// build the SQL from untrusted input.
+func Expr(sql string, args ...any) Expression {
+	return Expression{sql: sql, args: copyArgs(args)}
+}
 
 // UpdateAll updates matching rows and returns the affected count. It requires
 // conditions or AllRows. UpdatedAt is maintained unless explicitly assigned;
@@ -236,11 +245,11 @@ func (q Query[T]) forceDeleteAll(
 	return runSetOp[T](ctx, db, "delete", p, sqlText, outArgs, returning)
 }
 
-// appendSetValue renders one assignment's right-hand side: an Expr verbatim,
-// anything else as a bound value (JSON columns encode first).
+// appendSetValue renders one assignment's right-hand side: an Expression
+// verbatim with its arguments, anything else bound (JSON columns encode first).
 func appendSetValue(b []byte, args []any, op string, f *field, v any) ([]byte, []any, error) {
-	if expr, isExpr := v.(Expr); isExpr {
-		return append(b, string(expr)...), args, nil
+	if expr, isExpr := v.(Expression); isExpr {
+		return append(b, expr.sql...), append(args, expr.args...), nil
 	}
 	b = append(b, '?')
 	if f.jsonCol {

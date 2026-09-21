@@ -356,12 +356,12 @@ func TestNativeAllRendersAndScansTypedRows(t *testing.T) {
 	if users[0].Age != 30 || users[0].Version != 1 || !users[0].CreatedAt.Equal(testNow) {
 		t.Fatalf("typed values misrouted: %+v", users[0])
 	}
-	want := `SELECT "users"."id", "users"."email", "users"."age", "users"."bio", "users"."version", "users"."deleted_at", "users"."created_at", "users"."updated_at" FROM "users" WHERE (age > $1) AND "users"."deleted_at" IS NULL ORDER BY created_at DESC LIMIT 10`
+	want := `SELECT "users"."id", "users"."email", "users"."age", "users"."bio", "users"."version", "users"."deleted_at", "users"."created_at", "users"."updated_at" FROM "users" WHERE (age > $1) AND "users"."deleted_at" IS NULL ORDER BY created_at DESC LIMIT $2`
 	if got := nf.logged()[0]; got != want {
 		t.Fatalf("sql:\n got: %s\nwant: %s", got, want)
 	}
-	// Native args are rio's bind values verbatim — 18 stays an int.
-	if args := nf.loggedContaining("SELECT")[0].args; len(args) != 1 || args[0] != 18 {
+	// Native args are rio's bind values verbatim — 18 and the bound LIMIT stay ints.
+	if args := nf.loggedContaining("SELECT")[0].args; len(args) != 2 || args[0] != 18 || args[1] != 10 {
 		t.Fatalf("args = %v", args)
 	}
 }

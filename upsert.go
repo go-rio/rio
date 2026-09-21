@@ -21,16 +21,22 @@ func OnConflict(cols ...string) UpsertOption {
 	return func(s *upsertSpec) { s.conflict = append(s.conflict, cols...) }
 }
 
+// OnConflictWhere adds a partial unique index's predicate to the conflict
+// target, verbatim; it needs OnConflict, and MySQL rejects it.
+func OnConflictWhere(pred string) UpsertOption {
+	return func(s *upsertSpec) { s.conflictWhere = pred }
+}
+
 // DoUpdate selects columns to overwrite on conflict. Without columns it uses
 // every eligible column; explicit columns are deduplicated in model order.
 func DoUpdate(cols ...string) UpsertOption {
 	return func(s *upsertSpec) { s.update = append(s.update, cols...) }
 }
 
-// DoUpdateSet assigns columns on conflict: an Expr renders verbatim (the
-// incoming row is "excluded" on PostgreSQL and SQLite, "_rio_new" on MySQL),
-// any other value binds. Calls merge; columns rio maintains, readonly
-// columns, and columns also named in DoUpdate are rejected.
+// DoUpdateSet assigns columns on conflict: an Expression renders verbatim with
+// its arguments (the incoming row is "excluded" on PostgreSQL and SQLite,
+// "_rio_new" on MySQL), any other value binds. Calls merge; maintained,
+// readonly, and DoUpdate columns are rejected.
 func DoUpdateSet(set Set) UpsertOption {
 	return func(s *upsertSpec) {
 		if s.sets == nil {
@@ -40,6 +46,13 @@ func DoUpdateSet(set Set) UpsertOption {
 			s.sets[k] = v
 		}
 	}
+}
+
+// DoUpdateWhere applies the conflict update only where the verbatim expr
+// holds (the incoming row is "excluded"); a rejected update returns
+// ErrStaleObject from Upsert. MySQL rejects it.
+func DoUpdateWhere(expr string, args ...any) UpsertOption {
+	return func(s *upsertSpec) { s.where = cond{expr: expr, args: copyArgs(args)} }
 }
 
 // DoNothing turns conflicts into no-ops without suppressing unrelated errors.
@@ -55,15 +68,17 @@ func KeepTrashed() UpsertOption {
 
 // upsertSpec is the normalized option set of one upsert call.
 type upsertSpec struct {
-	conflict    []string
-	update      []string
-	sets        Set      // DoUpdateSet assignments
-	setKeys     []string // sets in canonical order, after normalize
-	doNothing   bool
-	keepTrashed bool
-	noStamps    bool // the handle's WithoutStamps
-	conflictBuf [1]string
-	updateBuf   [1]string
+	conflict      []string
+	conflictWhere string // OnConflictWhere: the partial index predicate
+	update        []string
+	sets          Set      // DoUpdateSet assignments
+	setKeys       []string // sets in canonical order, after normalize
+	where         cond     // DoUpdateWhere: the conflict update's predicate
+	doNothing     bool
+	keepTrashed   bool
+	noStamps      bool // the handle's WithoutStamps
+	conflictBuf   [1]string
+	updateBuf     [1]string
 }
 
 func (s *upsertSpec) init() {
@@ -94,23 +109,20 @@ func (s *upsertSpec) normalize() {
 	s.conflict = out
 }
 
-// appendSetArgs binds the DoUpdateSet values in canonical order, after the
-// row values, skipping Expr assignments.
+// appendSetArgs binds the DoUpdateSet values and the DoUpdateWhere arguments
+// in render order, after the row values.
 func (s *upsertSpec) appendSetArgs(args []any, p *plan, d Dialect) ([]any, error) {
-	if len(s.sets) == 0 {
+	if len(s.sets) == 0 && len(s.where.args) == 0 {
 		return args, nil
 	}
 	start := len(args)
 	for _, k := range s.setKeys {
-		v := s.sets[k]
-		if _, isExpr := v.(Expr); isExpr {
-			continue
-		}
 		var err error
-		if _, args, err = appendSetValue(nil, args, "DoUpdateSet", p.byColumn[k], v); err != nil {
+		if _, args, err = appendSetValue(nil, args, "DoUpdateSet", p.byColumn[k], s.sets[k]); err != nil {
 			return nil, err
 		}
 	}
+	args = append(args, s.where.args...)
 	bound, err := normalizeArgs(d, args[start:])
 	if err != nil {
 		return nil, err
@@ -143,11 +155,13 @@ func upsertSpecKey(spec *upsertSpec, update []*field) upsertCacheKey {
 	for i, c := range spec.conflict[:min(len(spec.conflict), len(key.conflict))] {
 		key.conflict[i] = c
 	}
-	if len(spec.conflict) <= len(key.conflict) && len(spec.sets) == 0 {
+	simple := len(spec.conflict) <= len(key.conflict) && len(spec.sets) == 0 &&
+		spec.conflictWhere == "" && spec.where.expr == ""
+	if simple {
 		return key
 	}
-	// overflow carries the conflict columns past the fixed slots and the
-	// DoUpdateSet shape: column=expression or column=? per assignment.
+	// overflow carries the conflict columns past the fixed slots, the
+	// DoUpdateSet shape, and both conflict predicates.
 	var b []byte
 	for _, c := range spec.conflict[min(len(spec.conflict), len(key.conflict)):] {
 		b = append(b, c...)
@@ -156,13 +170,16 @@ func upsertSpecKey(spec *upsertSpec, update []*field) upsertCacheKey {
 	for _, k := range spec.setKeys {
 		b = append(b, k...)
 		b = append(b, '=')
-		if expr, ok := spec.sets[k].(Expr); ok {
-			b = append(b, expr...)
+		if expr, ok := spec.sets[k].(Expression); ok {
+			b = append(b, expr.sql...)
 		} else {
 			b = append(b, '?')
 		}
 		b = append(b, 0)
 	}
+	b = append(b, spec.conflictWhere...)
+	b = append(b, 0)
+	b = append(b, spec.where.expr...)
 	key.overflow = byteString(b)
 	return key
 }
@@ -170,7 +187,8 @@ func upsertSpecKey(spec *upsertSpec, update []*field) upsertCacheKey {
 // Upsert inserts a row or updates it on unique-key conflict in one statement.
 // Unless KeepTrashed is set, a successful update restores a soft-deleted row.
 // Zero omitzero fields are excluded from both insert and the default update
-// set; naming one explicitly in DoUpdate is an error.
+// set; naming one explicitly in DoUpdate is an error. DoUpdateWhere narrows
+// the conflict update; a rejected update returns ErrStaleObject.
 //
 // PostgreSQL and SQLite backfill the conflict result. MySQL backfills an
 // auto-increment key only on insert and cannot refresh a server-incremented
@@ -186,23 +204,14 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 		opt(&spec)
 	}
 	spec.normalize()
-	hasUpdate := len(spec.update) > 0 || len(spec.sets) > 0
-	if spec.doNothing && hasUpdate {
-		return errors.New("rio: Upsert cannot combine DoNothing with DoUpdate/DoUpdateSet")
-	}
 	p, err := planOf[T]()
 	if err != nil {
 		return err
 	}
 	g := db.gram()
 	d := g.d
-	if err := checkUpsertWrite(d, "Upsert"); err != nil {
+	if err := checkUpsertSpec(d, "Upsert", &spec); err != nil {
 		return err
-	}
-	// MySQL has no conflict target.
-	needsConflictTarget := !spec.doNothing && d.caps().conflictTarget
-	if needsConflictTarget && len(spec.conflict) == 0 {
-		return errors.New("rio: Upsert with DoUpdate needs OnConflict(columns...) naming the unique index")
 	}
 
 	rv, err := rowValue("Upsert", row)
@@ -243,7 +252,7 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 	returning := d.caps().returning
 	// DoNothing returns generated columns only for a fresh insert.
 	insertOnlyBackfill := returning && spec.doNothing && len(back) > 0
-	// Conflict assignments bind no arguments, so the shape is cacheable.
+	// Conflict assignments and predicates bind through ?, so the shape is cacheable.
 	sqlText, err := upsertSQL(
 		g,
 		p,
@@ -291,6 +300,9 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 				return err
 			}
 			err = scanBackRow(rows, p, unsafe.Pointer(row))
+			if spec.where.expr != "" && errors.Is(err, errNoReturningRow) {
+				err = ErrStaleObject
+			}
 			finishQuery(finish, err, oneIf(err == nil))
 			return err
 		}
@@ -433,6 +445,51 @@ func checkUpsertSets(p *plan, spec *upsertSpec, update []*field) error {
 	return nil
 }
 
+// checkUpsertSpec validates the option set against the dialect.
+func checkUpsertSpec(d Dialect, op string, spec *upsertSpec) error {
+	if err := checkUpsertWrite(d, op); err != nil {
+		return err
+	}
+	hasUpdate := len(spec.update) > 0 || len(spec.sets) > 0 || spec.where.expr != ""
+	if spec.doNothing && hasUpdate {
+		return fmt.Errorf("rio: %s cannot combine DoNothing with DoUpdate, DoUpdateSet, or DoUpdateWhere", op)
+	}
+	if spec.where.expr != "" {
+		var holes int
+		_, _, _ = rebindCount(d.lexer(), spec.where.expr, &holes)
+		if holes != len(spec.where.args) {
+			return fmt.Errorf(
+				"rio: %s: DoUpdateWhere(%q) has %d placeholder(s) but %d argument(s)",
+				op,
+				spec.where.expr,
+				holes,
+				len(spec.where.args),
+			)
+		}
+	}
+	if !d.caps().conflictTarget {
+		// MySQL has neither a conflict target nor a conditional conflict update.
+		if spec.conflictWhere != "" {
+			return unsupportedf("rio: %s: OnConflictWhere is not supported on %s (no conflict target)", op, d.name())
+		}
+		if spec.where.expr != "" {
+			return unsupportedf(
+				"rio: %s: DoUpdateWhere is not supported on %s (ON DUPLICATE KEY UPDATE takes no predicate)",
+				op,
+				d.name(),
+			)
+		}
+		return nil
+	}
+	if !spec.doNothing && len(spec.conflict) == 0 {
+		return fmt.Errorf("rio: %s with DoUpdate needs OnConflict(columns...) naming the unique index", op)
+	}
+	if spec.conflictWhere != "" && len(spec.conflict) == 0 {
+		return fmt.Errorf("rio: %s: OnConflictWhere needs OnConflict(columns...)", op)
+	}
+	return nil
+}
+
 // checkUpsertWrite rejects dialects without unique constraints.
 func checkUpsertWrite(d Dialect, op string) error {
 	if d.caps().uniqueKeys {
@@ -498,7 +555,13 @@ func appendConflictBranch(b []byte, d Dialect, table string, p *plan, update []*
 			return append(b, "DO NOTHING"...)
 		}
 		b = append(b, "DO UPDATE SET "...)
-		return appendConflictSets(b, d, table, p, update, spec, "excluded")
+		b = appendConflictSets(b, d, table, p, update, spec, "excluded")
+		if spec.where.expr != "" {
+			b = append(b, " WHERE ("...)
+			b = append(b, spec.where.expr...)
+			b = append(b, ')')
+		}
+		return b
 	}
 	// The DoUpdate row alias requires MySQL 8.0.19 or later.
 	if !spec.doNothing {
@@ -629,7 +692,12 @@ func appendConflictClause(b []byte, d Dialect, spec *upsertSpec) []byte {
 		}
 		b = d.quote(b, c)
 	}
-	return append(b, ") "...)
+	b = append(b, ')')
+	if spec.conflictWhere != "" {
+		b = append(b, " WHERE "...)
+		b = append(b, spec.conflictWhere...)
+	}
+	return append(b, ' ')
 }
 
 // appendConflictSets renders the DO UPDATE SET list. newRow is "excluded" for
@@ -665,8 +733,8 @@ func appendConflictSets(
 		sep()
 		b = d.quote(b, k)
 		b = append(b, " = "...)
-		if expr, ok := spec.sets[k].(Expr); ok {
-			b = append(b, expr...)
+		if expr, ok := spec.sets[k].(Expression); ok {
+			b = append(b, expr.sql...)
 		} else {
 			b = append(b, '?')
 		}

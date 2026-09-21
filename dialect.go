@@ -63,6 +63,7 @@ type dialectCaps struct {
 	autoIncrPK     bool          // the database can generate the conventional ID
 	stmtPrepare    bool          // the driver prepares arbitrary statements (stmt cache)
 	finalTable     bool          // FROM t FINAL merges row versions at read (ClickHouse)
+	keyLocks       bool          // FOR NO KEY UPDATE and FOR KEY SHARE exist (PostgreSQL)
 
 	// bindBytesAsString rebinds []byte arguments as strings: the ClickHouse channel
 	// would interpolate them as Array(UInt8) literals.
@@ -86,7 +87,7 @@ func (postgresDialect) caps() dialectCaps {
 	return dialectCaps{
 		returning: true, conflictTarget: true, forUpdate: forUpdateRender, maxBindParams: 65535,
 		mutations: true, transactions: true, uniqueKeys: true, autoIncrPK: true, stmtPrepare: true,
-		arrayBind: true,
+		arrayBind: true, keyLocks: true,
 	}
 }
 

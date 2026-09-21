@@ -50,9 +50,13 @@ func TestAllRendersQualifiedSelect(t *testing.T) {
 	if len(users) != 2 || users[0].Email != "a@x" || users[1].ID != 2 {
 		t.Fatalf("scanned %+v", users)
 	}
-	want := `SELECT "users"."id", "users"."email", "users"."age", "users"."bio", "users"."version", "users"."deleted_at", "users"."created_at", "users"."updated_at" FROM "users" WHERE (age > $1) AND "users"."deleted_at" IS NULL ORDER BY created_at DESC LIMIT 10`
-	if got := f.logged()[0]; got != want {
-		t.Fatalf("sql:\n got: %s\nwant: %s", got, want)
+	want := `SELECT "users"."id", "users"."email", "users"."age", "users"."bio", "users"."version", "users"."deleted_at", "users"."created_at", "users"."updated_at" FROM "users" WHERE (age > $1) AND "users"."deleted_at" IS NULL ORDER BY created_at DESC LIMIT $2`
+	got := f.loggedContaining("SELECT")[0]
+	if got.sql != want {
+		t.Fatalf("sql:\n got: %s\nwant: %s", got.sql, want)
+	}
+	if len(got.args) != 2 || got.args[0] != int64(18) || got.args[1] != int64(10) {
+		t.Fatalf("args: %v", got.args)
 	}
 }
 
@@ -79,8 +83,8 @@ func TestSoleMultipleRows(t *testing.T) {
 	if !errors.Is(err, ErrMultipleRows) {
 		t.Fatalf("want ErrMultipleRows, got %v", err)
 	}
-	if !strings.Contains(f.logged()[0], "LIMIT 2") {
-		t.Fatal("Sole should probe with LIMIT 2")
+	if got := f.loggedContaining("LIMIT")[0]; !strings.HasSuffix(got.sql, "LIMIT $1") || got.args[0] != int64(2) {
+		t.Fatalf("Sole should probe with LIMIT 2: %s %v", got.sql, got.args)
 	}
 }
 
@@ -252,6 +256,41 @@ func TestUpdateFullColumnWithOptimisticLock(t *testing.T) {
 	}
 	if !u.UpdatedAt.Equal(normalizeTime(testNow)) {
 		t.Fatal("UpdatedAt must be maintained")
+	}
+}
+
+func TestAtPinsTheClock(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	f.queueRows([]string{"id"}, []driver.Value{int64(1)})
+	u := &User{Email: "a@x"}
+	if err := Insert(ctx, db.At(at), u); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if !u.CreatedAt.Equal(at) || !u.UpdatedAt.Equal(at) {
+		t.Fatalf("stamps must read the pinned clock: %+v", u)
+	}
+
+	f.queueExec(0, 1)
+	err := db.Tx(ctx, func(tx *Tx) error {
+		return Update(ctx, tx.At(at), u, "email")
+	})
+	if err != nil {
+		t.Fatalf("Tx: %v", err)
+	}
+	if bound, ok := f.loggedContaining("UPDATE")[0].args[1].(time.Time); !ok || !bound.Equal(at) {
+		t.Fatalf("transaction view must inherit the pinned clock: %v", f.loggedContaining("UPDATE")[0].args)
+	}
+
+	f.queueRows([]string{"id"}, []driver.Value{int64(2)})
+	if err := Insert(ctx, db, &User{Email: "b@x"}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if got := f.loggedContaining("INSERT")[1].args; got[len(got)-1] != normalizeTime(testNow) {
+		t.Fatalf("the parent handle keeps its own clock: %v", got)
 	}
 }
 

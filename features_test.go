@@ -904,7 +904,7 @@ func TestQueryFind(t *testing.T) {
 	if len(mains) != 2 || mains[0].sql != mains[1].sql || mains[1].args[0] != int64(2) {
 		t.Fatalf("cached find: %+v", mains)
 	}
-	if got := mains[0].sql; !strings.Contains(got, `WHERE "users"."id" = $1`) || strings.Contains(got, `"deleted_at" IS NULL`) || !strings.HasSuffix(got, "LIMIT 1") {
+	if got := mains[0].sql; !strings.Contains(got, `WHERE "users"."id" = $1`) || strings.Contains(got, `"deleted_at" IS NULL`) || !strings.HasSuffix(got, "LIMIT $2") {
 		t.Fatalf("find sql: %s", got)
 	}
 	entries := 0
@@ -1193,16 +1193,17 @@ func TestOffsetWithoutLimit(t *testing.T) {
 		d    Dialect
 		want string
 	}{
-		{Postgres, " OFFSET 5"},
-		{MySQL, " LIMIT 18446744073709551615 OFFSET 5"},
-		{SQLite, " LIMIT -1 OFFSET 5"},
+		{Postgres, " OFFSET $1"},
+		{MySQL, " LIMIT 18446744073709551615 OFFSET ?"},
+		{SQLite, " LIMIT -1 OFFSET ?"},
 	} {
 		f := newFakeDB()
 		db := f.open(tc.d)
 		f.queueRows([]string{"id"})
 		_, _ = From[Org]().Offset(5).All(ctx, db)
-		if got := f.logged()[0]; !strings.HasSuffix(got, tc.want) {
-			t.Fatalf("%s: %s (want suffix %q)", tc.d.name(), got, tc.want)
+		got := f.loggedContaining("OFFSET")[0]
+		if !strings.HasSuffix(got.sql, tc.want) || len(got.args) != 1 || got.args[0] != int64(5) {
+			t.Fatalf("%s: %s %v (want suffix %q binding 5)", tc.d.name(), got.sql, got.args, tc.want)
 		}
 	}
 }
@@ -1258,23 +1259,23 @@ func TestExistsHonorsOffsetAndZeroLimit(t *testing.T) {
 
 	f.queueRows([]string{"1"})
 	_, _ = From[Org]().Limit(10).Exists(ctx, db)
-	got := f.logged()[0]
-	if !strings.HasSuffix(got, "LIMIT 1") || strings.Count(got, "LIMIT") != 1 {
-		t.Fatalf("Limit >= 1 collapses to the probe LIMIT: %s", got)
+	got := f.loggedContaining("LIMIT")[0]
+	if !strings.HasSuffix(got.sql, "LIMIT $1") || strings.Count(got.sql, "LIMIT") != 1 || got.args[0] != int64(1) {
+		t.Fatalf("Limit >= 1 collapses to the probe LIMIT: %s %v", got.sql, got.args)
 	}
 
 	f.queueRows([]string{"1"})
 	_, _ = From[Org]().Limit(10).Offset(5).Exists(ctx, db)
-	got = f.logged()[1]
-	if !strings.HasSuffix(got, "LIMIT 1 OFFSET 5") {
-		t.Fatalf("Offset must shift the probe row: %s", got)
+	got = f.loggedContaining("LIMIT")[1]
+	if !strings.HasSuffix(got.sql, "LIMIT $1 OFFSET $2") || got.args[0] != int64(1) || got.args[1] != int64(5) {
+		t.Fatalf("Offset must shift the probe row: %s %v", got.sql, got.args)
 	}
 
 	f.queueRows([]string{"1"})
 	_, _ = From[Org]().Limit(0).Exists(ctx, db)
-	got = f.logged()[2]
-	if !strings.HasSuffix(got, "LIMIT 0") {
-		t.Fatalf("Limit(0) means no rows, as it does on All: %s", got)
+	got = f.loggedContaining("LIMIT")[2]
+	if !strings.HasSuffix(got.sql, "LIMIT $1") || got.args[0] != int64(0) {
+		t.Fatalf("Limit(0) means no rows, as it does on All: %s %v", got.sql, got.args)
 	}
 }
 
@@ -2913,7 +2914,7 @@ func TestCountForUpdateOmitsLock(t *testing.T) {
 	if _, err := From[Post]().Where("user_id = ?", 5).ForUpdate().Exists(ctx, db); err != nil {
 		t.Fatalf("Exists: %v", err)
 	}
-	if got := f.logged()[1]; !strings.HasSuffix(got, "LIMIT 1 FOR UPDATE") {
+	if got := f.logged()[1]; !strings.HasSuffix(got, "LIMIT $2 FOR UPDATE") {
 		t.Fatalf("exists keeps the lock: %s", got)
 	}
 }
@@ -3977,8 +3978,8 @@ func TestFirstRespectsCallerLimit(t *testing.T) {
 	if _, err := From[User]().Limit(0).First(ctx, db); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Limit(0).First: %v", err)
 	}
-	if got := f.logged()[0]; !strings.Contains(got, "LIMIT 0") {
-		t.Fatalf("caller's LIMIT 0 must reach the SQL: %s", got)
+	if got := f.loggedContaining("LIMIT")[0]; !strings.HasSuffix(got.sql, "LIMIT $1") || got.args[0] != int64(0) {
+		t.Fatalf("caller's LIMIT 0 must reach the SQL: %s %v", got.sql, got.args)
 	}
 
 	f.queueRows(userCols, userRow(1, "a@x"), userRow(2, "b@x"))
@@ -3986,16 +3987,16 @@ func TestFirstRespectsCallerLimit(t *testing.T) {
 	if err != nil || u.ID != 1 {
 		t.Fatalf("Limit(5).First: %v %+v", err, u)
 	}
-	if got := f.logged()[1]; !strings.Contains(got, "LIMIT 5") {
-		t.Fatalf("caller's LIMIT 5 must not be overridden: %s", got)
+	if got := f.loggedContaining("LIMIT")[1]; got.args[0] != int64(5) {
+		t.Fatalf("caller's LIMIT 5 must not be overridden: %s %v", got.sql, got.args)
 	}
 
 	f.queueRows(userCols)
 	if _, err := From[User]().First(ctx, db); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("First: %v", err)
 	}
-	if got := f.logged()[2]; !strings.Contains(got, "LIMIT 1") {
-		t.Fatalf("First without a caller Limit still injects LIMIT 1: %s", got)
+	if got := f.loggedContaining("LIMIT")[2]; got.args[0] != int64(1) {
+		t.Fatalf("First without a caller Limit still injects LIMIT 1: %s %v", got.sql, got.args)
 	}
 }
 
@@ -4008,16 +4009,16 @@ func TestSoleRespectsCallerLimit(t *testing.T) {
 	if _, err := From[User]().Limit(0).Sole(ctx, db); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Limit(0).Sole: %v", err)
 	}
-	if got := f.logged()[0]; !strings.Contains(got, "LIMIT 0") {
-		t.Fatalf("caller's LIMIT 0 must reach the SQL: %s", got)
+	if got := f.loggedContaining("LIMIT")[0]; !strings.HasSuffix(got.sql, "LIMIT $1") || got.args[0] != int64(0) {
+		t.Fatalf("caller's LIMIT 0 must reach the SQL: %s %v", got.sql, got.args)
 	}
 
 	f.queueRows(userCols)
 	if _, err := From[User]().Sole(ctx, db); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Sole: %v", err)
 	}
-	if got := f.logged()[1]; !strings.Contains(got, "LIMIT 2") {
-		t.Fatalf("Sole without a caller Limit still probes with LIMIT 2: %s", got)
+	if got := f.loggedContaining("LIMIT")[1]; got.args[0] != int64(2) {
+		t.Fatalf("Sole without a caller Limit still probes with LIMIT 2: %s %v", got.sql, got.args)
 	}
 }
 
@@ -4345,11 +4346,11 @@ func TestCursorAtRendersExpandedKeysetPredicate(t *testing.T) {
 	if !strings.Contains(got.sql, wantPred) {
 		t.Fatalf("keyset predicate:\n got: %s\nwant: %s", got.sql, wantPred)
 	}
-	wantOrder := `ORDER BY "paged_items"."score" DESC, "paged_items"."name", "paged_items"."id" LIMIT 2`
+	wantOrder := `ORDER BY "paged_items"."score" DESC, "paged_items"."name", "paged_items"."id" LIMIT $7`
 	if !strings.HasSuffix(got.sql, wantOrder) {
 		t.Fatalf("order tail:\n got: %s\nwant suffix: %s", got.sql, wantOrder)
 	}
-	wantArgs := []any{int64(90), int64(90), "m", int64(90), "m", int64(7)}
+	wantArgs := []any{int64(90), int64(90), "m", int64(90), "m", int64(7), int64(2)}
 	if len(got.args) != len(wantArgs) {
 		t.Fatalf("args: %#v", got.args)
 	}
@@ -4481,7 +4482,7 @@ func TestBeforeReversesQueryAndPage(t *testing.T) {
 	}
 	got := f.loggedContaining("SELECT")[0]
 	wantPred := `(("paged_items"."score" > $1) OR ("paged_items"."score" = $2 AND "paged_items"."id" > $3))`
-	if !strings.Contains(got.sql, wantPred) || !strings.HasSuffix(got.sql, `ORDER BY "paged_items"."score", "paged_items"."id" LIMIT 2`) {
+	if !strings.Contains(got.sql, wantPred) || !strings.HasSuffix(got.sql, `ORDER BY "paged_items"."score", "paged_items"."id" LIMIT $4`) {
 		t.Fatalf("reversed query: %s", got.sql)
 	}
 	if len(page) != 2 || page[0].ID != 9 || page[1].ID != 8 {
@@ -4522,7 +4523,7 @@ func TestChunkWalksKeysetPages(t *testing.T) {
 		t.Fatalf("seen = %v", seen)
 	}
 	stmts := f.loggedContaining("SELECT")
-	if len(stmts) != 2 || !strings.HasSuffix(stmts[0].sql, `ORDER BY "paged_items"."id" LIMIT 2`) {
+	if len(stmts) != 2 || !strings.HasSuffix(stmts[0].sql, `ORDER BY "paged_items"."id" LIMIT $2`) || stmts[0].args[1] != int64(2) {
 		t.Fatalf("first page: %+v", stmts)
 	}
 	if !strings.Contains(stmts[1].sql, `"paged_items"."id" > $2`) || stmts[1].args[0] != int64(0) || stmts[1].args[1] != int64(2) {

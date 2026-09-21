@@ -178,6 +178,9 @@ func newCachedQuery(
 		return true
 	}
 
+	if s.head.expr != "" && !conditions("Raw", []cond{s.head}) {
+		return nil, false
+	}
 	if !conditions("Where", s.wheres) {
 		return nil, false
 	}
@@ -192,8 +195,14 @@ func newCachedQuery(
 	if !conditions("Having", s.havings) {
 		return nil, false
 	}
-	if execIndex != len(execArgs) || argIndex != len(args) {
+	if execIndex != len(execArgs) {
 		return nil, false
+	}
+	// LIMIT and OFFSET bind last, as ints fixed by the query value.
+	for ; argIndex < len(args); argIndex++ {
+		if _, ok := args[argIndex].(int); !ok {
+			return nil, false
+		}
 	}
 
 	hasIdentityArgs := len(args) == len(execArgs)

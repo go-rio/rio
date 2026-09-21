@@ -83,6 +83,16 @@ func (d *DB) WithoutStamps() *DB {
 	return &c
 }
 
+// At returns a handle whose clock reads t, so stamps and soft-delete
+// timestamps written through it carry t; its transactions inherit it.
+func (d *DB) At(t time.Time) *DB {
+	cfg := *d.cfg
+	cfg.clock = func() time.Time { return t }
+	c := *d
+	c.cfg = &cfg
+	return &c
+}
+
 // Close closes the prepared-statement cache (if enabled) and the underlying
 // *sql.DB.
 func (d *DB) Close() error { return d.e.close() }
@@ -181,6 +191,15 @@ func (t *Tx) NativeTx() any {
 func (t *Tx) WithoutStamps() *Tx {
 	cfg := *t.cfg
 	cfg.noStamps = true
+	c := *t
+	c.cfg = &cfg
+	return &c
+}
+
+// At returns a view of this transaction whose clock reads at; see DB.At.
+func (t *Tx) At(at time.Time) *Tx {
+	cfg := *t.cfg
+	cfg.clock = func() time.Time { return at }
 	c := *t
 	c.cfg = &cfg
 	return &c

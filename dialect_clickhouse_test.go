@@ -29,7 +29,7 @@ func TestClickHouseSelectGolden(t *testing.T) {
 	if len(users) != 1 || users[0].Email != "a@x" {
 		t.Fatalf("scan: %+v", users)
 	}
-	want := "SELECT `users`.`id`, `users`.`email`, `users`.`age`, `users`.`bio`, `users`.`version`, `users`.`deleted_at`, `users`.`created_at`, `users`.`updated_at` FROM `users` WHERE (age > ?) AND `users`.`deleted_at` IS NULL ORDER BY created_at DESC LIMIT 10"
+	want := "SELECT `users`.`id`, `users`.`email`, `users`.`age`, `users`.`bio`, `users`.`version`, `users`.`deleted_at`, `users`.`created_at`, `users`.`updated_at` FROM `users` WHERE (age > ?) AND `users`.`deleted_at` IS NULL ORDER BY created_at DESC LIMIT ?"
 	if got := f.logged()[0]; got != want {
 		t.Fatalf("sql:\n got: %s\nwant: %s", got, want)
 	}
@@ -58,7 +58,7 @@ func TestClickHouseBareOffset(t *testing.T) {
 	db := f.open(ClickHouse)
 	f.queueRows(orgCols)
 	_, _ = From[Org]().Offset(5).All(ctx, db)
-	if got := f.logged()[0]; !strings.HasSuffix(got, "FROM `orgs` OFFSET 5") {
+	if got := f.logged()[0]; !strings.HasSuffix(got, "FROM `orgs` OFFSET ?") {
 		t.Fatalf("bare OFFSET must not synthesize a LIMIT: %s", got)
 	}
 }
@@ -282,7 +282,7 @@ func TestClickHouseFinalGolden(t *testing.T) {
 	for i, want := range []string{
 		"SELECT `users`.`id`, `users`.`email`, `users`.`age`, `users`.`bio`, `users`.`version`, `users`.`deleted_at`, `users`.`created_at`, `users`.`updated_at` FROM `users` FINAL WHERE (age > ?) AND `users`.`deleted_at` IS NULL",
 		"SELECT count(*) FROM `users` FINAL WHERE `users`.`deleted_at` IS NULL",
-		"SELECT 1 FROM `users` FINAL WHERE `users`.`deleted_at` IS NULL LIMIT 1",
+		"SELECT 1 FROM `users` FINAL WHERE `users`.`deleted_at` IS NULL LIMIT ?",
 		"SELECT `users`.`email` FROM `users` FINAL WHERE `users`.`deleted_at` IS NULL",
 	} {
 		if logs[i] != want {
@@ -672,7 +672,7 @@ func TestClickHouseHashCommentRules(t *testing.T) {
 
 	// `# ` comments: the trailing ? is dead, so one argument over-supplies.
 	_, err := Raw[int64]("SELECT 1 # dead ?", 1).All(ctx, db)
-	if err == nil || !strings.Contains(err.Error(), "0 placeholder(s) but 1 argument(s)") {
+	if err == nil || !strings.Contains(err.Error(), "0 placeholder(s) but 1 inline argument(s)") {
 		t.Fatalf("a ? inside '# ' comment is not a placeholder: %v", err)
 	}
 	// `#x` is not a comment: the ? is live and binds.

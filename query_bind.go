@@ -68,6 +68,13 @@ func bindQueryState(d Dialect, p *plan, s *queryState, execArgs []any) (querySta
 		return dst, nil
 	}
 
+	if s.head.expr != "" {
+		head, err := bind("Raw", []cond{s.head})
+		if err != nil {
+			return queryState{}, err
+		}
+		out.head = head[0]
+	}
 	var err error
 	if out.wheres, err = bind("Where", s.wheres); err != nil {
 		return queryState{}, err

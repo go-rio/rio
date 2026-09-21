@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-09-22
+
+### Added
+
+- `Raw[T]` is a builder: `Where`, `GroupBy`, `Having`, `OrderBy`, `Limit`, `Offset`, `Validate`, `Must`, and the terminals `Value`, `Count`, `Exists`, and `SQL` join `All`/`First`/`Sole`/`Rows`. The head is written up to its FROM and JOIN clauses; its placeholders bind inline or defer to the terminal call, and `Must` caches stable shapes as `Query.Must` does.
+- `DoUpdateWhere(expr, args...)` applies an upsert's conflict update conditionally; a rejected update returns `ErrStaleObject`. `OnConflictWhere(pred)` targets a partial unique index. MySQL rejects both.
+- `ForNoKeyUpdate`, `ForKeyShare`, and the `LockOf(tables...)` lock option; MySQL renders the next stronger lock for the key strengths.
+- `DB.At(t)` and `Tx.At(t)` return views whose stamps read `t`.
+- `Expr(sql, args...)` binds the expression's own `?` placeholders in `UpdateAll`, `UpdateAllReturning`, and `DoUpdateSet`; slices expand inside `IN (?)`.
+
+### Changed
+
+- **Breaking:** `Expr` is a constructor returning `Expression`; `rio.Expr("age + 1")` call sites compile unchanged.
+- **Breaking:** `LockOption` is an interface; `NoWait` and `SkipLocked` are its values, so `ForUpdate(rio.SkipLocked)` compiles unchanged.
+- **Breaking:** `Limit` and `Offset` bind as parameters on `Query` and `Raw`, so every page of a query shares one statement text and one cached shape.
+- `Update` with a column whitelist that names the `UpdatedAt` column binds the struct's value instead of the clock, matching `UpdateAll`'s explicit-assignment rule.
+
 ## [0.18.1] - 2026-09-02
 
 ### Fixed

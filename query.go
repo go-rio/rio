@@ -33,18 +33,45 @@ type lockMode uint8
 const (
 	lockNone lockMode = iota
 	lockUpdate
+	lockNoKeyUpdate
 	lockShare
+	lockKeyShare
 )
 
-// LockOption refines a row lock: what happens when a row is already locked.
-type LockOption uint8
+// LockOption refines a row lock: NoWait and SkipLocked set the wait policy,
+// LockOf names the tables the lock covers.
+type LockOption interface {
+	applyLock(s *queryState)
+}
+
+// lockWait is the wait policy of a row lock.
+type lockWait uint8
 
 const (
-	// NoWait fails immediately instead of waiting for a locked row.
-	NoWait LockOption = iota + 1
-	// SkipLocked leaves out rows another transaction holds locked.
-	SkipLocked
+	waitDefault lockWait = iota
+	waitNoWait
+	waitSkipLocked
 )
+
+func (w lockWait) applyLock(s *queryState) { s.lockWait = w }
+
+// lockOf is the FOR ... OF table list.
+type lockOf []string
+
+func (t lockOf) applyLock(s *queryState) { s.lockOf = append(s.lockOf, t...) }
+
+var (
+	// NoWait fails immediately instead of waiting for a locked row.
+	NoWait LockOption = waitNoWait
+	// SkipLocked leaves out rows another transaction holds locked.
+	SkipLocked LockOption = waitSkipLocked
+)
+
+// LockOf restricts the lock to the named tables or aliases, rendered
+// verbatim after OF; never build them from untrusted input.
+func LockOf(tables ...string) LockOption {
+	return lockOf(append([]string(nil), tables...))
+}
 
 // selectShape is the projection renderSelect produces: entity rows, count(*),
 // or an existence probe.
@@ -58,6 +85,8 @@ const (
 
 // queryState is the non-generic body shared by renderers and preloaders.
 type queryState struct {
+	// head is a RawQuery's hand-written SELECT head; empty on entity queries.
+	head    cond
 	wheres  []cond
 	havings []cond
 	joins   []string
@@ -71,7 +100,8 @@ type queryState struct {
 	limitSet, offsetSet bool
 
 	lock     lockMode
-	lockOpt  LockOption
+	lockWait lockWait
+	lockOf   []string
 	distinct bool
 	final    bool
 	trashed  trashMode
@@ -181,7 +211,7 @@ func (q Query[T]) Join(clause string) Query[T] {
 	return q
 }
 
-// Limit caps the result. The value is rendered into the SQL, not bound.
+// Limit caps the result; the value binds as a parameter.
 func (q Query[T]) Limit(n int) Query[T] {
 	q.cache = nil
 	q.s.limit, q.s.limitSet = n, true
@@ -195,23 +225,35 @@ func (q Query[T]) Offset(n int) Query[T] {
 	return q
 }
 
-// ForUpdate renders SELECT ... FOR UPDATE, with at most one LockOption. A
-// no-op on SQLite; rejected on ClickHouse.
+// ForUpdate renders SELECT ... FOR UPDATE with the given LockOptions. A no-op
+// on SQLite; rejected on ClickHouse.
 func (q Query[T]) ForUpdate(opts ...LockOption) Query[T] {
 	return q.withLock(lockUpdate, opts)
 }
 
-// ForShare renders SELECT ... FOR SHARE, with at most one LockOption. A no-op
+// ForNoKeyUpdate renders FOR NO KEY UPDATE, which foreign-key checks can
+// read through; MySQL renders FOR UPDATE, SQLite elides, ClickHouse rejects.
+func (q Query[T]) ForNoKeyUpdate(opts ...LockOption) Query[T] {
+	return q.withLock(lockNoKeyUpdate, opts)
+}
+
+// ForShare renders SELECT ... FOR SHARE with the given LockOptions. A no-op
 // on SQLite; rejected on ClickHouse.
 func (q Query[T]) ForShare(opts ...LockOption) Query[T] {
 	return q.withLock(lockShare, opts)
 }
 
+// ForKeyShare renders FOR KEY SHARE, blocking deletes and key changes only;
+// MySQL renders FOR SHARE, SQLite elides, ClickHouse rejects.
+func (q Query[T]) ForKeyShare(opts ...LockOption) Query[T] {
+	return q.withLock(lockKeyShare, opts)
+}
+
 func (q Query[T]) withLock(mode lockMode, opts []LockOption) Query[T] {
 	q.cache = nil
-	q.s.lock, q.s.lockOpt = mode, 0
+	q.s.lock, q.s.lockWait, q.s.lockOf = mode, waitDefault, nil
 	for _, o := range opts {
-		q.s.lockOpt = o
+		o.applyLock(&q.s)
 	}
 	return q
 }
@@ -860,41 +902,14 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 		return "", nil, err
 	}
 
-	if len(s.groups) > 0 {
-		b = append(b, " GROUP BY "...)
-		for i, gexpr := range s.groups {
-			if i > 0 {
-				b = append(b, ", "...)
-			}
-			b = append(b, gexpr...)
-		}
-	}
-	for i, h := range s.havings {
-		if i == 0 {
-			b = append(b, " HAVING "...)
-		} else {
-			b = append(b, " AND "...)
-		}
-		b = append(b, '(')
-		b = append(b, h.expr...)
-		b = append(b, ')')
-		args = append(args, h.args...)
-	}
-	if shape == selectRows && len(s.orders) > 0 {
-		b = append(b, " ORDER BY "...)
-		for i, o := range s.orders {
-			if i > 0 {
-				b = append(b, ", "...)
-			}
-			b = append(b, o...)
-		}
-	}
+	b, args = appendGroupHaving(b, args, s)
 	if shape == selectRows {
+		b = appendOrderBy(b, s.orders)
 		b = appendOrderKeys(b, d, table, sortKeys, s.before != nil)
 	}
 	switch shape {
 	case selectRows:
-		b, err = appendLimitOffset(b, d, s)
+		b, args, err = appendLimitOffset(b, args, d, s)
 		if err != nil {
 			return "", nil, err
 		}
@@ -905,7 +920,7 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 		if !probe.limitSet || probe.limit > 1 {
 			probe.limit, probe.limitSet = 1, true
 		}
-		b, err = appendLimitOffset(b, d, &probe)
+		b, args, err = appendLimitOffset(b, args, d, &probe)
 		if err != nil {
 			return "", nil, err
 		}
@@ -921,6 +936,43 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 	return finishSQL(g, b, args)
 }
 
+// appendGroupHaving renders GROUP BY and the AND-ed HAVING conditions.
+func appendGroupHaving(b []byte, args []any, s *queryState) ([]byte, []any) {
+	for i, gexpr := range s.groups {
+		if i == 0 {
+			b = append(b, " GROUP BY "...)
+		} else {
+			b = append(b, ", "...)
+		}
+		b = append(b, gexpr...)
+	}
+	for i, h := range s.havings {
+		if i == 0 {
+			b = append(b, " HAVING "...)
+		} else {
+			b = append(b, " AND "...)
+		}
+		b = append(b, '(')
+		b = append(b, h.expr...)
+		b = append(b, ')')
+		args = append(args, h.args...)
+	}
+	return b, args
+}
+
+// appendOrderBy renders the verbatim ORDER BY terms.
+func appendOrderBy(b []byte, orders []string) []byte {
+	for i, o := range orders {
+		if i == 0 {
+			b = append(b, " ORDER BY "...)
+		} else {
+			b = append(b, ", "...)
+		}
+		b = append(b, o...)
+	}
+	return b
+}
+
 // appendLock renders, elides, or rejects the row lock by dialect capability.
 func appendLock(b []byte, d Dialect, s *queryState) ([]byte, error) {
 	switch d.caps().forUpdate {
@@ -932,18 +984,42 @@ func appendLock(b []byte, d Dialect, s *queryState) ([]byte, error) {
 	case forUpdateElide:
 		return b, nil
 	}
-	if s.lock == lockShare {
-		b = append(b, " FOR SHARE"...)
-	} else {
-		b = append(b, " FOR UPDATE"...)
+	b = append(b, lockStrength(d, s.lock)...)
+	for i, t := range s.lockOf {
+		if i == 0 {
+			b = append(b, " OF "...)
+		} else {
+			b = append(b, ", "...)
+		}
+		b = append(b, t...)
 	}
-	switch s.lockOpt {
-	case NoWait:
+	switch s.lockWait {
+	case waitNoWait:
 		b = append(b, " NOWAIT"...)
-	case SkipLocked:
+	case waitSkipLocked:
 		b = append(b, " SKIP LOCKED"...)
 	}
 	return b, nil
+}
+
+// lockStrength renders the lock clause; a dialect without key locks takes
+// the next stronger one.
+func lockStrength(d Dialect, mode lockMode) string {
+	keyLocks := d.caps().keyLocks
+	switch mode {
+	case lockNoKeyUpdate:
+		if keyLocks {
+			return " FOR NO KEY UPDATE"
+		}
+	case lockShare:
+		return " FOR SHARE"
+	case lockKeyShare:
+		if keyLocks {
+			return " FOR KEY SHARE"
+		}
+		return " FOR SHARE"
+	}
+	return " FOR UPDATE"
 }
 
 // checkFinal rejects Final() on dialects without the FINAL table modifier.
@@ -957,18 +1033,18 @@ func checkFinal(d Dialect, s *queryState) error {
 	return nil
 }
 
-// appendLimitOffset renders LIMIT/OFFSET; MySQL and SQLite need a synthetic
-// LIMIT before a bare OFFSET.
-func appendLimitOffset(b []byte, d Dialect, s *queryState) ([]byte, error) {
+// appendLimitOffset binds LIMIT/OFFSET as parameters; MySQL and SQLite need a
+// synthetic LIMIT before a bare OFFSET.
+func appendLimitOffset(b []byte, args []any, d Dialect, s *queryState) ([]byte, []any, error) {
 	if s.limitSet && s.limit < 0 {
-		return nil, fmt.Errorf("rio: Limit requires a non-negative value, got %d", s.limit)
+		return nil, nil, fmt.Errorf("rio: Limit requires a non-negative value, got %d", s.limit)
 	}
 	if s.offsetSet && s.offset < 0 {
-		return nil, fmt.Errorf("rio: Offset requires a non-negative value, got %d", s.offset)
+		return nil, nil, fmt.Errorf("rio: Offset requires a non-negative value, got %d", s.offset)
 	}
 	if s.limitSet {
-		b = append(b, " LIMIT "...)
-		b = strconv.AppendInt(b, int64(s.limit), 10)
+		b = append(b, " LIMIT ?"...)
+		args = append(args, s.limit)
 	} else if s.offsetSet {
 		switch d.name() {
 		case "mysql":
@@ -978,10 +1054,10 @@ func appendLimitOffset(b []byte, d Dialect, s *queryState) ([]byte, error) {
 		}
 	}
 	if s.offsetSet {
-		b = append(b, " OFFSET "...)
-		b = strconv.AppendInt(b, int64(s.offset), 10)
+		b = append(b, " OFFSET ?"...)
+		args = append(args, s.offset)
 	}
-	return b, nil
+	return b, args, nil
 }
 
 // renderWhere combines user, relation, and soft-delete predicates.
@@ -1313,17 +1389,9 @@ func renderPluckRaw(g *grammar, p *plan, f *field, s *queryState) ([]byte, []any
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(s.orders) > 0 {
-		b = append(b, " ORDER BY "...)
-		for i, order := range s.orders {
-			if i > 0 {
-				b = append(b, ", "...)
-			}
-			b = append(b, order...)
-		}
-	}
+	b = appendOrderBy(b, s.orders)
 	b = appendOrderKeys(b, d, table, sortKeys, s.before != nil)
-	b, err = appendLimitOffset(b, d, s)
+	b, args, err = appendLimitOffset(b, args, d, s)
 	if err != nil {
 		return nil, nil, err
 	}

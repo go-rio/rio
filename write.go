@@ -10,6 +10,9 @@ import (
 	"unsafe"
 )
 
+// errNoReturningRow marks a RETURNING statement that matched no row.
+var errNoReturningRow = errors.New("rio: RETURNING produced no row")
+
 // softProbeState is the row state probeSoftState scans back: the current
 // softdelete stamp and, when the model has one, the current version.
 type softProbeState struct {
@@ -100,8 +103,9 @@ func Insert[T any](ctx context.Context, db Queryer, row *T) error {
 }
 
 // Update writes a row by primary key. Without cols it writes every eligible
-// field, including zero values; otherwise it writes only cols and UpdatedAt.
-// It enforces optimistic locking and may stamp the struct before a failed call.
+// field, including zero values; otherwise it writes cols plus a clock-stamped
+// UpdatedAt, bound from the struct instead when cols names it. It enforces
+// optimistic locking and may stamp the struct before a failed call.
 func Update[T any](ctx context.Context, db Queryer, row *T, cols ...string) error {
 	p, err := planOf[T]()
 	if err != nil {
@@ -122,11 +126,11 @@ func Update[T any](ctx context.Context, db Queryer, row *T, cols ...string) erro
 	now := normalizeTime(db.conf().clock())
 	stamps := !db.conf().noStamps
 
-	set, err := updateSet(p, cols, stamps)
+	set, explicit, err := updateSet(p, cols, stamps)
 	if err != nil {
 		return err
 	}
-	if p.updated != nil && stamps {
+	if p.updated != nil && stamps && !explicit {
 		setTime(p.updated, rv, now)
 	}
 
@@ -451,31 +455,32 @@ func checkGeneratedID(
 	)
 }
 
-// updateSet resolves the explicit or default Update columns in plan order.
-func updateSet(p *plan, cols []string, stamps bool) ([]*field, error) {
+// updateSet resolves the explicit or default Update columns in plan order and
+// reports whether cols named the UpdatedAt column itself.
+func updateSet(p *plan, cols []string, stamps bool) ([]*field, bool, error) {
 	if len(cols) == 0 {
 		if len(p.updatable) == 0 {
-			return nil, fmt.Errorf("rio: %s has no updatable columns", p.structName)
+			return nil, false, fmt.Errorf("rio: %s has no updatable columns", p.structName)
 		}
 		// UpdatedAt is in here, bound from the struct like any other column.
-		return p.updatable, nil // precomputed at plan time; callers only read
+		return p.updatable, false, nil // precomputed at plan time; callers only read
 	}
 	seen := make(map[string]bool, len(cols)+1)
 	out := make([]*field, 0, len(cols)+1)
 	for _, c := range cols {
 		f, ok := p.byColumn[c]
 		if !ok {
-			return nil, fmt.Errorf("rio: Update: %s has no column %q (column names, not Go field names)", p.structName, c)
+			return nil, false, fmt.Errorf("rio: Update: %s has no column %q (column names, not Go field names)", p.structName, c)
 		}
 		isMaintained := f.isPK || f.isVersion || f.isCreated
 		if isMaintained {
-			return nil, fmt.Errorf("rio: Update: column %q is maintained by rio and cannot be listed", c)
+			return nil, false, fmt.Errorf("rio: Update: column %q is maintained by rio and cannot be listed", c)
 		}
 		if f.readOnly {
-			return nil, fmt.Errorf("rio: Update: column %q is readonly", c)
+			return nil, false, fmt.Errorf("rio: Update: column %q is readonly", c)
 		}
 		if f.isSoftDelete {
-			return nil, fmt.Errorf("rio: Update: column %q is the softdelete column; use Delete, Restore, or ForceDelete", c)
+			return nil, false, fmt.Errorf("rio: Update: column %q is the softdelete column; use Delete, Restore, or ForceDelete", c)
 		}
 		if seen[c] {
 			continue
@@ -483,12 +488,13 @@ func updateSet(p *plan, cols []string, stamps bool) ([]*field, error) {
 		seen[c] = true
 		out = append(out, f)
 	}
-	if p.updated != nil && stamps && !seen[p.updated.column] {
+	explicit := p.updated != nil && seen[p.updated.column]
+	if p.updated != nil && stamps && !explicit {
 		out = append(out, p.updated)
 	}
 	// Canonical order must match the order-free SQL-cache key.
 	slices.SortFunc(out, func(a, b *field) int { return a.ordinal - b.ordinal })
-	return out, nil
+	return out, explicit, nil
 }
 
 // stampOp keeps the two UpdatedAt shapes in separate SQL-cache entries.
@@ -745,7 +751,7 @@ func appendReturning(b []byte, d Dialect, table string, p *plan) []byte {
 func scanBackCols(rows rows, back []*field, base unsafe.Pointer) error {
 	scanned, err := scanBackColsIfRow(rows, back, base)
 	if err == nil && !scanned {
-		return errors.New("rio: RETURNING produced no row")
+		return errNoReturningRow
 	}
 	return err
 }
@@ -777,7 +783,7 @@ func scanBackRow(rows rows, p *plan, base unsafe.Pointer) (err error) {
 		if err := rows.Err(); err != nil {
 			return err
 		}
-		return errors.New("rio: RETURNING produced no row")
+		return errNoReturningRow
 	}
 	rs := newRowScanner(fields, nil)
 	defer rs.release()
