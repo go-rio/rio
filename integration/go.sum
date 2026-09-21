@@ -5,8 +5,8 @@ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
-github.com/go-rio/clickhouse v0.9.8 h1:qEYE7ZWpxlwWkLmRuL/ApouRKgAvf36tgDz5MGvpSjc=
-github.com/go-rio/clickhouse v0.9.8/go.mod h1:N6iTtCI8AX8+7vzKLu/opaA6/kSQauLSdl5XvGYEKnY=
+github.com/go-rio/clickhouse v0.9.9 h1:kp3CZ5mjQpxoLiMyM9VEMfC25gAH4EhODX+sh0nvJd8=
+github.com/go-rio/clickhouse v0.9.9/go.mod h1:N6iTtCI8AX8+7vzKLu/opaA6/kSQauLSdl5XvGYEKnY=
 github.com/go-rio/postgres v0.8.8 h1:mf4RdMh1xLmNbHwdQVf/FxYXapV+yRFBKAYEKqJJwgs=
 github.com/go-rio/postgres v0.8.8/go.mod h1:6b68aj3/ehRShfMggBhVZVbvP3kehsFltqblkpvF5xA=
 github.com/go-rio/sqlite v0.6.4 h1:Hfwq1rq6UMHOx0UPhaDJwwB3vHVj+AveTrMTJXT2sz8=
