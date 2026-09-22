@@ -70,7 +70,8 @@ const (
 //     operators) and consumes no argument.
 //   - A single ? consumes one argument. When that argument is a slice or
 //     array — except []byte and driver.Valuer implementations — it expands
-//     in place to one placeholder per element; empty slices are an error.
+//     in place to one placeholder per element, an element that is itself a
+//     slice becoming a parenthesized tuple; empty slices are an error.
 //   - Existing $N text passes through untouched; mixing styles is the
 //     caller's responsibility.
 //   - Placeholder/argument count mismatches error with both counts and the
@@ -145,6 +146,29 @@ func rebindFrom(p lexProfile, style bindStyle, query string, args []any, g *gram
 		if j > 0 {
 			out = append(out, ", "...)
 		}
+	}
+	// emitElems expands one list; an element that is itself a list renders
+	// as a parenthesized tuple.
+	emitElems := func(i, n int, at func(int) any) error {
+		for j := range n {
+			sep(j)
+			v := at(j)
+			inner, ok := sliceValue(v)
+			if !ok {
+				emit(v)
+				continue
+			}
+			if inner.Len() == 0 {
+				return fmt.Errorf("rio: empty tuple in IN placeholder %d (byte %d)", argIdx, i)
+			}
+			out = append(out, '(')
+			for k := range inner.Len() {
+				sep(k)
+				emit(inner.Index(k).Interface())
+			}
+			out = append(out, ')')
+		}
+		return nil
 	}
 	// spliceSubquery replaces the ? at i with the rendered subquery, its
 	// placeholders numbered after the ones emitted so far.
@@ -279,7 +303,7 @@ func rebindFrom(p lexProfile, style bindStyle, query string, args []any, g *gram
 				expandErr = spliceSubquery(i, xs)
 			case []any:
 				if expandErr = beginExpand(i, len(xs)); expandErr == nil {
-					emitAll(xs, sep, emit)
+					expandErr = emitElems(i, len(xs), func(j int) any { return xs[j] })
 				}
 			case []int64:
 				if expandErr = beginExpand(i, len(xs)); expandErr == nil {
@@ -304,10 +328,7 @@ func rebindFrom(p lexProfile, style bindStyle, query string, args []any, g *gram
 					break
 				}
 				if expandErr = beginExpand(i, elems.Len()); expandErr == nil {
-					for j := range elems.Len() {
-						sep(j)
-						emit(elems.Index(j).Interface())
-					}
+					expandErr = emitElems(i, elems.Len(), func(j int) any { return elems.Index(j).Interface() })
 				}
 			}
 			if expandErr != nil {

@@ -276,6 +276,43 @@ func runSuite(t *testing.T, db *rio.DB, dialect string) {
 	if err != nil || len(grown) == 0 {
 		t.Fatalf("reusable Query: %v %d", err, len(grown))
 	}
+
+	// Raw builder: conditions as values, tuple expansion, derived-table
+	// Count, keyset paging over a projection, and a Table override.
+	rk := &User{Email: "raw-keyset@example.com", Age: 33}
+	if err := rio.Insert(ctx, db, rk); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	type userRow struct {
+		ID    int64
+		Email string
+	}
+	filter := []rio.Condition{
+		rio.Cond("u.age >= ?", 1),
+		rio.Cond("(u.id, u.email) IN (?)", [][]any{{rk.ID, rk.Email}, {int64(-1), "nobody"}}),
+	}
+	raw := rio.Raw[userRow]("SELECT u.id, u.email FROM users u").WhereAll(filter...).Must()
+	if n, err := raw.Count(ctx, db); err != nil || n != 1 {
+		t.Fatalf("raw count: %v %d", err, n)
+	}
+	if ok, err := raw.Exists(ctx, db); err != nil || !ok {
+		t.Fatalf("raw exists: %v %v", err, ok)
+	}
+	var paged []int64
+	for page, err := range raw.OrderKeys(rio.SortKey{Column: "id", Expr: "u.id"}).Chunk(ctx, db, 1) {
+		if err != nil {
+			t.Fatalf("raw chunk: %v", err)
+		}
+		for _, row := range page {
+			paged = append(paged, row.ID)
+		}
+	}
+	if len(paged) != 1 || paged[0] != rk.ID {
+		t.Fatalf("raw keyset pages: %v", paged)
+	}
+	if n, err := rio.From[User]().Table("users").Where("id = ?", rk.ID).Count(ctx, db); err != nil || n != 1 {
+		t.Fatalf("table override: %v %d", err, n)
+	}
 }
 
 // runV02Suite: WhereHas, WithCount, RelLimit, Attach/Detach, Rows streaming,

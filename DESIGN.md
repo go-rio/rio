@@ -36,7 +36,8 @@ Four layers inside `github.com/go-rio/rio`:
    callers configure the `database/sql` or pgx pool they construct.
 2. **SQL layer** — per-statement renderers, dialect grammars, the `?`
    placeholder rebinder with per-dialect lexer profiles, `IN (?)` slice
-   expansion (expand first, renumber second), and subquery splicing (a
+   expansion (a slice of slices as tuples; expand first, renumber second),
+   and subquery splicing (a
    `Query.Sub` argument renders in place, its placeholders numbered after the
    ones already emitted). Dialects are an *opaque* interface built into the
    core (`rio.Postgres`, `rio.MySQL`, `rio.SQLite`, `rio.ClickHouse`);
@@ -116,7 +117,10 @@ and JOIN clauses, plus the clauses rio appends (WHERE, GROUP BY, HAVING,
 ORDER BY, bound LIMIT/OFFSET) under `Query`'s argument and caching rules.
 Entity queries never prune columns; a projection is a `Raw[DTO]`. `Count` and
 `Exists` wrap the rendered statement as a derived table instead of parsing the
-head, and `First`/`Sole` append no LIMIT to it.
+head, and `First`/`Sole` append no LIMIT to it. Keyset cursors and `Chunk`
+resolve `OrderKeys` against the DTO's plan; `SortKey.Expr` carries the SQL
+that produced a column, since the head is opaque to rio. Conditions are
+values (`Cond`, `WhereAll`) so one filter drives entity and raw queries alike.
 
 ## Model mapping
 
@@ -206,6 +210,7 @@ relations across composite keys are unsupported.
 | `CreatedAt` in `Update`, `DoUpdate`, or `DoUpdateSet` | rejected, except under `WithoutStamps`, where both stamps are the caller's |
 | Row lock strengths | `ForNoKeyUpdate`/`ForKeyShare` render on PostgreSQL; MySQL takes the next stronger lock; SQLite elides; ClickHouse rejects |
 | `Raw.Count` / `Raw.Exists` | `count(*)` or a `LIMIT 1` probe over the statement as a derived table; `Raw.First`/`Sole` never add LIMIT |
+| `Table(name)` | reads, `Pluck`, aggregates, and set-based writes render against name; entity writes keep the model's table; the select head bypasses the per-plan cache |
 | `UpdateAll/DeleteAll` without WHERE | `rio.ErrMissingWhere`; `.AllRows()` opts in explicitly |
 | `UpdateAllReturning/DeleteAllReturning` | the affected rows as stored (a soft delete returns the trashed state); rejected without `RETURNING` (MySQL) |
 | `Upsert` with `DoUpdateSet` | assignments render in canonical column order after `DoUpdate`'s; `Expr` verbatim, other values bound after the row values; the shape keys the SQL cache |

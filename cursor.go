@@ -16,10 +16,12 @@ const cursorVersion = byte(1)
 
 // SortKey is one column of a structured ordering. It names a mapped column —
 // not verbatim SQL — so rio can read its value back out of rows to issue
-// cursors.
+// cursors. Expr is the SQL that produced the column, for Raw heads whose bare
+// column name would be ambiguous or aliased; empty renders the column itself.
 type SortKey struct {
 	Column string
 	Desc   bool
+	Expr   string
 }
 
 // Cursor marks a position in a keyset-ordered result: the sort-key values of
@@ -149,6 +151,7 @@ func (c *Cursor) check(clause string, keys []resolvedKey) error {
 type resolvedKey struct {
 	f    *field
 	desc bool
+	expr string
 }
 
 // OrderKeys sets the structured ordering cursor pagination requires, rendered
@@ -188,11 +191,15 @@ func (q Query[T]) CursorAt(row *T) (Cursor, error) {
 	if err != nil {
 		return Cursor{}, err
 	}
-	keys, err := resolveSortKeys(p, &q.s)
+	return cursorAt(p, &q.s, reflect.ValueOf(row).Elem())
+}
+
+// cursorAt reads row's sort-key values under s's OrderKeys.
+func cursorAt(p *plan, s *queryState, rv reflect.Value) (Cursor, error) {
+	keys, err := resolveSortKeys(p, s)
 	if err != nil {
 		return Cursor{}, err
 	}
-	rv := reflect.ValueOf(row).Elem()
 	c := Cursor{fp: sortKeyFingerprint(keys), values: make([]any, 0, len(keys))}
 	for _, k := range keys {
 		v, err := cursorValue(k.f, rv)
@@ -236,7 +243,7 @@ func resolveSortKeys(p *plan, s *queryState) ([]resolvedKey, error) {
 		if err := checkSortable(p, f); err != nil {
 			return nil, err
 		}
-		keys = append(keys, resolvedKey{f: f, desc: k.Desc})
+		keys = append(keys, resolvedKey{f: f, desc: k.Desc, expr: k.Expr})
 	}
 	tailDesc := keys[len(keys)-1].desc
 	for _, pk := range p.pks {
@@ -313,15 +320,11 @@ func renderKeyset(b []byte, args []any, d Dialect, table string, keys []resolved
 		}
 		b = append(b, '(')
 		for j := range i {
-			b = d.quote(b, table)
-			b = append(b, '.')
-			b = d.quote(b, keys[j].f.column)
+			b = appendKeyRef(b, d, table, keys[j])
 			b = append(b, " = ? AND "...)
 			args = append(args, c.values[j])
 		}
-		b = d.quote(b, table)
-		b = append(b, '.')
-		b = d.quote(b, k.f.column)
+		b = appendKeyRef(b, d, table, k)
 		if k.desc != reverse {
 			b = append(b, " < ?"...)
 		} else {
@@ -345,12 +348,23 @@ func appendOrderKeys(b []byte, d Dialect, table string, keys []resolvedKey, reve
 		if i > 0 {
 			b = append(b, ", "...)
 		}
-		b = d.quote(b, table)
-		b = append(b, '.')
-		b = d.quote(b, k.f.column)
+		b = appendKeyRef(b, d, table, k)
 		if k.desc != reverse {
 			b = append(b, " DESC"...)
 		}
 	}
 	return b
+}
+
+// appendKeyRef renders a sort key: its expression, else the column qualified
+// by table when one is given.
+func appendKeyRef(b []byte, d Dialect, table string, k resolvedKey) []byte {
+	if k.expr != "" {
+		return append(b, k.expr...)
+	}
+	if table != "" {
+		b = d.quote(b, table)
+		b = append(b, '.')
+	}
+	return d.quote(b, k.f.column)
 }

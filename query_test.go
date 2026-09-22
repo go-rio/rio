@@ -2,6 +2,7 @@ package rio
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"strings"
 	"testing"
@@ -61,6 +62,80 @@ func TestLockStrengthsAndTargets(t *testing.T) {
 	}
 	if got := f.logged()[4]; !strings.HasSuffix(got, " FOR KEY SHARE") {
 		t.Fatalf("Pluck carries the lock: %s", got)
+	}
+}
+
+func TestWhereAllAppendsConditions(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	conds := []Condition{Cond("name ILIKE ?", "%acme%"), Cond("id > ?"), Cond("id IN (?)")}
+	q := From[Org]().WhereAll(conds...).OrderBy("id").Must()
+
+	f.queueRows(orgCols)
+	if _, err := q.All(ctx, db, 5, []int64{7, 8}); err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	got := f.loggedContaining("SELECT")[0]
+	want := `SELECT "orgs"."id", "orgs"."name" FROM "orgs" WHERE (name ILIKE $1) AND (id > $2) AND (id IN ($3, $4)) ORDER BY id`
+	if got.sql != want || len(got.args) != 4 || got.args[0] != "%acme%" || got.args[1] != int64(5) {
+		t.Fatalf("sql: %s %v", got.sql, got.args)
+	}
+	if err := From[Org]().WhereAll(Cond("a = ? AND b = ?", 1)).Validate(); err == nil {
+		t.Fatal("inline arity is checked per condition")
+	}
+}
+
+func TestTableOverridesRenderedTable(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	archived := From[Org]().Table("orgs_archive").Where("id = ?").Must()
+
+	f.queueRows(orgCols)
+	if _, err := From[Org]().Where("id = ?", 1).All(ctx, db); err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	f.queueRows(orgCols)
+	if _, err := archived.All(ctx, db, 1); err != nil {
+		t.Fatalf("archived All: %v", err)
+	}
+	f.queueRows([]string{"count"}, []driver.Value{int64(2)})
+	if _, err := archived.Count(ctx, db, 1); err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	f.queueRows([]string{"name"})
+	if _, err := archived.Pluck[string](ctx, db, "name", 1); err != nil {
+		t.Fatalf("Pluck: %v", err)
+	}
+	f.queueExec(0, 1)
+	if _, err := archived.UpdateAll(ctx, db, Set{"name": "x"}, 1); err != nil {
+		t.Fatalf("UpdateAll: %v", err)
+	}
+	f.queueExec(0, 1)
+	if _, err := archived.DeleteAll(ctx, db, 1); err != nil {
+		t.Fatalf("DeleteAll: %v", err)
+	}
+	logs := f.logged()
+	want := []string{
+		`SELECT "orgs"."id", "orgs"."name" FROM "orgs" WHERE (id = $1)`,
+		`SELECT "orgs_archive"."id", "orgs_archive"."name" FROM "orgs_archive" WHERE (id = $1)`,
+		`SELECT count(*) FROM "orgs_archive" WHERE (id = $1)`,
+		`SELECT "orgs_archive"."name" FROM "orgs_archive" WHERE (id = $1)`,
+		`UPDATE "orgs_archive" SET "name" = $1 WHERE (id = $2)`,
+		`DELETE FROM "orgs_archive" WHERE (id = $1)`,
+	}
+	for i, w := range want {
+		if logs[i] != w {
+			t.Fatalf("statement %d:\n got: %s\nwant: %s", i, logs[i], w)
+		}
+	}
+	f.queueRows(orgCols)
+	if _, err := From[Org]().Where("id = ?", 1).All(ctx, db); err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if got := f.logged()[6]; got != want[0] {
+		t.Fatalf("the override must not poison the cached head: %s", got)
 	}
 }
 

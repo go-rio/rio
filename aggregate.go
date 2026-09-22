@@ -96,7 +96,7 @@ func renderAggregate(g *grammar, p *plan, fn string, f *field, s *queryState) (s
 	if err := checkFinal(d, s); err != nil {
 		return "", nil, err
 	}
-	table := g.table(p)
+	table := s.tableOf(g, p)
 	var sortKeys []resolvedKey
 	usesSortKeys := len(s.orderKeys) > 0 || s.after != nil || s.before != nil
 	if usesSortKeys {

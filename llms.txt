@@ -54,12 +54,13 @@ func main() {
 
 - **Query values**: `rio.From[T]()` starts an immutable builder; every builder method returns a derived value, so a query can be a package variable reused concurrently. `Validate` checks it without a database; `Must` panics on error and enables a per-handle render cache.
 - **Queryer**: `*rio.DB` (from `rio.New` or a driver module's `Open`) and `*rio.Tx` (from `db.Tx`) both satisfy it; the same code runs inside or outside a transaction. `Tx` on a `*Tx` opens a savepoint.
-- **Placeholders**: always `?`, rebound per dialect. A slice argument expands inside `IN (?)`; `Query.Sub(column)` splices a one-column subquery as an argument; `??` is a literal `?` where the rendered SQL can carry one. `Where`/`Having` fragments are either fully inline (`Where("age >= ?", 18)`) or fully deferred (`Where("age >= ?")`, filled by terminal arguments in SQL order).
+- **Placeholders**: always `?`, rebound per dialect. A slice argument expands inside `IN (?)`, a slice of slices to tuples (`(a, b) IN (?)`, `VALUES ?`); `Query.Sub(column)` splices a one-column subquery as an argument; `??` is a literal `?` where the rendered SQL can carry one. `Where`/`Having` fragments are either fully inline (`Where("age >= ?", 18)`) or fully deferred (`Where("age >= ?")`, filled by terminal arguments in SQL order).
 - **SQL text is verbatim**: `Where`, `Having`, `Join`, `OrderBy`, `GroupBy`, `RelWhere`, `RelOrderBy`, `Expr`, `Raw`, `Exec` render what they are given. Never build them from untrusted input; mapped column names (`Pluck`, aggregates, `Set` keys, `OrderKeys`, `Update` columns) are validated against the model.
 - **Models**: structs with a `rio` tag. `ID int64` is the conventional auto-increment key; `CreatedAt`/`UpdatedAt` are maintained. Tags: `rio:"column"`, `,pk`, `,noautoincr`, `,version` (optimistic locking), `,softdelete`, `,json`, `,omitzero`, `,readonly`, `,countof:Rel`, `,nostamp`, `-`. `TableName() string` overrides the pluralized snake_case table name.
 - **Relations**: typed containers `HasMany[T]`, `HasOne[T]`, `BelongsTo[T]`, `ManyToMany[T]` (tags `fk:`, `ref:`, `join:`). They load only through `With`, as separate key-set queries; `Rows()`/`Row()` on an unloaded container panics. `WithCount` fills an `int64` field tagged `countof:`.
 - **Cursor pagination**: `OrderKeys` (mapped NOT NULL scalar columns, primary key appended as tie-breaker), `CursorAt(&row)`, `After(cursor)`, `Before(cursor)`, `Chunk(ctx, db, size)`; `Cursor.String`/`ParseCursor` round-trip URL-safe tokens.
-- **Raw queries**: `rio.Raw[T](head, args...)` takes a SELECT head written up to its FROM and JOIN clauses and appends `Where`/`GroupBy`/`Having`/`OrderBy`/bound `Limit`/`Offset` under `Query`'s argument rules; `T` is a DTO struct (matched by column name), a scalar, or an entity. `Value` is `Sole` by value; `Count`/`Exists` wrap the statement as a derived table; `First`/`Sole` append no LIMIT.
+- **Raw queries**: `rio.Raw[T](head, args...)` takes a SELECT head written up to its FROM and JOIN clauses and appends `Where`/`GroupBy`/`Having`/`OrderBy`/bound `Limit`/`Offset` under `Query`'s argument rules; `T` is a DTO struct (matched by column name), a scalar, or an entity. `Value` is `Sole` by value; `Count`/`Exists` wrap the statement as a derived table; `First`/`Sole` append no LIMIT. `OrderKeys`/`After`/`Before`/`CursorAt`/`Chunk` page a struct target by keyset, with `SortKey.Expr` naming the SQL that produced a column.
+- **Conditions as values**: `rio.Cond(expr, args...)` builds a `Condition`; `WhereAll(conds...)` on `Query` and `Raw` appends each as its own AND-ed fragment. `Query.Table(name)` renders reads, `Pluck`, aggregates, and set-based writes against another table with the same model.
 - **Dialects**: opaque values `rio.Postgres`, `rio.MySQL`, `rio.SQLite`, `rio.ClickHouse`. Capabilities differ: MySQL has no `RETURNING`, no conflict predicates, and renders the key lock strengths as `FOR UPDATE`/`FOR SHARE`; SQLite elides row locks; ClickHouse rejects row locks, transactions, statement caching, synchronous update/delete, and upserts (an error matching `errors.ErrUnsupported`).
 
 ## API Reference
@@ -67,6 +68,7 @@ func main() {
 ### Core Functions
 
 - `From[T]() Query[T]` - start a query for T's table.
+- `Cond(expr, args...) Condition` - one WHERE fragment as a value, for `WhereAll`.
 - `Find[T](ctx, db, key...) (*T, error)` - primary-key lookup; composite key parts in field order.
 - `Insert(ctx, db, &row)`, `Update(ctx, db, &row, cols...)`, `Delete`, `ForceDelete`, `Restore` - entity writes by primary key; `Update` writes every eligible field (zero values included) unless given a whitelist.
 - `Upsert(ctx, db, &row, opts...)` with `OnConflict`, `OnConflictWhere` (partial index predicate), `DoUpdate`, `DoUpdateSet`, `DoUpdateWhere(expr, args...)` (conditional update; a rejection returns `ErrStaleObject`), `DoNothing`, `KeepTrashed` - one-statement insert-or-update.
@@ -82,7 +84,7 @@ func main() {
 
 ### Query[T] methods
 
-- Builders: `Where`, `Having`, `Join`, `OrderBy`, `GroupBy`, `Distinct`, `Limit`, `Offset`, `Scope`, `ForUpdate(opts...)`, `ForNoKeyUpdate(opts...)`, `ForShare(opts...)`, `ForKeyShare(opts...)` (with `rio.NoWait`, `rio.SkipLocked`, `rio.LockOf(...)`), `Final`, `WithTrashed`, `OnlyTrashed`, `AllRows`, `With(path, RelOption...)`, `WithCount(rel, RelOption...)`, `WhereHas`, `WhereHasNot`, `OrderKeys`, `After`, `Before`.
+- Builders: `Where`, `WhereAll`, `Having`, `Join`, `OrderBy`, `GroupBy`, `Distinct`, `Limit`, `Offset`, `Scope`, `Table`, `ForUpdate(opts...)`, `ForNoKeyUpdate(opts...)`, `ForShare(opts...)`, `ForKeyShare(opts...)` (with `rio.NoWait`, `rio.SkipLocked`, `rio.LockOf(...)`), `Final`, `WithTrashed`, `OnlyTrashed`, `AllRows`, `With(path, RelOption...)`, `WithCount(rel, RelOption...)`, `WhereHas`, `WhereHasNot`, `OrderKeys`, `After`, `Before`.
 - Terminals: `All`, `First`, `Sole`, `Find`, `Rows` (`iter.Seq2[T, error]`), `Chunk` (`iter.Seq2[[]T, error]`), `Count`, `Exists`, `Pluck[V]`, `Sum[V]`, `Min[V]`, `Max[V]`, `Avg[V]`, `FirstOrCreate`, `CreateOrFirst`.
 - Set-based writes (require a condition or `AllRows`): `UpdateAll(ctx, db, Set, args...)`, `UpdateAllReturning`, `DeleteAll`, `DeleteAllReturning`, `ForceDeleteAll`, `RestoreAll`.
 - Reuse: `Validate`, `Must`, `SQL(db, args...)`, `Sub(column)`, `CursorAt(&row)`.
@@ -95,7 +97,7 @@ func main() {
 - `HasMany[T]`, `HasOne[T]`, `BelongsTo[T]`, `ManyToMany[T]` - relation containers with `Loaded`, `Rows`/`Row`, `Set`, JSON `null` when unloaded.
 - `RelOption` - `RelWhere`, `RelOrderBy`, `RelLimit` (per parent), `RelWithTrashed`.
 - `Set`, `Expression` - `UpdateAll`/`DoUpdateSet` assignments; `Expr(sql, args...)` builds the verbatim `Expression`.
-- `SortKey`, `Cursor`, `Subquery`, `LockOption` (`NoWait`, `SkipLocked`, `LockOf`), `UpsertOption`, `Option`.
+- `SortKey` (`Column`, `Desc`, `Expr`), `Cursor`, `Condition`, `Subquery`, `LockOption` (`NoWait`, `SkipLocked`, `LockOf`), `UpsertOption`, `Option`.
 - `QueryHook`, `QueryEvent` - observation of every statement (`Op`, `Model`, `Query`, `Args`, `Err`, `Duration`, `RowsAffected`, `RowsReturned`, `Phase`).
 - `Dialect` - opaque; `Postgres`, `MySQL`, `SQLite`, `ClickHouse`.
 - `NativeDB`, `NativeTx`, `NativeRows`, `NativeCell`, `NativeBatcher`, `NativeCopier`, `NativeLastInserter`, `NativeConfig` - driver-module SPI for native execution channels.

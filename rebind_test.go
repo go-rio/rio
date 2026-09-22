@@ -175,6 +175,25 @@ func TestRebind(t *testing.T) {
 }
 
 // Byte-identical SQL fed to two profiles must disagree at the pinned spots.
+// A slice of slices expands to parenthesized tuples for row-value IN lists
+// and multi-row VALUES; an empty tuple is an error like an empty list.
+func TestRebindExpandsTuples(t *testing.T) {
+	sql, args, err := rebind(pgLex, bindDollar, "WHERE (owner_id, sku) IN (?) AND x = ?", []any{[][]any{{1, "a"}, {2, "b"}}, 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sql != "WHERE (owner_id, sku) IN (($1, $2), ($3, $4)) AND x = $5" || len(args) != 5 || args[4] != 9 {
+		t.Fatalf("tuples: %s %v", sql, args)
+	}
+	sql, args, err = rebind(mysqlLex, bindQuestion, "VALUES ?", []any{[][]int64{{1, 2}, {3, 4}}})
+	if err != nil || sql != "VALUES (?, ?), (?, ?)" || len(args) != 4 || args[3] != int64(4) {
+		t.Fatalf("typed tuples: %s %v %v", sql, args, err)
+	}
+	if _, _, err := rebind(pgLex, bindDollar, "IN (?)", []any{[][]any{{1}, {}}}); err == nil || !strings.Contains(err.Error(), "empty tuple") {
+		t.Fatalf("empty tuple: %v", err)
+	}
+}
+
 func TestRebindDialectDivergence(t *testing.T) {
 	// MySQL's backslash keeps the string open (? dead); PG ends it (? live).
 	q := `SELECT '\'? '`

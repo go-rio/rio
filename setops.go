@@ -71,7 +71,7 @@ func (q Query[T]) ForceDeleteAll(ctx context.Context, db Queryer, args ...any) (
 		return 0, err
 	}
 	if d := g.d; !d.caps().mutations {
-		return 0, checkDeleteWrite(d, "ForceDeleteAll", g.table(p))
+		return 0, checkDeleteWrite(d, "ForceDeleteAll", state.tableOf(g, p))
 	}
 	_, n, err := q.forceDeleteAll(ctx, db, p, &state, false)
 	return n, err
@@ -123,14 +123,14 @@ func (q Query[T]) updateAll(
 		return nil, 0, err
 	}
 	d := g.d
-	if err := checkUpdateWrite(d, "UpdateAll", g.table(p)); err != nil {
+	table := state.tableOf(g, p)
+	if err := checkUpdateWrite(d, "UpdateAll", table); err != nil {
 		return nil, 0, err
 	}
 	if err := checkReturning(d, returning, hookOp); err != nil {
 		return nil, 0, err
 	}
 	now := normalizeTime(db.conf().clock())
-	table := g.table(p)
 
 	keys := make([]string, 0, len(set)+1)
 	for k := range set {
@@ -202,7 +202,7 @@ func (q Query[T]) deleteAll(ctx context.Context, db Queryer, args []any, returni
 	}
 	// Check before delegation so errors name DeleteAll.
 	if d := g.d; !d.caps().mutations {
-		return nil, 0, checkDeleteWrite(d, "DeleteAll", g.table(p))
+		return nil, 0, checkDeleteWrite(d, "DeleteAll", state.tableOf(g, p))
 	}
 	if p.softDel != nil {
 		set := Set{p.softDel.column: g.d.bindTime(normalizeTime(db.conf().clock()))}
@@ -226,7 +226,7 @@ func (q Query[T]) forceDeleteAll(
 	if err := checkReturning(d, returning, "delete"); err != nil {
 		return nil, 0, err
 	}
-	table := g.table(p)
+	table := state.tableOf(g, p)
 	b := make([]byte, 0, 96)
 	b = append(b, "DELETE FROM "...)
 	b = d.quote(b, table)

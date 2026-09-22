@@ -101,11 +101,11 @@ table, and what rio deliberately leaves out.
 
 | Area | API |
 |---|---|
-| Query construction | `From[T]`, `Where`, `Having`, `Join`, `OrderBy`, `GroupBy`, `Distinct`, `Limit`, `Offset`, `Scope` |
+| Query construction | `From[T]`, `Where`, `WhereAll`, `Cond`, `Having`, `Join`, `OrderBy`, `GroupBy`, `Distinct`, `Limit`, `Offset`, `Scope`, `Table` |
 | Query modifiers | `ForUpdate`, `ForNoKeyUpdate`, `ForShare`, `ForKeyShare`, `LockOf`, `Final`, `WithTrashed`, `OnlyTrashed`, `AllRows` |
 | Query execution | `All`, `First`, `Sole`, `Find`, `Rows`, `Chunk`, `Count`, `Exists`, `Pluck[V]`, `Sum/Min/Max/Avg[V]`, `SQL` |
-| Cursor pagination | `OrderKeys`, `After`, `Before`, `CursorAt`, `Cursor.String`, `ParseCursor` |
-| Direct lookup and SQL | `Find[T]`, `Raw[T]` (`Where`, `GroupBy`, `Having`, `OrderBy`, `Limit`, `Offset`, `Must`, `All`, `First`, `Sole`, `Value`, `Rows`, `Count`, `Exists`, `SQL`), `Exec`, `Query.Sub` |
+| Cursor pagination | `OrderKeys`, `After`, `Before`, `CursorAt`, `Cursor.String`, `ParseCursor`, on `Query` and `Raw` |
+| Direct lookup and SQL | `Find[T]`, `Raw[T]` (`Where`, `WhereAll`, `GroupBy`, `Having`, `OrderBy`, `OrderKeys`, `After`, `Before`, `Limit`, `Offset`, `Must`, `All`, `First`, `Sole`, `Value`, `Rows`, `Chunk`, `Count`, `Exists`, `CursorAt`, `SQL`), `Exec`, `Query.Sub` |
 | Entity writes | `Insert`, `Update`, `Delete`, `ForceDelete`, `Restore`, `Upsert` (`OnConflict`, `OnConflictWhere`, `DoUpdate`, `DoUpdateSet`, `DoUpdateWhere`, `DoNothing`, `KeepTrashed`), `FirstOrCreate`, `CreateOrFirst` |
 | Batch and set writes | `InsertAll`, `UpsertAll`, `UpdateAll`, `UpdateAllReturning`, `DeleteAll`, `DeleteAllReturning`, `ForceDeleteAll`, `RestoreAll` |
 | Relations | `With`, `WithCount`, `WhereHas`, `WhereHasNot`, `Attach`, `Detach`, `SyncRelation`, `ClearRelation` |
@@ -154,7 +154,8 @@ Parameters per fragment:
 - `Where("age >= ?")` — deferred, consumes terminal arguments in SQL order.
 - `Where("active")` — no placeholders.
 
-Slices expand inside `IN (?)`; an empty slice is an error. A one-column
+Slices expand inside `IN (?)`; an empty slice is an error, and a slice of
+slices expands to tuples (`Where("(owner_id, sku) IN (?)", pairs)`). A one-column
 query embeds the same way: `Where("id IN (?)", banned.Sub("user_id"))` splices
 the subquery and its arguments in place — the caller writes the parentheses,
 and the subquery's own `Where` arguments must be inline. Missing or excess
@@ -170,6 +171,12 @@ per DB and per transaction (default 512 entries); the sqlite and mysql
 modules turn it on by default, and `WithoutStmtCache` opts out behind
 transaction- or statement-mode poolers. `New` panics on `WithStmtCache` with
 ClickHouse, which cannot prepare general queries.
+
+Conditions are values too: `rio.Cond("owner_id = ?", id)` builds one, and
+`WhereAll(conds...)` appends each as its own fragment, so one filter can drive
+several queries and raw heads. `Table("orgs_archive")` renders a query
+against another table with the same model, for reads, `Pluck`, aggregates,
+and the set-based writes; entity writes keep the model's table.
 
 ### Raw queries
 
@@ -201,12 +208,28 @@ its own `ORDER BY` or `LIMIT` still probes correctly. `Must` validates and
 caches stable shapes as it does for `Query`; `Exec` runs hand-written write
 statements through the same pipeline.
 
+Keyset pagination works over the DTO's mapped columns: `OrderKeys`, `After`,
+`Before`, `CursorAt`, and `Chunk` behave as on `Query`, and `SortKey.Expr`
+names the SQL that produced a column when its bare name would not resolve in
+the head:
+
+```go
+export := rio.Raw[InventoryRow](`SELECT i.*, w.code AS warehouse_code
+FROM inventory i JOIN warehouses w ON w.id = i.warehouse_id`).
+    OrderKeys(rio.SortKey{Column: "id", Expr: "i.id"})
+
+for page, err := range export.Chunk(ctx, db, 500) {
+    // ...
+}
+```
+
 ### Cursor pagination
 
 `OrderKeys` declares ordering over mapped NOT NULL scalar columns, so rio can
 read key values back out of a row and issue a keyset cursor. A missing
 primary-key column is appended as tie-breaker — pages never skip or repeat.
-`OrderKeys` cannot mix with verbatim `OrderBy`:
+`OrderKeys` cannot mix with verbatim `OrderBy`; the same API is on `Raw`,
+where `SortKey.Expr` names the SQL that produced a column:
 
 ```go
 q := rio.From[Post]().OrderKeys(

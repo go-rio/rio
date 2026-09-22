@@ -83,10 +83,24 @@ const (
 	selectExists
 )
 
+// Condition is one AND-ed WHERE fragment as a value: verbatim SQL with its
+// inline arguments, or none when its placeholders defer to the terminal call.
+type Condition struct {
+	expr string
+	args []any
+}
+
+// Cond builds a Condition; never build the expression from untrusted input.
+func Cond(expr string, args ...any) Condition {
+	return Condition{expr: expr, args: copyArgs(args)}
+}
+
 // queryState is the non-generic body shared by renderers and preloaders.
 type queryState struct {
 	// head is a RawQuery's hand-written SELECT head; empty on entity queries.
-	head    cond
+	head cond
+	// table is the Table override; empty renders T's table.
+	table   string
 	wheres  []cond
 	havings []cond
 	joins   []string
@@ -120,6 +134,14 @@ type queryState struct {
 	// holds its bound values in an execution-local state.
 	keyed   bool
 	keyArgs []any
+}
+
+// tableOf is the rendered table: the Table override, else the model's.
+func (s *queryState) tableOf(g *grammar, p *plan) string {
+	if s.table != "" {
+		return s.table
+	}
+	return g.table(p)
 }
 
 // noteCondArity records an inline-argument mismatch per fragment. Deferred and
@@ -176,6 +198,22 @@ func (q Query[T]) Where(expr string, args ...any) Query[T] {
 	q.cache = nil
 	q.s.wheres = appendOne(q.s.wheres, cond{expr: expr, args: copyArgs(args)})
 	q.s.noteCondArity("Where", expr, len(args))
+	return q
+}
+
+// WhereAll adds each condition as its own AND-ed Where fragment.
+func (q Query[T]) WhereAll(conds ...Condition) Query[T] {
+	for _, c := range conds {
+		q = q.Where(c.expr, c.args...)
+	}
+	return q
+}
+
+// Table renders the query against name instead of T's table: reads, Pluck,
+// aggregates, and the set-based writes. Entity writes keep the model's table.
+func (q Query[T]) Table(name string) Query[T] {
+	q.cache = nil
+	q.s.table = name
 	return q
 }
 
@@ -830,7 +868,7 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 	if err := checkFinal(d, s); err != nil {
 		return "", nil, err
 	}
-	table := g.table(p)
+	table := s.tableOf(g, p)
 	var sortKeys []resolvedKey
 	hasSortKeys := len(s.orderKeys) > 0 || s.after != nil || s.before != nil
 	if hasSortKeys {
@@ -861,28 +899,18 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 		b = append(b, "SELECT 1 FROM "...)
 		b = d.quote(b, table)
 	default:
-		op := "selecthead"
-		if s.distinct {
-			op = "selectdistinct"
-		}
-		head, err := g.cachedSQL(p, op, 0, 0, upsertCacheKey{}, func() (string, error) {
-			hb := make([]byte, 0, 128)
-			hb = append(hb, "SELECT "...)
+		build := func() (string, error) { return selectHead(d, p, table, s.distinct), nil }
+		var head string
+		var err error
+		if s.table != "" {
+			head, err = build()
+		} else {
+			op := "selecthead"
 			if s.distinct {
-				hb = append(hb, "DISTINCT "...)
+				op = "selectdistinct"
 			}
-			for i, f := range p.fields {
-				if i > 0 {
-					hb = append(hb, ", "...)
-				}
-				hb = d.quote(hb, table)
-				hb = append(hb, '.')
-				hb = d.quote(hb, f.column)
-			}
-			hb = append(hb, " FROM "...)
-			hb = d.quote(hb, table)
-			return string(hb), nil
-		})
+			head, err = g.cachedSQL(p, op, 0, 0, upsertCacheKey{}, build)
+		}
 		if err != nil {
 			return "", nil, err
 		}
@@ -934,6 +962,26 @@ func renderSelect(g *grammar, p *plan, s *queryState, shape selectShape) (string
 	}
 
 	return finishSQL(g, b, args)
+}
+
+// selectHead renders the qualified column list of an entity SELECT.
+func selectHead(d Dialect, p *plan, table string, distinct bool) string {
+	hb := make([]byte, 0, 128)
+	hb = append(hb, "SELECT "...)
+	if distinct {
+		hb = append(hb, "DISTINCT "...)
+	}
+	for i, f := range p.fields {
+		if i > 0 {
+			hb = append(hb, ", "...)
+		}
+		hb = d.quote(hb, table)
+		hb = append(hb, '.')
+		hb = d.quote(hb, f.column)
+	}
+	hb = append(hb, " FROM "...)
+	hb = d.quote(hb, table)
+	return string(hb)
 }
 
 // appendGroupHaving renders GROUP BY and the AND-ed HAVING conditions.
@@ -1357,7 +1405,7 @@ func renderPluckRaw(g *grammar, p *plan, f *field, s *queryState) ([]byte, []any
 	if err := checkFinal(d, s); err != nil {
 		return nil, nil, err
 	}
-	table := g.table(p)
+	table := s.tableOf(g, p)
 	var sortKeys []resolvedKey
 	hasSortKeys := len(s.orderKeys) > 0 || s.after != nil || s.before != nil
 	if hasSortKeys {

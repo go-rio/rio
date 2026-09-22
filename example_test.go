@@ -163,6 +163,37 @@ func ExampleRaw() {
 	fmt.Println(len(rows), authors)
 }
 
+// One filter, expressed as conditions, drives the entity list and a raw
+// aggregate over the same rows.
+func ExampleQuery_WhereAll() {
+	ctx := context.Background()
+	filter := []rio.Condition{rio.Cond("active"), rio.Cond("age >= ?", 18)}
+	users, err := rio.From[User]().WhereAll(filter...).OrderBy("id").Limit(20).All(ctx, db)
+	if err != nil {
+		log.Fatal(err)
+	}
+	total, err := rio.Raw[int64]("SELECT count(*) FROM users").WhereAll(filter...).Value(ctx, db)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(len(users), total)
+}
+
+// Chunk walks a raw projection by keyset; Expr names the SQL behind the
+// ordering column because the head joins another table.
+func ExampleRawQuery_Chunk() {
+	ctx := context.Background()
+	export := rio.Raw[userPosts]("SELECT u.id AS user_id, count(p.id) AS posts FROM users u JOIN posts p ON p.user_id = u.id").
+		GroupBy("u.id").
+		OrderKeys(rio.SortKey{Column: "user_id", Expr: "u.id"})
+	for page, err := range export.Chunk(ctx, db, 500) {
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(len(page))
+	}
+}
+
 func ExampleRawQuery_Value() {
 	ctx := context.Background()
 	n, err := rio.Raw[int64]("SELECT count(*) FROM users").

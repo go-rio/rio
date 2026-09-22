@@ -214,6 +214,131 @@ func TestRawLimitBindsPerDialect(t *testing.T) {
 	}
 }
 
+type rawPage struct {
+	ID    int64
+	Score int64
+	Name  string
+}
+
+func TestRawWhereAll(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	conds := []Condition{Cond("t.owner_id = ?", 3), Cond("t.status IN (?)")}
+	f.queueRows([]string{"id", "name"})
+	if _, err := Raw[rawStreamRow]("SELECT t.id, t.name FROM t").WhereAll(conds...).All(ctx, db, []string{"a", "b"}); err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	got := f.loggedContaining("SELECT")[0]
+	if got.sql != `SELECT t.id, t.name FROM t WHERE (t.owner_id = $1) AND (t.status IN ($2, $3))` || len(got.args) != 3 {
+		t.Fatalf("sql: %s %v", got.sql, got.args)
+	}
+}
+
+func TestRawKeysetPagination(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	cols := []string{"id", "score", "name"}
+	q := Raw[rawPage]("SELECT p.id, p.score, p.name FROM pages p JOIN owners o ON o.id = p.owner_id").
+		Where("o.active = ?", true).
+		OrderKeys(SortKey{Column: "score", Desc: true, Expr: "p.score"}, SortKey{Column: "id", Desc: true, Expr: "p.id"}).
+		Must()
+
+	f.queueRows(cols, []driver.Value{int64(1), int64(90), "a"}, []driver.Value{int64(2), int64(80), "b"})
+	page, err := q.Limit(2).All(ctx, db)
+	if err != nil || len(page) != 2 {
+		t.Fatalf("first page: %v %+v", err, page)
+	}
+	first := f.loggedContaining("SELECT")[0]
+	if !strings.HasSuffix(first.sql, `WHERE (o.active = $1) ORDER BY p.score DESC, p.id DESC LIMIT $2`) {
+		t.Fatalf("first page sql: %s", first.sql)
+	}
+
+	cur, err := q.CursorAt(&page[1])
+	if err != nil {
+		t.Fatalf("CursorAt: %v", err)
+	}
+	f.queueRows(cols, []driver.Value{int64(3), int64(70), "c"})
+	if _, err := q.After(cur).Limit(2).All(ctx, db); err != nil {
+		t.Fatalf("next page: %v", err)
+	}
+	next := f.loggedContaining("SELECT")[1]
+	wantPred := `WHERE (o.active = $1) AND ((p.score < $2) OR (p.score = $3 AND p.id < $4)) ORDER BY p.score DESC, p.id DESC LIMIT $5`
+	if !strings.HasSuffix(next.sql, wantPred) || next.args[1] != int64(80) || next.args[3] != int64(2) {
+		t.Fatalf("next page sql: %s %v", next.sql, next.args)
+	}
+
+	f.queueRows(cols, []driver.Value{int64(2), int64(80), "b"}, []driver.Value{int64(1), int64(90), "a"})
+	prev, err := q.Before(cur).Limit(2).All(ctx, db)
+	if err != nil || len(prev) != 2 || prev[0].ID != 1 || prev[1].ID != 2 {
+		t.Fatalf("Before must read backwards and turn the page around: %v %+v", err, prev)
+	}
+	back := f.loggedContaining("SELECT")[2]
+	if !strings.HasSuffix(back.sql, `((p.score > $2) OR (p.score = $3 AND p.id > $4)) ORDER BY p.score, p.id LIMIT $5`) {
+		t.Fatalf("reversed sql: %s", back.sql)
+	}
+
+	f.queueRows([]string{"count"}, []driver.Value{int64(1)})
+	if n, err := q.After(cur).Count(ctx, db); err != nil || n != 1 {
+		t.Fatalf("Count after the cursor: %v %d", err, n)
+	}
+	if !strings.Contains(f.loggedContaining("rio_count")[0].sql, "(p.score < $2)") {
+		t.Fatal("Count keeps the keyset predicate")
+	}
+
+	bare := Raw[rawPage]("SELECT id, score, name FROM pages").OrderKeys(SortKey{Column: "score"})
+	f.queueRows(cols, []driver.Value{int64(1), int64(5), "a"})
+	if _, err := bare.All(ctx, db); err != nil {
+		t.Fatalf("bare keys: %v", err)
+	}
+	if got := f.loggedContaining("SELECT id, score, name FROM pages")[0].sql; !strings.HasSuffix(got, `ORDER BY "score", "id"`) {
+		t.Fatalf("bare keys render the quoted column: %s", got)
+	}
+
+	if err := Raw[int64]("SELECT id FROM pages").OrderKeys(SortKey{Column: "id"}).Validate(); err == nil || !strings.Contains(err.Error(), "scalar") {
+		t.Fatalf("scalar targets have no sort keys: %v", err)
+	}
+	if err := q.OrderBy("p.name").Validate(); err == nil || !strings.Contains(err.Error(), "cannot mix") {
+		t.Fatalf("OrderKeys and OrderBy cannot mix: %v", err)
+	}
+}
+
+func TestRawChunkWalksKeysetPages(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+	cols := []string{"id", "score", "name"}
+	q := Raw[rawPage]("SELECT p.id, p.score, p.name FROM pages p").Where("p.score > ?")
+
+	f.queueRows(cols, []driver.Value{int64(1), int64(9), "a"}, []driver.Value{int64(2), int64(8), "b"})
+	f.queueRows(cols, []driver.Value{int64(3), int64(7), "c"})
+	var seen []int64
+	for page, err := range q.Chunk(ctx, db, 2, 0) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range page {
+			seen = append(seen, row.ID)
+		}
+	}
+	if len(seen) != 3 || seen[2] != 3 {
+		t.Fatalf("seen = %v", seen)
+	}
+	stmts := f.loggedContaining("SELECT")
+	if len(stmts) != 2 || !strings.HasSuffix(stmts[0].sql, `WHERE (p.score > $1) ORDER BY "id" LIMIT $2`) {
+		t.Fatalf("first page: %+v", stmts)
+	}
+	if !strings.Contains(stmts[1].sql, `("id" > $2)`) || stmts[1].args[1] != int64(2) {
+		t.Fatalf("second page resumes after id 2: %s %v", stmts[1].sql, stmts[1].args)
+	}
+	for _, err := range q.Limit(1).Chunk(ctx, db, 2, 0) {
+		if err == nil || !strings.Contains(err.Error(), "Chunk owns") {
+			t.Fatalf("Chunk with Limit: %v", err)
+		}
+	}
+}
+
 func TestRawValidate(t *testing.T) {
 	err := Raw[int64]("SELECT 1 FROM t").OrderBy("id = ?").Validate()
 	if err == nil || !strings.Contains(err.Error(), "OrderBy") {

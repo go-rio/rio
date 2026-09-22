@@ -7,11 +7,12 @@ import (
 	"fmt"
 	"iter"
 	"reflect"
+	"slices"
 )
 
 // RawQuery is a hand-written SELECT head plus the clauses rio appends (WHERE,
-// GROUP BY, HAVING, ORDER BY, bound LIMIT/OFFSET): an immutable value that
-// scans into any shape under Query's argument rules.
+// GROUP BY, HAVING, ORDER BY, bound LIMIT/OFFSET, keyset cursors): an
+// immutable value that scans into any shape under Query's argument rules.
 type RawQuery[T any] struct {
 	s     queryState
 	cache *queryCache
@@ -38,6 +39,14 @@ func (q RawQuery[T]) Where(expr string, args ...any) RawQuery[T] {
 	return q
 }
 
+// WhereAll adds each condition as its own AND-ed Where fragment.
+func (q RawQuery[T]) WhereAll(conds ...Condition) RawQuery[T] {
+	for _, c := range conds {
+		q = q.Where(c.expr, c.args...)
+	}
+	return q
+}
+
 // GroupBy appends a verbatim GROUP BY term.
 func (q RawQuery[T]) GroupBy(expr string) RawQuery[T] {
 	q.cache = nil
@@ -60,6 +69,32 @@ func (q RawQuery[T]) OrderBy(expr string) RawQuery[T] {
 	return q
 }
 
+// OrderKeys sets the structured ordering cursor pagination requires, over
+// T's mapped NOT NULL scalar columns; SortKey.Expr names the SQL that
+// produced a column when its bare name would not resolve in the head.
+// T's primary-key columns missing from keys are appended as tie-breakers,
+// and OrderKeys cannot mix with OrderBy.
+func (q RawQuery[T]) OrderKeys(keys ...SortKey) RawQuery[T] {
+	q.cache = nil
+	q.s.orderKeys = append(append([]SortKey(nil), q.s.orderKeys...), keys...)
+	return q
+}
+
+// After resumes past the position c marks, as Query.After does.
+func (q RawQuery[T]) After(c Cursor) RawQuery[T] {
+	q.cache = nil
+	q.s.after = &c
+	return q
+}
+
+// Before selects the page ending at the position c marks, as Query.Before
+// does; Rows cannot stream it.
+func (q RawQuery[T]) Before(c Cursor) RawQuery[T] {
+	q.cache = nil
+	q.s.before = &c
+	return q
+}
+
 // Limit caps the result; the value binds as a parameter.
 func (q RawQuery[T]) Limit(n int) RawQuery[T] {
 	q.cache = nil
@@ -75,12 +110,13 @@ func (q RawQuery[T]) Offset(n int) RawQuery[T] {
 }
 
 // Validate returns the first connection-independent error: argument arity,
-// placeholders in GroupBy/OrderBy, or a T rio cannot scan into.
+// placeholders in GroupBy/OrderBy, cursor misuse, or a T rio cannot scan into.
 func (q RawQuery[T]) Validate() error {
-	if _, _, err := rawTarget[T](); err != nil {
+	_, p, err := rawTarget[T]()
+	if err != nil {
 		return err
 	}
-	return validateRawState(&q.s)
+	return validateRawState(p, &q.s)
 }
 
 // Must panics if Validate fails and returns the query with a private render
@@ -91,6 +127,19 @@ func (q RawQuery[T]) Must() RawQuery[T] {
 	}
 	q.cache = new(queryCache)
 	return q
+}
+
+// CursorAt issues the cursor marking row's position under the query's
+// OrderKeys; the row must hold the values the database returned.
+func (q RawQuery[T]) CursorAt(row *T) (Cursor, error) {
+	_, p, err := rawTarget[T]()
+	if err != nil {
+		return Cursor{}, err
+	}
+	if p == nil {
+		return Cursor{}, errors.New("rio: CursorAt needs struct rows; a scalar Raw query has no sort keys")
+	}
+	return cursorAt(p, &q.s, reflect.ValueOf(row).Elem())
 }
 
 // All scans every row; args fill deferred placeholders in SQL order.
@@ -144,12 +193,16 @@ func (q RawQuery[T]) Rows(ctx context.Context, db Queryer, args ...any) iter.Seq
 	execArgs := copyArgs(args)
 	return func(yield func(T, error) bool) {
 		var zero T
+		if q.s.before != nil {
+			yield(zero, errors.New("rio: Rows cannot stream Before (the page is read backwards and turned around); use All"))
+			return
+		}
 		tt, p, err := rawTarget[T]()
 		if err != nil {
 			yield(zero, err)
 			return
 		}
-		sqlText, bound, err := q.render(db.gram(), queryCacheRows, selectRows, execArgs)
+		sqlText, bound, err := q.render(db.gram(), p, queryCacheRows, selectRows, execArgs)
 		if err != nil {
 			yield(zero, err)
 			return
@@ -172,6 +225,60 @@ func (q RawQuery[T]) Rows(ctx context.Context, db Queryer, args ...any) iter.Seq
 	}
 }
 
+// Chunk yields the matching rows in keyset pages of size rows, as Query.Chunk
+// does: pages follow OrderKeys, defaulting to T's primary key; Limit, Offset,
+// After, and Before are refused.
+func (q RawQuery[T]) Chunk(ctx context.Context, db Queryer, size int, args ...any) iter.Seq2[[]T, error] {
+	execArgs := copyArgs(args)
+	return func(yield func([]T, error) bool) {
+		if size <= 0 {
+			yield(nil, fmt.Errorf("rio: Chunk requires a positive size, got %d", size))
+			return
+		}
+		hasPaging := q.s.limitSet || q.s.offsetSet || q.s.after != nil || q.s.before != nil
+		if hasPaging {
+			yield(nil, errors.New("rio: Chunk owns Limit, Offset, After, and Before; drop them"))
+			return
+		}
+		page := q
+		page.cache = nil
+		if len(page.s.orderKeys) == 0 {
+			_, p, err := rawTarget[T]()
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			if p == nil {
+				yield(nil, errors.New("rio: Chunk needs struct rows; a scalar Raw query has no sort keys"))
+				return
+			}
+			for _, pk := range p.pks {
+				page.s.orderKeys = append(page.s.orderKeys, SortKey{Column: pk.column})
+			}
+		}
+		page.s.limit, page.s.limitSet = size, true
+		for {
+			rows, err := page.All(ctx, db, execArgs...)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			if len(rows) == 0 {
+				return
+			}
+			if !yield(rows, nil) || len(rows) < size {
+				return
+			}
+			cur, err := page.CursorAt(&rows[len(rows)-1])
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			page.s.after = &cur
+		}
+	}
+}
+
 // Count returns how many rows All would return (groups under GROUP BY);
 // Limit and Offset are rejected.
 func (q RawQuery[T]) Count(ctx context.Context, db Queryer, args ...any) (int64, error) {
@@ -180,7 +287,11 @@ func (q RawQuery[T]) Count(ctx context.Context, db Queryer, args ...any) (int64,
 			"rio: Count cannot honor Limit/Offset (COUNT aggregates before LIMIT applies); drop them",
 		)
 	}
-	sqlText, bound, err := q.render(db.gram(), queryCacheCount, selectCount, args)
+	_, p, err := rawTarget[T]()
+	if err != nil {
+		return 0, err
+	}
+	sqlText, bound, err := q.render(db.gram(), p, queryCacheCount, selectCount, args)
 	if err != nil {
 		return 0, err
 	}
@@ -201,7 +312,11 @@ func (q RawQuery[T]) Count(ctx context.Context, db Queryer, args ...any) (int64,
 
 // Exists reports whether any row matches; Limit and Offset apply first.
 func (q RawQuery[T]) Exists(ctx context.Context, db Queryer, args ...any) (bool, error) {
-	sqlText, bound, err := q.render(db.gram(), queryCacheExists, selectExists, args)
+	_, p, err := rawTarget[T]()
+	if err != nil {
+		return false, err
+	}
+	sqlText, bound, err := q.render(db.gram(), p, queryCacheExists, selectExists, args)
 	if err != nil {
 		return false, err
 	}
@@ -217,18 +332,28 @@ func (q RawQuery[T]) Exists(ctx context.Context, db Queryer, args ...any) (bool,
 // SQL renders the statement All would run on db, without executing it.
 func (q RawQuery[T]) SQL(db Queryer, args ...any) (string, []any, error) {
 	g := db.gram()
-	if err := validateRawState(&q.s); err != nil {
+	_, p, err := rawTarget[T]()
+	if err != nil {
+		return "", nil, err
+	}
+	if err := validateRawState(p, &q.s); err != nil {
 		return "", nil, err
 	}
 	state, err := bindQueryState(g.d, nil, &q.s, args)
 	if err != nil {
 		return "", nil, err
 	}
-	return renderRaw(g, &state, selectRows)
+	return renderRaw(g, p, &state, selectRows)
 }
 
 // render binds args and renders the shape through Must's cache.
-func (q RawQuery[T]) render(g *grammar, op queryCacheOp, shape selectShape, execArgs []any) (string, []any, error) {
+func (q RawQuery[T]) render(
+	g *grammar,
+	p *plan,
+	op queryCacheOp,
+	shape selectShape,
+	execArgs []any,
+) (string, []any, error) {
 	key := queryCacheKey{grammar: g.weakSelf, op: op}
 	entry, bound, ok, err := q.cache.load(key, g.d, execArgs)
 	if err != nil {
@@ -237,14 +362,14 @@ func (q RawQuery[T]) render(g *grammar, op queryCacheOp, shape selectShape, exec
 	if ok {
 		return entry.sql, bound, nil
 	}
-	if err := validateRawState(&q.s); err != nil {
+	if err := validateRawState(p, &q.s); err != nil {
 		return "", nil, err
 	}
 	state, err := bindQueryState(g.d, nil, &q.s, execArgs)
 	if err != nil {
 		return "", nil, err
 	}
-	sqlText, args, err := renderRaw(g, &state, shape)
+	sqlText, args, err := renderRaw(g, p, &state, shape)
 	if err != nil {
 		return "", nil, err
 	}
@@ -256,7 +381,7 @@ func (q RawQuery[T]) scan(ctx context.Context, db Queryer, op queryCacheOp, args
 	if err != nil {
 		return nil, err
 	}
-	sqlText, bound, err := q.render(db.gram(), op, selectRows, args)
+	sqlText, bound, err := q.render(db.gram(), p, op, selectRows, args)
 	if err != nil {
 		return nil, err
 	}
@@ -264,13 +389,16 @@ func (q RawQuery[T]) scan(ctx context.Context, db Queryer, op queryCacheOp, args
 	if err != nil {
 		return nil, err
 	}
+	var out []T
 	if p == nil {
-		out, err := scanScalarsN[T](rows, maxRows)
-		finishQuery(finish, err, int64(len(out)))
-		return out, err
+		out, err = scanScalarsN[T](rows, maxRows)
+	} else {
+		out, err = scanAllN[T](rows, p, true, maxRows)
 	}
-	out, err := scanAllN[T](rows, p, true, maxRows)
 	finishQuery(finish, err, int64(len(out)))
+	if err == nil && q.s.before != nil {
+		slices.Reverse(out) // the reversed query read the page backwards
+	}
 	return out, err
 }
 
@@ -295,7 +423,7 @@ func rawTarget[T any]() (reflect.Type, *plan, error) {
 }
 
 // validateRawState checks a raw query without a database.
-func validateRawState(s *queryState) error {
+func validateRawState(p *plan, s *queryState) error {
 	if s.err != nil {
 		return s.err
 	}
@@ -308,12 +436,23 @@ func validateRawState(s *queryState) error {
 	if s.offsetSet && s.offset < 0 {
 		return fmt.Errorf("rio: Offset requires a non-negative value, got %d", s.offset)
 	}
-	return checkNoArgClauses("Raw", s)
+	if err := checkNoArgClauses("Raw", s); err != nil {
+		return err
+	}
+	return validateSortKeys(p, s)
 }
 
 // renderRaw appends the builder clauses to the head; Count and Exists wrap
 // the statement as a derived table.
-func renderRaw(g *grammar, s *queryState, shape selectShape) (string, []any, error) {
+func renderRaw(g *grammar, p *plan, s *queryState, shape selectShape) (string, []any, error) {
+	var sortKeys []resolvedKey
+	hasSortKeys := len(s.orderKeys) > 0 || s.after != nil || s.before != nil
+	if hasSortKeys {
+		var err error
+		if sortKeys, err = resolveSortKeys(p, s); err != nil {
+			return "", nil, err
+		}
+	}
 	b := make([]byte, 0, len(s.head.expr)+96)
 	switch shape {
 	case selectCount:
@@ -323,7 +462,7 @@ func renderRaw(g *grammar, s *queryState, shape selectShape) (string, []any, err
 	}
 	b = append(b, s.head.expr...)
 	args := append([]any(nil), s.head.args...)
-	b, args, err := renderWhere(b, args, g, "", nil, s, nil)
+	b, args, err := renderWhere(b, args, g, "", nil, s, sortKeys)
 	if err != nil {
 		return "", nil, err
 	}
@@ -331,6 +470,7 @@ func renderRaw(g *grammar, s *queryState, shape selectShape) (string, []any, err
 	switch shape {
 	case selectRows:
 		b = appendOrderBy(b, s.orders)
+		b = appendOrderKeys(b, g.d, "", sortKeys, s.before != nil)
 		if b, args, err = appendLimitOffset(b, args, g.d, s); err != nil {
 			return "", nil, err
 		}

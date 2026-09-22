@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-09-22
+
+### Added
+
+- `Cond(expr, args...)` builds a `Condition`; `WhereAll(conds...)` on `Query` and `Raw` appends each as its own AND-ed fragment, so one filter drives several queries.
+- `Query.Table(name)` renders reads, `Pluck`, aggregates, and the set-based writes against another table with the same model; entity writes keep the model's table.
+- Keyset pagination on `Raw`: `OrderKeys`, `After`, `Before`, `CursorAt`, and `Chunk` over the DTO's mapped columns. `SortKey.Expr` names the SQL that produced a column when its bare name would not resolve in the head.
+- A slice of slices expands to parenthesized tuples inside `IN (?)` and `VALUES ?`; an empty tuple is an error.
+
 ## [0.19.1] - 2026-09-22
 
 ### Changed

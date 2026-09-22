@@ -1,6 +1,9 @@
 package rio
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // Validate checks q without accessing a database. Deferred Where and Having
 // arguments are checked by the terminal method under its dialect.
@@ -35,25 +38,8 @@ func validateQueryState(p *plan, s *queryState) error {
 	if err := checkNoArgClauses(p.structName, s); err != nil {
 		return err
 	}
-	hasSortKeys := len(s.orderKeys) > 0 || s.after != nil || s.before != nil
-	if hasSortKeys {
-		keys, err := resolveSortKeys(p, s)
-		if err != nil {
-			return err
-		}
-		if s.after != nil && s.before != nil {
-			return fmt.Errorf("rio: After and Before cannot combine; a page has one edge")
-		}
-		if s.after != nil {
-			if err := s.after.check("After", keys); err != nil {
-				return err
-			}
-		}
-		if s.before != nil {
-			if err := s.before.check("Before", keys); err != nil {
-				return err
-			}
-		}
+	if err := validateSortKeys(p, s); err != nil {
+		return err
 	}
 	if err := validatePaths(p, s.withs); err != nil {
 		return err
@@ -65,6 +51,36 @@ func validateQueryState(p *plan, s *queryState) error {
 		return err
 	}
 	return validateRelOptions(p, s)
+}
+
+// validateSortKeys resolves OrderKeys and checks the cursors against them; a
+// nil plan is a scalar Raw target, which has no sort keys.
+func validateSortKeys(p *plan, s *queryState) error {
+	hasSortKeys := len(s.orderKeys) > 0 || s.after != nil || s.before != nil
+	if !hasSortKeys {
+		return nil
+	}
+	if p == nil {
+		return errors.New("rio: cursor pagination needs struct rows; a scalar Raw query has no sort keys")
+	}
+	keys, err := resolveSortKeys(p, s)
+	if err != nil {
+		return err
+	}
+	if s.after != nil && s.before != nil {
+		return errors.New("rio: After and Before cannot combine; a page has one edge")
+	}
+	if s.after != nil {
+		if err := s.after.check("After", keys); err != nil {
+			return err
+		}
+	}
+	if s.before != nil {
+		if err := s.before.check("Before", keys); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // checkNoArgClauses rejects a placeholder recognized by any supported lexer.
