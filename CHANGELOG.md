@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.20.2] - 2026-09-22
+
+### Fixed
+
+- A conflict update rejected by `DoUpdateWhere` reports `Err = nil` to query hooks, like a `First` miss; only the caller sees `ErrStaleObject`.
+- `FirstOrCreate` and `CreateOrFirst` reject a `Table` override instead of reading one table and inserting into the model's.
+
 ## [0.20.1] - 2026-09-22
 
 ### Changed

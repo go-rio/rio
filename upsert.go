@@ -301,7 +301,9 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 			}
 			err = scanBackRow(rows, p, unsafe.Pointer(row))
 			if spec.where.expr != "" && errors.Is(err, errNoReturningRow) {
-				err = ErrStaleObject
+				// A rejected conflict update is an outcome, not a failure.
+				finishQuery(finish, nil, 0)
+				return ErrStaleObject
 			}
 			finishQuery(finish, err, oneIf(err == nil))
 			return err
@@ -360,7 +362,7 @@ func Upsert[T any](ctx context.Context, db Queryer, row *T, opts ...UpsertOption
 // wins, it re-reads after ErrDuplicateKey; if that still misses, it returns the
 // duplicate-key error, which may identify a hidden soft-deleted row.
 func (q Query[T]) FirstOrCreate(ctx context.Context, db Queryer, row *T, args ...any) error {
-	if err := checkRacedCreate(db.gram().d, "FirstOrCreate"); err != nil {
+	if err := checkRacedCreate(db.gram().d, "FirstOrCreate", &q.s); err != nil {
 		return err
 	}
 	_, state, err := prepareQueryState[T](db.gram().d, &q.s, args)
@@ -397,7 +399,7 @@ func (q Query[T]) FirstOrCreate(ctx context.Context, db Queryer, row *T, args ..
 // CreateOrFirst inserts row or returns the existing match after a unique-key
 // conflict.
 func (q Query[T]) CreateOrFirst(ctx context.Context, db Queryer, row *T, args ...any) error {
-	if err := checkRacedCreate(db.gram().d, "CreateOrFirst"); err != nil {
+	if err := checkRacedCreate(db.gram().d, "CreateOrFirst", &q.s); err != nil {
 		return err
 	}
 	_, state, err := prepareQueryState[T](db.gram().d, &q.s, args)
@@ -505,7 +507,10 @@ func checkUpsertWrite(d Dialect, op string) error {
 }
 
 // checkRacedCreate requires a unique constraint to arbitrate concurrent creates.
-func checkRacedCreate(d Dialect, op string) error {
+func checkRacedCreate(d Dialect, op string, s *queryState) error {
+	if s.table != "" {
+		return fmt.Errorf("rio: %s cannot use a Table override: Insert writes the model's table", op)
+	}
 	if d.caps().uniqueKeys {
 		return nil
 	}

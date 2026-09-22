@@ -203,8 +203,8 @@ open, err := rio.Raw[int64]("SELECT count(*) FROM inventory").
 `T` is any scannable shape: a DTO struct matched by column name, a scalar, or
 an entity. `Value` is `Sole` by value for single-cell reads; `First` and
 `Sole` append no `LIMIT` to the head. `Count` and `Exists` wrap the statement
-as a derived table, so `Count` counts groups under `GroupBy` and a head with
-its own `ORDER BY` or `LIMIT` still probes correctly. `Must` validates and
+as a derived table, so `Count` counts groups under `GroupBy`, and a full
+hand-written statement with no appended clauses still probes correctly. `Must` validates and
 caches stable shapes as it does for `Query`; `Exec` runs hand-written write
 statements through the same pipeline.
 

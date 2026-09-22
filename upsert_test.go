@@ -47,6 +47,41 @@ func TestDoUpdateWhereRendersAndReportsRejection(t *testing.T) {
 	}
 }
 
+func TestDoUpdateWhereRejectionIsAnOutcomeForHooks(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	hook := &afterHook{}
+	db := f.openWith(Postgres, WithQueryHook(hook))
+	o := &Org{ID: 1, Name: "acme"}
+
+	f.queueRows(orgCols)
+	err := Upsert(ctx, db, o, OnConflict("id"), DoUpdate("name"), DoUpdateWhere("orgs.name < excluded.name"))
+	if !errors.Is(err, ErrStaleObject) {
+		t.Fatalf("rejected update: %v", err)
+	}
+	if len(hook.events) != 1 || hook.events[0].Err != nil || hook.events[0].RowsReturned != 0 {
+		t.Fatalf("hooks see a miss, not a failure: %+v", hook.events)
+	}
+}
+
+func TestRacedCreateRejectsTableOverride(t *testing.T) {
+	ctx := context.Background()
+	db := newFakeDB().open()
+	o := &Org{Name: "acme"}
+	for name, run := range map[string]func() error{
+		"FirstOrCreate": func() error {
+			return From[Org]().Table("orgs_archive").Where("name = ?", "acme").FirstOrCreate(ctx, db, o)
+		},
+		"CreateOrFirst": func() error {
+			return From[Org]().Table("orgs_archive").Where("name = ?", "acme").CreateOrFirst(ctx, db, o)
+		},
+	} {
+		if err := run(); err == nil || !strings.Contains(err.Error(), "Table") {
+			t.Fatalf("%s must reject a Table override: %v", name, err)
+		}
+	}
+}
+
 func TestOnConflictWhereRendersPartialIndexPredicate(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeDB()
