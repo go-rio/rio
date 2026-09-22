@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-09-22
+
+### Changed
+
+- `OrderKeys` accepts `driver.Valuer` columns (date wrappers and the like): the cursor carries the value they bind, and a Valuer that binds NULL is rejected at `CursorAt`.
+
 ## [0.20.0] - 2026-09-22
 
 ### Added

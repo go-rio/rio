@@ -1,6 +1,7 @@
 package rio
 
 import (
+	"database/sql/driver"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
@@ -267,8 +268,11 @@ func checkSortable(p *plan, f *field) error {
 	case scanInt, scanUint, scanFloat, scanString, scanBool, scanTime:
 		return nil
 	}
+	if f.typ.Implements(valuerType) {
+		return nil
+	}
 	return fmt.Errorf(
-		"rio: OrderKeys: column %q of %s (%s) has no canonical comparable form for a cursor; sort a scalar column",
+		"rio: OrderKeys: column %q of %s (%s) has no canonical comparable form for a cursor; sort a scalar or driver.Valuer column",
 		f.column, p.structName, f.typ,
 	)
 }
@@ -306,7 +310,28 @@ func cursorValue(f *field, rv reflect.Value) (any, error) {
 		// The struct already holds the normalized value the database stores.
 		return v.Interface().(time.Time), nil
 	}
+	if valuer, ok := v.Interface().(driver.Valuer); ok {
+		return valuerCursorValue(f, valuer)
+	}
 	return nil, fmt.Errorf("rio: cursor: column %q is not a cursor scalar", f.column)
+}
+
+// valuerCursorValue binds a driver.Valuer sort key by its Value, which the
+// token carries in place of the field.
+func valuerCursorValue(f *field, valuer driver.Valuer) (any, error) {
+	val, err := valuer.Value()
+	if err != nil {
+		return nil, fmt.Errorf("rio: cursor: column %q: %w", f.column, err)
+	}
+	switch t := val.(type) {
+	case nil:
+		return nil, fmt.Errorf("rio: cursor: column %q binds NULL, which has no keyset order", f.column)
+	case []byte:
+		return string(t), nil
+	case time.Time:
+		return normalizeTime(t), nil
+	}
+	return val, nil
 }
 
 // renderKeyset appends the expanded keyset predicate, ((k0 > ?) OR (k0 = ? AND

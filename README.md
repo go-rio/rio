@@ -225,8 +225,9 @@ for page, err := range export.Chunk(ctx, db, 500) {
 
 ### Cursor pagination
 
-`OrderKeys` declares ordering over mapped NOT NULL scalar columns, so rio can
-read key values back out of a row and issue a keyset cursor. A missing
+`OrderKeys` declares ordering over mapped NOT NULL scalar or `driver.Valuer`
+columns, so rio can read key values back out of a row and issue a keyset
+cursor. A missing
 primary-key column is appended as tie-breaker — pages never skip or repeat.
 `OrderKeys` cannot mix with verbatim `OrderBy`; the same API is on `Raw`,
 where `SortKey.Expr` names the SQL that produced a column:
