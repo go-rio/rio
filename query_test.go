@@ -173,3 +173,18 @@ func TestLimitOffsetBindAndShareOneShape(t *testing.T) {
 		t.Fatalf("cache entries = %d", entries)
 	}
 }
+
+func TestCondAccessors(t *testing.T) {
+	c := Cond("a = ? AND b IN (?)", 1, []int64{2, 3})
+	if c.Expr() != "a = ? AND b IN (?)" {
+		t.Fatalf("Expr: %q", c.Expr())
+	}
+	args := c.Args()
+	if len(args) != 2 || args[0] != 1 {
+		t.Fatalf("Args: %v", args)
+	}
+	args[0] = 9
+	if c.Args()[0] != 1 {
+		t.Fatal("Args must copy")
+	}
+}

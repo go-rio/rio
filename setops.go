@@ -30,29 +30,58 @@ func Expr(sql string, args ...any) Expression {
 // conditions or AllRows. UpdatedAt is maintained unless explicitly assigned;
 // set-based writes do not use optimistic locking.
 func (q Query[T]) UpdateAll(ctx context.Context, db Queryer, set Set, args ...any) (int64, error) {
-	_, n, err := q.updateAll(ctx, db, set, args, "update", false)
+	_, n, err := updateAll[T](ctx, db, q, set, args, "update", false, nil)
 	return n, err
 }
 
 // UpdateAllReturning is UpdateAll returning the updated rows. Dialects
 // without RETURNING (MySQL) reject it.
 func (q Query[T]) UpdateAllReturning(ctx context.Context, db Queryer, set Set, args ...any) ([]T, error) {
-	rows, _, err := q.updateAll(ctx, db, set, args, "update", true)
+	rows, _, err := updateAll[T](ctx, db, q, set, args, "update", true, nil)
+	return rows, err
+}
+
+// UpdateAllInto is UpdateAllReturning scanning into P, a struct whose fields
+// map to columns of T; only those columns return.
+func UpdateAllInto[P, T any](ctx context.Context, db Queryer, q Query[T], set Set, args ...any) ([]P, error) {
+	into, err := intoPlan[P]("UpdateAllInto")
+	if err != nil {
+		return nil, err
+	}
+	rows, _, err := updateAll[P](ctx, db, q, set, args, "update", true, into)
 	return rows, err
 }
 
 // DeleteAll deletes matching rows, using soft deletion when configured. It
 // requires conditions or AllRows.
 func (q Query[T]) DeleteAll(ctx context.Context, db Queryer, args ...any) (int64, error) {
-	_, n, err := q.deleteAll(ctx, db, args, false)
+	_, n, err := deleteAll[T](ctx, db, q, args, false, nil)
 	return n, err
 }
 
 // DeleteAllReturning is DeleteAll returning the deleted rows, as stored after
 // a soft delete. Dialects without RETURNING (MySQL) reject it.
 func (q Query[T]) DeleteAllReturning(ctx context.Context, db Queryer, args ...any) ([]T, error) {
-	rows, _, err := q.deleteAll(ctx, db, args, true)
+	rows, _, err := deleteAll[T](ctx, db, q, args, true, nil)
 	return rows, err
+}
+
+// DeleteAllInto is DeleteAllReturning scanning into P, as UpdateAllInto does.
+func DeleteAllInto[P, T any](ctx context.Context, db Queryer, q Query[T], args ...any) ([]P, error) {
+	into, err := intoPlan[P]("DeleteAllInto")
+	if err != nil {
+		return nil, err
+	}
+	rows, _, err := deleteAll[P](ctx, db, q, args, true, into)
+	return rows, err
+}
+
+// intoPlan resolves the struct an Into form scans RETURNING into.
+func intoPlan[P any](name string) (*plan, error) {
+	if t := reflect.TypeFor[P](); t.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("rio: %s: %s is not a struct; declare the returned columns as fields", name, t)
+	}
+	return planOf[P]()
 }
 
 // ForceDeleteAll permanently deletes matching rows. It requires conditions
@@ -73,7 +102,11 @@ func (q Query[T]) ForceDeleteAll(ctx context.Context, db Queryer, args ...any) (
 	if d := g.d; !d.caps().mutations {
 		return 0, checkDeleteWrite(d, "ForceDeleteAll", state.tableOf(g, p))
 	}
-	_, n, err := q.forceDeleteAll(ctx, db, p, &state, false)
+	op, err := renderForceDeleteAll(db, p, &state, false, nil)
+	if err != nil {
+		return 0, err
+	}
+	_, n, err := runSetOp[T](ctx, db, "delete", op)
 	return n, err
 }
 
@@ -99,36 +132,64 @@ func (q Query[T]) RestoreAll(ctx context.Context, db Queryer, args ...any) (int6
 	return q.UpdateAll(ctx, db, Set{p.softDel.column: nil}, args...)
 }
 
-func (q Query[T]) updateAll(
+// setOp is a rendered set-based write; ret is the plan RETURNING lists, nil
+// when the statement only counts.
+type setOp struct {
+	model string
+	ret   *plan
+	sql   string
+	args  []any
+}
+
+// updateAll renders and runs UPDATE; with returning it scans the rows into R,
+// T itself or the DTO into.
+func updateAll[R, T any](
 	ctx context.Context,
+	db Queryer,
+	q Query[T],
+	set Set,
+	args []any,
+	hookOp string,
+	returning bool,
+	into *plan,
+) ([]R, int64, error) {
+	op, err := q.renderUpdateAll(db, set, args, hookOp, returning, into)
+	if err != nil {
+		return nil, 0, err
+	}
+	return runSetOp[R](ctx, db, hookOp, op)
+}
+
+func (q Query[T]) renderUpdateAll(
 	db Queryer,
 	set Set,
 	args []any,
 	hookOp string,
 	returning bool,
-) ([]T, int64, error) {
+	into *plan,
+) (setOp, error) {
 	if len(set) == 0 {
-		return nil, 0, errors.New("rio: UpdateAll with an empty Set")
+		return setOp{}, errors.New("rio: UpdateAll with an empty Set")
 	}
 	missingWhere := len(q.s.wheres) == 0 && len(q.s.hasConds) == 0 && !q.s.allRows
 	if missingWhere {
-		return nil, 0, ErrMissingWhere
+		return setOp{}, ErrMissingWhere
 	}
 	if err := checkSetOpShape("UpdateAll", &q.s); err != nil {
-		return nil, 0, err
+		return setOp{}, err
 	}
 	g := db.gram()
 	p, state, err := prepareQueryState[T](g.d, &q.s, args)
 	if err != nil {
-		return nil, 0, err
+		return setOp{}, err
 	}
 	d := g.d
 	table := state.tableOf(g, p)
 	if err := checkUpdateWrite(d, "UpdateAll", table); err != nil {
-		return nil, 0, err
+		return setOp{}, err
 	}
-	if err := checkReturning(d, returning, hookOp); err != nil {
-		return nil, 0, err
+	if err := checkReturning(d, returning, hookOp, into != nil); err != nil {
+		return setOp{}, err
 	}
 	now := normalizeTime(db.conf().clock())
 
@@ -154,10 +215,10 @@ func (q Query[T]) updateAll(
 		}
 		f, ok := p.byColumn[k]
 		if !ok {
-			return nil, 0, fmt.Errorf("rio: UpdateAll: %s has no column %q", p.structName, k)
+			return setOp{}, fmt.Errorf("rio: UpdateAll: %s has no column %q", p.structName, k)
 		}
 		if f.readOnly {
-			return nil, 0, fmt.Errorf("rio: UpdateAll: column %q is readonly", k)
+			return setOp{}, fmt.Errorf("rio: UpdateAll: column %q is readonly", k)
 		}
 		b = d.quote(b, k)
 		b = append(b, " = "...)
@@ -169,62 +230,65 @@ func (q Query[T]) updateAll(
 		}
 		var err error
 		if b, bindArgs, err = appendSetValue(b, bindArgs, "UpdateAll", f, v); err != nil {
-			return nil, 0, err
+			return setOp{}, err
 		}
 	}
 
 	b, bindArgs, err = renderWhere(b, bindArgs, g, table, p, &state, nil)
 	if err != nil {
-		return nil, 0, err
+		return setOp{}, err
 	}
-	if returning {
-		b = appendReturning(b, d, table, p)
-	}
-	sqlText, outArgs, err := finishSQL(g, b, bindArgs)
+	return finishSetOp(g, b, bindArgs, table, p, hookOp, returning, into)
+}
+
+// deleteAll renders and runs the soft or hard delete, as updateAll does.
+func deleteAll[R, T any](
+	ctx context.Context,
+	db Queryer,
+	q Query[T],
+	args []any,
+	returning bool,
+	into *plan,
+) ([]R, int64, error) {
+	op, err := q.renderDeleteAll(db, args, returning, into)
 	if err != nil {
 		return nil, 0, err
 	}
-	return runSetOp[T](ctx, db, hookOp, p, sqlText, outArgs, returning)
+	return runSetOp[R](ctx, db, "delete", op)
 }
 
-func (q Query[T]) deleteAll(ctx context.Context, db Queryer, args []any, returning bool) ([]T, int64, error) {
+func (q Query[T]) renderDeleteAll(db Queryer, args []any, returning bool, into *plan) (setOp, error) {
 	missingWhere := len(q.s.wheres) == 0 && len(q.s.hasConds) == 0 && !q.s.allRows
 	if missingWhere {
-		return nil, 0, ErrMissingWhere
+		return setOp{}, ErrMissingWhere
 	}
 	if err := checkSetOpShape("DeleteAll", &q.s); err != nil {
-		return nil, 0, err
+		return setOp{}, err
 	}
 	g := db.gram()
 	p, state, err := prepareQueryState[T](g.d, &q.s, args)
 	if err != nil {
-		return nil, 0, err
+		return setOp{}, err
 	}
 	// Check before delegation so errors name DeleteAll.
 	if d := g.d; !d.caps().mutations {
-		return nil, 0, checkDeleteWrite(d, "DeleteAll", state.tableOf(g, p))
+		return setOp{}, checkDeleteWrite(d, "DeleteAll", state.tableOf(g, p))
 	}
 	if p.softDel != nil {
 		set := Set{p.softDel.column: g.d.bindTime(normalizeTime(db.conf().clock()))}
-		return (Query[T]{s: state}).updateAll(ctx, db, set, nil, "delete", returning)
+		return (Query[T]{s: state}).renderUpdateAll(db, set, nil, "delete", returning, into)
 	}
-	return q.forceDeleteAll(ctx, db, p, &state, returning)
+	return renderForceDeleteAll(db, p, &state, returning, into)
 }
 
-func (q Query[T]) forceDeleteAll(
-	ctx context.Context,
-	db Queryer,
-	p *plan,
-	state *queryState,
-	returning bool,
-) ([]T, int64, error) {
+func renderForceDeleteAll(db Queryer, p *plan, state *queryState, returning bool, into *plan) (setOp, error) {
 	if err := checkSetOpShape("DeleteAll", state); err != nil {
-		return nil, 0, err
+		return setOp{}, err
 	}
 	g := db.gram()
 	d := g.d
-	if err := checkReturning(d, returning, "delete"); err != nil {
-		return nil, 0, err
+	if err := checkReturning(d, returning, "delete", into != nil); err != nil {
+		return setOp{}, err
 	}
 	table := state.tableOf(g, p)
 	b := make([]byte, 0, 96)
@@ -233,16 +297,47 @@ func (q Query[T]) forceDeleteAll(
 	var args []any
 	b, args, err := renderWhere(b, args, g, table, p, state, nil)
 	if err != nil {
-		return nil, 0, err
+		return setOp{}, err
 	}
-	if returning {
-		b = appendReturning(b, d, table, p)
+	return finishSetOp(g, b, args, table, p, "delete", returning, into)
+}
+
+// finishSetOp appends RETURNING, T's columns or the DTO's (each a column of
+// T), and rebinds the statement.
+func finishSetOp(
+	g *grammar,
+	b []byte,
+	args []any,
+	table string,
+	p *plan,
+	hookOp string,
+	returning bool,
+	into *plan,
+) (setOp, error) {
+	var ret *plan
+	switch {
+	case !returning:
+	case into == nil:
+		ret = p
+	default:
+		for _, f := range into.fields {
+			if _, ok := p.byColumn[f.column]; !ok {
+				return setOp{}, fmt.Errorf(
+					"rio: %s: %s has no column %q for %s.%s",
+					setOpName(hookOp, true), p.structName, f.column, into.structName, f.name,
+				)
+			}
+		}
+		ret = into
+	}
+	if ret != nil {
+		b = appendReturning(b, g.d, table, ret)
 	}
 	sqlText, outArgs, err := finishSQL(g, b, args)
 	if err != nil {
-		return nil, 0, err
+		return setOp{}, err
 	}
-	return runSetOp[T](ctx, db, "delete", p, sqlText, outArgs, returning)
+	return setOp{model: p.structName, ret: ret, sql: sqlText, args: outArgs}, nil
 }
 
 // appendSetValue renders one assignment's right-hand side: an Expression
@@ -278,36 +373,40 @@ func appendSetValue(b []byte, args []any, op string, f *field, v any) ([]byte, [
 
 // checkReturning rejects a returning set-based write on dialects without
 // RETURNING.
-func checkReturning(d Dialect, returning bool, op string) error {
+func checkReturning(d Dialect, returning bool, op string, into bool) error {
 	if !returning || d.caps().returning {
 		return nil
 	}
-	name := "UpdateAllReturning"
-	if op == "delete" {
-		name = "DeleteAllReturning"
-	}
-	return unsupportedf("rio: %s is not supported on %s (no RETURNING clause); use the counting form", name, d.name())
+	return unsupportedf(
+		"rio: %s is not supported on %s (no RETURNING clause); use the counting form",
+		setOpName(op, into), d.name(),
+	)
 }
 
-// runSetOp executes a set-based write, scanning the RETURNING rows when asked.
-func runSetOp[T any](
-	ctx context.Context,
-	db Queryer,
-	op string,
-	p *plan,
-	sqlText string,
-	args []any,
-	returning bool,
-) ([]T, int64, error) {
-	if !returning {
-		n, err := runAffected(ctx, db, op, p.structName, sqlText, args)
+// setOpName names the returning API of a set-based write for errors.
+func setOpName(op string, into bool) string {
+	name := "UpdateAll"
+	if op == "delete" {
+		name = "DeleteAll"
+	}
+	if into {
+		return name + "Into"
+	}
+	return name + "Returning"
+}
+
+// runSetOp executes a set-based write, scanning the RETURNING rows into R
+// when asked.
+func runSetOp[R any](ctx context.Context, db Queryer, hookOp string, op setOp) ([]R, int64, error) {
+	if op.ret == nil {
+		n, err := runAffected(ctx, db, hookOp, op.model, op.sql, op.args)
 		return nil, n, err
 	}
-	rows, finish, err := runQuery(ctx, db, op, p.structName, sqlText, args)
+	rows, finish, err := runQuery(ctx, db, hookOp, op.model, op.sql, op.args)
 	if err != nil {
 		return nil, 0, err
 	}
-	out, err := scanAllCap[T](rows, p, false, 0, 0)
+	out, err := scanAllCap[R](rows, op.ret, false, 0, 0)
 	finishQuery(finish, err, int64(len(out)))
 	if err != nil {
 		return nil, 0, err

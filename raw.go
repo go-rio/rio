@@ -95,6 +95,33 @@ func (q RawQuery[T]) Before(c Cursor) RawQuery[T] {
 	return q
 }
 
+// ForUpdate renders FOR UPDATE after the appended clauses, with the given
+// LockOptions; a no-op on SQLite, rejected on ClickHouse, ignored by Count.
+func (q RawQuery[T]) ForUpdate(opts ...LockOption) RawQuery[T] {
+	return q.withLock(lockUpdate, opts)
+}
+
+// ForNoKeyUpdate renders FOR NO KEY UPDATE, as Query.ForNoKeyUpdate does.
+func (q RawQuery[T]) ForNoKeyUpdate(opts ...LockOption) RawQuery[T] {
+	return q.withLock(lockNoKeyUpdate, opts)
+}
+
+// ForShare renders FOR SHARE, as Query.ForShare does.
+func (q RawQuery[T]) ForShare(opts ...LockOption) RawQuery[T] {
+	return q.withLock(lockShare, opts)
+}
+
+// ForKeyShare renders FOR KEY SHARE, as Query.ForKeyShare does.
+func (q RawQuery[T]) ForKeyShare(opts ...LockOption) RawQuery[T] {
+	return q.withLock(lockKeyShare, opts)
+}
+
+func (q RawQuery[T]) withLock(mode lockMode, opts []LockOption) RawQuery[T] {
+	q.cache = nil
+	setLock(&q.s, mode, opts)
+	return q
+}
+
 // Limit caps the result; the value binds as a parameter.
 func (q RawQuery[T]) Limit(n int) RawQuery[T] {
 	q.cache = nil
@@ -329,6 +356,26 @@ func (q RawQuery[T]) Exists(ctx context.Context, db Queryer, args ...any) (bool,
 	return found, err
 }
 
+// Sub embeds the query as a ? argument, for IN (?), EXISTS (?), and scalar
+// comparisons; the caller writes the parentheses, the head selects what the
+// outer statement expects, and the query's arguments must be inline.
+func (q RawQuery[T]) Sub() Subquery {
+	return Subquery{render: func(g *grammar) ([]byte, []any, error) {
+		_, p, err := rawTarget[T]()
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := validateRawState(p, &q.s); err != nil {
+			return nil, nil, err
+		}
+		state, err := bindQueryState(g.d, nil, &q.s, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		return renderRawBytes(g, p, &state, selectRows)
+	}}
+}
+
 // SQL renders the statement All would run on db, without executing it.
 func (q RawQuery[T]) SQL(db Queryer, args ...any) (string, []any, error) {
 	g := db.gram()
@@ -445,12 +492,21 @@ func validateRawState(p *plan, s *queryState) error {
 // renderRaw appends the builder clauses to the head; Count and Exists wrap
 // the statement as a derived table.
 func renderRaw(g *grammar, p *plan, s *queryState, shape selectShape) (string, []any, error) {
+	b, args, err := renderRawBytes(g, p, s, shape)
+	if err != nil {
+		return "", nil, err
+	}
+	return finishSQL(g, b, args)
+}
+
+// renderRawBytes is renderRaw before placeholder rebinding, for Sub.
+func renderRawBytes(g *grammar, p *plan, s *queryState, shape selectShape) ([]byte, []any, error) {
 	var sortKeys []resolvedKey
 	hasSortKeys := len(s.orderKeys) > 0 || s.after != nil || s.before != nil
 	if hasSortKeys {
 		var err error
 		if sortKeys, err = resolveSortKeys(p, s); err != nil {
-			return "", nil, err
+			return nil, nil, err
 		}
 	}
 	b := make([]byte, 0, len(s.head.expr)+96)
@@ -464,7 +520,7 @@ func renderRaw(g *grammar, p *plan, s *queryState, shape selectShape) (string, [
 	args := append([]any(nil), s.head.args...)
 	b, args, err := renderWhere(b, args, g, "", nil, s, sortKeys)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	b, args = appendGroupHaving(b, args, s)
 	switch shape {
@@ -472,18 +528,28 @@ func renderRaw(g *grammar, p *plan, s *queryState, shape selectShape) (string, [
 		b = appendOrderBy(b, s.orders)
 		b = appendOrderKeys(b, g.d, "", sortKeys, s.before != nil)
 		if b, args, err = appendLimitOffset(b, args, g.d, s); err != nil {
-			return "", nil, err
+			return nil, nil, err
+		}
+		if s.lock != lockNone {
+			if b, err = appendLock(b, g.d, s); err != nil {
+				return nil, nil, err
+			}
 		}
 	case selectCount:
 		b = append(b, ") AS rio_count"...)
 	case selectExists:
 		if b, args, err = appendLimitOffset(b, args, g.d, s); err != nil {
-			return "", nil, err
+			return nil, nil, err
+		}
+		if s.lock != lockNone {
+			if b, err = appendLock(b, g.d, s); err != nil {
+				return nil, nil, err
+			}
 		}
 		b = append(b, ") AS rio_exists LIMIT ?"...)
 		args = append(args, 1)
 	}
-	return finishSQL(g, b, args)
+	return b, args, nil
 }
 
 // anyRow reports whether the result has a row and closes it.

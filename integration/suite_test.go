@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -312,6 +313,67 @@ func runSuite(t *testing.T, db *rio.DB, dialect string) {
 	}
 	if n, err := rio.From[User]().Table("users").Where("id = ?", rk.ID).Count(ctx, db); err != nil || n != 1 {
 		t.Fatalf("table override: %v %d", err, n)
+	}
+
+	// Raw row locks and subqueries, a conditional upsert, RETURNING into DTOs.
+	if err := db.Tx(ctx, func(tx *rio.Tx) error {
+		locked, err := raw.ForUpdate().OrderBy("u.id").Limit(1).All(ctx, tx)
+		if err != nil || len(locked) != 1 || locked[0].ID != rk.ID {
+			return fmt.Errorf("raw for update: %v %+v", err, locked)
+		}
+		if ok, err := raw.ForShare().Exists(ctx, tx); err != nil || !ok {
+			return fmt.Errorf("raw exists for share: %v %v", err, ok)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sub := rio.Raw[int64]("SELECT u.id FROM users u").Where("u.email = ?", rk.Email).Sub()
+	if n, err := rio.From[User]().Where("id IN (?)", sub).Count(ctx, db); err != nil || n != 1 {
+		t.Fatalf("raw sub: %v %d", err, n)
+	}
+
+	guard := []rio.UpsertOption{rio.OnConflict("email"), rio.DoUpdate("age"), rio.DoUpdateWhere("users.age < excluded.age")}
+	older := &User{Email: rk.Email, Age: 40}
+	err = rio.Upsert(ctx, db, older, guard...)
+	if dialect == "mysql" {
+		if !errors.Is(err, errors.ErrUnsupported) {
+			t.Fatalf("mysql has no conflict predicate: %v", err)
+		}
+	} else {
+		if err != nil {
+			t.Fatalf("guarded upsert: %v", err)
+		}
+		younger := &User{Email: rk.Email, Age: 35}
+		if err := rio.Upsert(ctx, db, younger, guard...); !errors.Is(err, rio.ErrStaleObject) {
+			t.Fatalf("rejected conflict update: %v", err)
+		}
+		if got, err := rio.Find[User](ctx, db, rk.ID); err != nil || got.Age != 40 {
+			t.Fatalf("guarded row: %v %+v", err, got)
+		}
+	}
+
+	type userStamp struct {
+		ID        int64
+		UpdatedAt time.Time
+	}
+	type userGone struct {
+		ID        int64
+		DeletedAt *time.Time
+	}
+	stamps, err := rio.UpdateAllInto[userStamp](ctx, db, rio.From[User]().Where("id = ?", rk.ID), rio.Set{"age": 34})
+	if dialect == "mysql" {
+		if !errors.Is(err, errors.ErrUnsupported) {
+			t.Fatalf("mysql has no RETURNING: %v", err)
+		}
+		return
+	}
+	if err != nil || len(stamps) != 1 || stamps[0].ID != rk.ID || stamps[0].UpdatedAt.IsZero() {
+		t.Fatalf("UpdateAllInto: %v %+v", err, stamps)
+	}
+	gone, err := rio.DeleteAllInto[userGone](ctx, db, rio.From[User]().Where("id = ?", rk.ID))
+	if err != nil || len(gone) != 1 || gone[0].ID != rk.ID || gone[0].DeletedAt == nil {
+		t.Fatalf("DeleteAllInto: %v %+v", err, gone)
 	}
 }
 

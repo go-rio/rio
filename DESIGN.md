@@ -121,6 +121,9 @@ head, and `First`/`Sole` append no LIMIT to it. Keyset cursors and `Chunk`
 resolve `OrderKeys` against the DTO's plan; `SortKey.Expr` carries the SQL
 that produced a column, since the head is opaque to rio. Conditions are
 values (`Cond`, `WhereAll`) so one filter drives entity and raw queries alike.
+Row locks render after the appended clauses, and `Sub()` embeds a raw query as
+a `?` argument like `Query.Sub`, so a hand-written head composes into entity
+queries instead of being pasted into their WHERE.
 
 ## Model mapping
 
@@ -210,9 +213,12 @@ relations across composite keys are unsupported.
 | `CreatedAt` in `Update`, `DoUpdate`, or `DoUpdateSet` | rejected, except under `WithoutStamps`, where both stamps are the caller's |
 | Row lock strengths | `ForNoKeyUpdate`/`ForKeyShare` render on PostgreSQL; MySQL takes the next stronger lock; SQLite elides; ClickHouse rejects |
 | `Raw.Count` / `Raw.Exists` | `count(*)` or a `LIMIT 1` probe over the statement as a derived table; `Raw.First`/`Sole` never add LIMIT |
+| `Raw` row locks | rendered after LIMIT/OFFSET; `Exists` locks inside its derived table, `Count` ignores the lock |
+| `rio.Array(slice)` | one array parameter (`= ANY(?)`) on PostgreSQL; dialects without array binding reject it, inline or deferred |
 | `Table(name)` | reads, `Pluck`, aggregates, and set-based writes render against name; entity writes keep the model's table; the select head bypasses the per-plan cache |
 | `UpdateAll/DeleteAll` without WHERE | `rio.ErrMissingWhere`; `.AllRows()` opts in explicitly |
 | `UpdateAllReturning/DeleteAllReturning` | the affected rows as stored (a soft delete returns the trashed state); rejected without `RETURNING` (MySQL) |
+| `UpdateAllInto[P]/DeleteAllInto[P]` | RETURNING only the columns `P` names, each validated against the model; same dialect rule |
 | `Upsert` with `DoUpdateSet` | assignments render in canonical column order after `DoUpdate`'s; `Expr` verbatim, other values bound after the row values; the shape keys the SQL cache |
 | `Query.Find` | primary-key lookup under the query's clauses: `WithTrashed` lifts the soft-delete filter, `With` preloads, inline `Where` narrows |
 | `Before(cursor)` | the reversed keyset query, page turned around; `Rows` refuses it |

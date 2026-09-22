@@ -365,3 +365,77 @@ func TestRawValidate(t *testing.T) {
 	}()
 	Raw[int64]("SELECT 1 FROM t").Where("a = ?", 1, 2).Must()
 }
+
+func TestRawLocks(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	pg := f.open()
+	cols := []string{"id", "name"}
+	q := Raw[rawStreamRow]("SELECT id, name FROM t").Where("id = ?", 1)
+
+	f.queueRows(cols)
+	if _, err := q.ForUpdate(SkipLocked).Limit(1).All(ctx, pg); err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if got := f.logged()[0]; got != `SELECT id, name FROM t WHERE (id = $1) LIMIT $2 FOR UPDATE SKIP LOCKED` {
+		t.Fatalf("lock follows LIMIT: %s", got)
+	}
+	f.queueRows(cols, []driver.Value{int64(1), "a"})
+	if _, err := q.ForNoKeyUpdate(LockOf("t"), NoWait).First(ctx, pg); err != nil {
+		t.Fatalf("First: %v", err)
+	}
+	if got := f.logged()[1]; !strings.HasSuffix(got, ` FOR NO KEY UPDATE OF t NOWAIT`) {
+		t.Fatalf("lock options: %s", got)
+	}
+	f.queueRows([]string{"1"})
+	if _, err := q.ForShare().Exists(ctx, pg); err != nil {
+		t.Fatalf("Exists: %v", err)
+	}
+	if got := f.logged()[2]; got != `SELECT 1 FROM (SELECT id, name FROM t WHERE (id = $1) FOR SHARE) AS rio_exists LIMIT $2` {
+		t.Fatalf("Exists locks inside the derived table: %s", got)
+	}
+	f.queueRows([]string{"count"}, []driver.Value{int64(1)})
+	if _, err := q.ForKeyShare().Count(ctx, pg); err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	if got := f.logged()[3]; strings.Contains(got, " FOR ") {
+		t.Fatalf("Count drops the lock: %s", got)
+	}
+
+	fs := newFakeDB()
+	fs.queueRows(cols)
+	if _, err := q.ForUpdate().All(ctx, fs.open(SQLite)); err != nil {
+		t.Fatalf("sqlite: %v", err)
+	}
+	if got := fs.logged()[0]; strings.Contains(got, " FOR ") {
+		t.Fatalf("sqlite elides the lock: %s", got)
+	}
+	if _, err := q.ForUpdate().All(ctx, newFakeDB().open(ClickHouse)); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("clickhouse rejects: %v", err)
+	}
+}
+
+func TestRawSub(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	db := f.open()
+
+	paid := Raw[int64]("SELECT user_id FROM orders").Where("status = ?", "paid").Limit(10).Sub()
+	f.queueRows(userCols)
+	if _, err := From[User]().Where("id IN (?)", paid).Where("age > ?", 18).All(ctx, db); err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	got := f.loggedContaining("SELECT")[0]
+	want := `WHERE (id IN (SELECT user_id FROM orders WHERE (status = $1) LIMIT $2)) AND (age > $3) AND "users"."deleted_at" IS NULL`
+	if !strings.Contains(got.sql, want) || len(got.args) != 3 || got.args[0] != "paid" || got.args[1] != int64(10) || got.args[2] != int64(18) {
+		t.Fatalf("sub: %s %v", got.sql, got.args)
+	}
+
+	deferred := Raw[int64]("SELECT user_id FROM orders").Where("status = ?").Sub()
+	if _, err := From[User]().Where("id IN (?)", deferred).All(ctx, db); err == nil || !strings.Contains(err.Error(), "deferred argument") {
+		t.Fatalf("deferred placeholders have no arguments inside a Sub: %v", err)
+	}
+	if _, err := From[User]().Where("id IN (?)", Raw[int64]("").Sub()).All(ctx, db); err == nil || !strings.Contains(err.Error(), "SELECT head") {
+		t.Fatalf("empty head: %v", err)
+	}
+}

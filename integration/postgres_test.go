@@ -141,3 +141,31 @@ func runPostgresTextArray(t *testing.T, db *rio.DB) {
 		t.Fatalf("text[] round-trip through Scanner/Valuer: %v", got.Tags)
 	}
 }
+
+// runPostgresArrayArg binds a slice as one array parameter.
+func runPostgresArrayArg(t *testing.T, db *rio.DB) {
+	ctx := context.Background()
+	for _, ddl := range []string{
+		"DROP TABLE IF EXISTS pg_nums",
+		"CREATE TABLE pg_nums (id BIGSERIAL PRIMARY KEY, n BIGINT NOT NULL)",
+		"INSERT INTO pg_nums (n) VALUES (1), (2), (3)",
+	} {
+		if _, err := rio.Exec(ctx, db, ddl); err != nil {
+			t.Fatalf("array ddl %q: %v", ddl, err)
+		}
+	}
+	got, err := rio.Raw[int64]("SELECT n FROM pg_nums").Where("n = ANY(?)", rio.Array([]int64{1, 3})).OrderBy("n").All(ctx, db)
+	if err != nil || !reflect.DeepEqual(got, []int64{1, 3}) {
+		t.Fatalf("= ANY(array): %v %v", err, got)
+	}
+	counted := rio.Raw[int64]("SELECT count(*) FROM pg_nums").Where("n IN (SELECT unnest(?::bigint[]))").Must()
+	for _, want := range []int64{2, 0} {
+		ids := []int64{2, 3, 99}
+		if want == 0 {
+			ids = nil
+		}
+		if n, err := counted.Value(ctx, db, rio.Array(ids)); err != nil || n != want {
+			t.Fatalf("unnest(array) with %v: %v %d", ids, err, n)
+		}
+	}
+}

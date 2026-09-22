@@ -155,7 +155,9 @@ Parameters per fragment:
 - `Where("active")` — no placeholders.
 
 Slices expand inside `IN (?)`; an empty slice is an error, and a slice of
-slices expands to tuples (`Where("(owner_id, sku) IN (?)", pairs)`). A one-column
+slices expands to tuples (`Where("(owner_id, sku) IN (?)", pairs)`);
+`rio.Array(ids)` binds a slice as one array parameter instead
+(`Where("id = ANY(?)", rio.Array(ids))`), on dialects that take one. A one-column
 query embeds the same way: `Where("id IN (?)", banned.Sub("user_id"))` splices
 the subquery and its arguments in place — the caller writes the parentheses,
 and the subquery's own `Where` arguments must be inline. Missing or excess
@@ -174,7 +176,8 @@ ClickHouse, which cannot prepare general queries.
 
 Conditions are values too: `rio.Cond("owner_id = ?", id)` builds one, and
 `WhereAll(conds...)` appends each as its own fragment, so one filter can drive
-several queries and raw heads. `Table("orgs_archive")` renders a query
+several queries and raw heads; `Expr()` and `Args()` read a condition back.
+`Table("orgs_archive")` renders a query
 against another table with the same model, for reads, `Pluck`, aggregates,
 and the set-based writes; entity writes keep the model's table.
 
@@ -221,6 +224,17 @@ FROM inventory i JOIN warehouses w ON w.id = i.warehouse_id`).
 for page, err := range export.Chunk(ctx, db, 500) {
     // ...
 }
+```
+
+`ForUpdate`, `ForNoKeyUpdate`, `ForShare`, and `ForKeyShare` take the same
+lock options as on `Query` and render after the appended clauses; `Exists`
+locks inside its derived table, `Count` ignores the lock. `Sub()` embeds a
+raw query as a `?` argument the way `Query.Sub` does, with the head selecting
+what the outer statement expects and its arguments inline:
+
+```go
+paid := rio.Raw[int64]("SELECT user_id FROM orders").Where("status = ?", "paid").Sub()
+users, err := rio.From[User]().Where("id IN (?)", paid).All(ctx, db)
 ```
 
 ### Cursor pagination
@@ -296,7 +310,8 @@ queue-worker idiom is `Where("state = ?", "queued").ForUpdate(rio.SkipLocked).Li
 `ForNoKeyUpdate` and `ForKeyShare` are PostgreSQL's weaker strengths, and
 `rio.LockOf("u")` restricts any lock to the named tables of a join
 (`FOR UPDATE OF u`). MySQL renders the next stronger lock for the key
-strengths, SQLite elides every row lock, ClickHouse rejects them.
+strengths, SQLite elides every row lock, ClickHouse rejects them. `Raw`
+queries take the same four methods and options.
 
 ### Models and relations
 
@@ -366,7 +381,9 @@ locks — select the target rows in `Where`. `Set` values bind, or render verbat
 through `rio.Expr("hits + ?", n)` with the expression's own arguments bound
 in place. `UpdateAllReturning` and `DeleteAllReturning` hand the affected
 rows back where the dialect has `RETURNING` (a soft delete returns the
-trashed state); MySQL rejects them.
+trashed state); `rio.UpdateAllInto[P](ctx, db, q, set)` and
+`rio.DeleteAllInto[P](ctx, db, q)` return only the columns the struct `P`
+names. MySQL rejects all four.
 
 `Upsert` supports conflict targets (`OnConflict`, plus `OnConflictWhere` for a
 partial unique index's predicate), update whitelists (`DoUpdate`),

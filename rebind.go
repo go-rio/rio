@@ -41,13 +41,18 @@ var (
 	}
 )
 
-// arrayParam binds a whole slice as one array parameter: rebind never expands
-// it and unwraps it into the bound arguments.
-type arrayParam struct{ v any }
+// ArrayArg binds a whole slice as one array parameter: rebind never expands
+// it. Array builds one; only dialects with array binding (PostgreSQL) take it.
+type ArrayArg struct{ v any }
+
+// Array binds slice as one array parameter instead of expanding it, so the
+// statement keeps one placeholder for any length (`= ANY(?)`,
+// `unnest(?::bigint[])`). Dialects without array binding reject it.
+func Array(slice any) ArrayArg { return ArrayArg{v: slice} }
 
 // Subquery is a query embedded as a ? argument: it renders in place of the
 // placeholder, its own arguments spliced into the statement's, with the
-// caller's parentheses around it. Query.Sub builds one.
+// caller's parentheses around it. Query.Sub and RawQuery.Sub build one.
 type Subquery struct {
 	render func(g *grammar) ([]byte, []any, error)
 }
@@ -296,7 +301,14 @@ func rebindFrom(p lexProfile, style bindStyle, query string, args []any, g *gram
 			// Common slice types skip reflect, whose element boxing allocates.
 			var expandErr error
 			switch xs := arg.(type) {
-			case arrayParam:
+			case ArrayArg:
+				if g != nil && !g.d.caps().arrayBind {
+					expandErr = unsupportedf(
+						"rio: Array binds one array parameter, which %s cannot take; pass the slice itself for IN (?) expansion",
+						g.d.name(),
+					)
+					break
+				}
 				startExpanding()
 				bindScalar(i, xs.v)
 			case Subquery:

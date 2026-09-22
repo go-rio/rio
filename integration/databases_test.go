@@ -169,6 +169,7 @@ func TestPostgresSuite(t *testing.T) {
 	runHardDelete(t, db, "postgres")
 	runPostgresJSONB(t, db)
 	runPostgresTextArray(t, db)
+	runPostgresArrayArg(t, db)
 }
 
 // The full PostgreSQL suite must hold identically on the pgx-native channel.
@@ -189,6 +190,7 @@ func TestPostgresNativeSuite(t *testing.T) {
 	runHardDelete(t, db, "postgres")
 	// text[] wrapper is stdlib-only: native hands Scanners the binary wire format.
 	runPostgresJSONB(t, db)
+	runPostgresArrayArg(t, db)
 }
 
 func TestMySQLSuite(t *testing.T) {

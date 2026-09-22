@@ -95,6 +95,12 @@ func Cond(expr string, args ...any) Condition {
 	return Condition{expr: expr, args: copyArgs(args)}
 }
 
+// Expr returns the condition's SQL.
+func (c Condition) Expr() string { return c.expr }
+
+// Args returns a copy of the condition's inline arguments.
+func (c Condition) Args() []any { return copyArgs(c.args) }
+
 // queryState is the non-generic body shared by renderers and preloaders.
 type queryState struct {
 	// head is a RawQuery's hand-written SELECT head; empty on entity queries.
@@ -289,11 +295,16 @@ func (q Query[T]) ForKeyShare(opts ...LockOption) Query[T] {
 
 func (q Query[T]) withLock(mode lockMode, opts []LockOption) Query[T] {
 	q.cache = nil
-	q.s.lock, q.s.lockWait, q.s.lockOf = mode, waitDefault, nil
-	for _, o := range opts {
-		o.applyLock(&q.s)
-	}
+	setLock(&q.s, mode, opts)
 	return q
+}
+
+// setLock records a row lock and its options.
+func setLock(s *queryState, mode lockMode, opts []LockOption) {
+	s.lock, s.lockWait, s.lockOf = mode, waitDefault, nil
+	for _, o := range opts {
+		o.applyLock(s)
+	}
 }
 
 // Final applies ClickHouse's FINAL modifier to the main SELECT. It does not
@@ -1324,6 +1335,12 @@ func normalizeArgs(d Dialect, args []any) ([]any, error) {
 	for i, a := range args {
 		var v any // stays nil for NULL-like inputs
 		switch t := a.(type) {
+		case ArrayArg:
+			// A deferred Array reaches a cached shape without rebind.
+			if !d.caps().arrayBind {
+				return nil, unsupportedf("rio: Array binds one array parameter, which %s cannot take", d.name())
+			}
+			v = t.v
 		case time.Time:
 			nt := normalizeTime(t)
 			if err := checkBindTime(d, nt); err != nil {

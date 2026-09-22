@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-09-22
+
+### Added
+
+- Row locks on `Raw`: `ForUpdate`, `ForNoKeyUpdate`, `ForShare`, and `ForKeyShare` take the same `LockOption`s as `Query` and render after the appended clauses; `Exists` locks inside its derived table and `Count` ignores the lock.
+- `RawQuery.Sub()` embeds a raw query as a `?` argument, as `Query.Sub` does.
+- `rio.Array(slice)` binds a slice as one array parameter (`= ANY(?)`, `unnest(?::bigint[])`) instead of expanding it; dialects without array binding reject it.
+- `Condition.Expr()` and `Condition.Args()`.
+- `UpdateAllInto[P]` and `DeleteAllInto[P]`: the returning set-based writes with `RETURNING` limited to the columns a DTO names.
+
 ## [0.20.2] - 2026-09-22
 
 ### Fixed
@@ -268,7 +278,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial release.
 
-[Unreleased]: https://github.com/go-rio/rio/compare/v0.18.1...HEAD
+[Unreleased]: https://github.com/go-rio/rio/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/go-rio/rio/compare/v0.20.2...v0.21.0
+[0.20.2]: https://github.com/go-rio/rio/compare/v0.20.1...v0.20.2
+[0.20.1]: https://github.com/go-rio/rio/compare/v0.20.0...v0.20.1
+[0.20.0]: https://github.com/go-rio/rio/compare/v0.19.1...v0.20.0
+[0.19.1]: https://github.com/go-rio/rio/compare/v0.19.0...v0.19.1
+[0.19.0]: https://github.com/go-rio/rio/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/go-rio/rio/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/go-rio/rio/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/go-rio/rio/compare/v0.16.1...v0.17.0

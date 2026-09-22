@@ -438,7 +438,7 @@ func (l *relLoad[K, KR]) prepare(rq *relQuery, stmts []relStatement) ([]relState
 				bindChunk = binds[start:end]
 			}
 			if array {
-				bindChunk = arrayParam{v: bindChunk}
+				bindChunk = ArrayArg{v: bindChunk}
 			}
 			sqlText, args, keyed, err := renderRelSelect(l.db.gram(), l.res, l.rel.kind, bindChunk, rq)
 			if err != nil {
@@ -662,7 +662,7 @@ func (l *countLoad[K, KR]) prepare(stmts []relStatement) ([]relStatement, error)
 			bindChunk = binds[start:end]
 		}
 		if array {
-			bindChunk = arrayParam{v: bindChunk}
+			bindChunk = ArrayArg{v: bindChunk}
 		}
 		b = appendKeySet(b, bindChunk)
 		args := []any{bindChunk}
@@ -1011,7 +1011,7 @@ func renderRelSelect(
 // appendKeySet renders the owner-key predicate: one array parameter, or the
 // expanded IN list.
 func appendKeySet(b []byte, keys any) []byte {
-	if _, ok := keys.(arrayParam); ok {
+	if _, ok := keys.(ArrayArg); ok {
 		return append(b, " = ANY(?)"...)
 	}
 	return append(b, " IN (?)"...)

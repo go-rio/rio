@@ -345,3 +345,29 @@ func ExampleQuery_UpdateAllReturning() {
 		fmt.Println(u.Email, u.Active)
 	}
 }
+
+// RETURNING only the columns the DTO names.
+func ExampleUpdateAllInto() {
+	ctx := context.Background()
+	type stamped struct {
+		ID        int64
+		UpdatedAt time.Time
+	}
+	rows, err := rio.UpdateAllInto[stamped](ctx, db,
+		rio.From[User]().Where("age < ?", 18), rio.Set{"active": false})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(len(rows))
+}
+
+// A raw head embeds in an entity query the way Query.Sub does.
+func ExampleRawQuery_Sub() {
+	ctx := context.Background()
+	paid := rio.Raw[int64]("SELECT user_id FROM orders").Where("status = ?", "paid").Sub()
+	users, err := rio.From[User]().Where("id IN (?)", paid).All(ctx, db)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(len(users))
+}

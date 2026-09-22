@@ -1,6 +1,9 @@
 package rio
 
 import (
+	"context"
+	"database/sql/driver"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -132,12 +135,12 @@ func TestRebind(t *testing.T) {
 			"SELECT * FROM t WHERE a IN ($1, $2) AND b IN ($3) AND c IN ($4, $5) AND d IN ($6)",
 			[]any{int64(1), int64(300), uint64(2), "x", 3, "y"}, ""},
 
-		// An arrayParam binds whole, unwrapped, between expansions.
+		// An ArrayArg binds whole, unwrapped, between expansions.
 		{"array param pg", pgLex, bindDollar, "SELECT * FROM t WHERE a = ? AND id = ANY(?) AND b IN (?)",
-			[]any{1, arrayParam{[]int64{2, 3}}, []int{4, 5}},
+			[]any{1, ArrayArg{[]int64{2, 3}}, []int{4, 5}},
 			"SELECT * FROM t WHERE a = $1 AND id = ANY($2) AND b IN ($3, $4)", []any{1, []int64{2, 3}, 4, 5}, ""},
 		{"array param question style", sqliteLex, bindQuestion, "SELECT * FROM t WHERE id = ANY(?)",
-			[]any{arrayParam{[]string{"a"}}},
+			[]any{ArrayArg{[]string{"a"}}},
 			"SELECT * FROM t WHERE id = ANY(?)", []any{[]string{"a"}}, ""},
 
 		// ?N is rejected everywhere: a digit after ? would glue onto an emitted $N ($1+"0" reads as $10).
@@ -392,5 +395,51 @@ func BenchmarkQueryBuild(b *testing.B) {
 	b.ReportAllocs()
 	for range b.N {
 		_ = From[User]().Where("age > ?", 18).Where("email = ?", "a@x").OrderBy("created_at DESC").Limit(10)
+	}
+}
+
+func TestArrayBindsOneParameter(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeDB()
+	pg := f.open()
+	ids := []int64{1, 2}
+
+	f.queueRows(orgCols)
+	if _, err := From[Org]().Where("id = ANY(?)", Array(ids)).All(ctx, pg); err != nil {
+		t.Fatalf("inline: %v", err)
+	}
+	got := f.loggedContaining("SELECT")[0]
+	if !strings.HasSuffix(got.sql, `WHERE (id = ANY($1))`) || len(got.args) != 1 || !reflect.DeepEqual(got.args[0], ids) {
+		t.Fatalf("inline: %s %v", got.sql, got.args)
+	}
+
+	deferred := From[Org]().Where("id = ANY(?)").Must()
+	for i := range 2 { // the second run binds through the cached shape
+		f.queueRows(orgCols)
+		if _, err := deferred.All(ctx, pg, Array(ids)); err != nil {
+			t.Fatalf("deferred %d: %v", i, err)
+		}
+		if got := f.loggedContaining("SELECT")[i+1]; len(got.args) != 1 || !reflect.DeepEqual(got.args[0], ids) {
+			t.Fatalf("deferred %d: %s %v", i, got.sql, got.args)
+		}
+	}
+
+	inline := From[Org]().Where("id = ANY(?)", Array(ids)).Must()
+	for i := range 2 { // an inline Array is a stable part of the cached shape
+		f.queueRows(orgCols)
+		if _, err := inline.All(ctx, pg); err != nil {
+			t.Fatalf("inline cached %d: %v", i, err)
+		}
+		if got := f.loggedContaining("SELECT")[i+3]; !strings.HasSuffix(got.sql, "ANY($1))") || !reflect.DeepEqual(got.args, []driver.Value{ids}) {
+			t.Fatalf("inline cached %d: %s %v", i, got.sql, got.args)
+		}
+	}
+
+	lite := newFakeDB().open(SQLite)
+	if _, err := From[Org]().Where("id = ANY(?)", Array(ids)).All(ctx, lite); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("sqlite inline: %v", err)
+	}
+	if _, err := deferred.All(ctx, lite, Array(ids)); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("sqlite deferred: %v", err)
 	}
 }
