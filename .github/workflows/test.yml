@@ -54,7 +54,7 @@ jobs:
           --health-timeout 5s
           --health-retries 20
       clickhouse:
-        image: clickhouse/clickhouse-server:26.10-alpine
+        image: clickhouse/clickhouse-server:26.11-alpine
         env:
           CLICKHOUSE_DB: rio_test
           CLICKHOUSE_USER: rio
