@@ -7,7 +7,7 @@ require (
 	github.com/go-rio/postgres v0.8.12
 	github.com/go-rio/rio v0.21.0
 	github.com/go-rio/sqlite v0.7.0
-	github.com/go-sql-driver/mysql v1.10.2
+	github.com/go-sql-driver/mysql v1.11.0
 	github.com/jackc/pgx/v5 v5.13.0
 	github.com/libtnb/sqlite v1.3.0
 	gorm.io/driver/mysql v1.6.0
